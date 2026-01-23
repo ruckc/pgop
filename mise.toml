@@ -1,0 +1,10 @@
+[tools]
+go = "latest"
+python = "latest"
+
+[tasks.docs]
+description = "Serve documentation locally"
+run = """
+pip install -q mkdocs-material
+mkdocs serve --livereload
+"""

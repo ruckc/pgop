@@ -1,0 +1,15 @@
+apiVersion: pgop.ruck.io/v1alpha1
+kind: Role
+metadata:
+  name: app-user
+spec:
+  clusterRef:
+    name: example-cluster
+  login: true
+  superuser: false
+  createDB: false
+  createRole: false
+  inherit: true
+  connectionLimit: 10
+  # Password is auto-generated and stored in a Secret named: <role-name>-credentials
+  # The secret contains keys: username, password, host, port

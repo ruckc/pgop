@@ -1,0 +1,17 @@
+apiVersion: pgop.ruck.io/v1alpha1
+kind: Cluster
+metadata:
+  name: example-cluster
+spec:
+  image: postgres:18
+  replicas: 1
+  port: 5432
+  storage:
+    size: 5Gi
+  resources:
+    requests:
+      memory: "256Mi"
+      cpu: "250m"
+    limits:
+      memory: "512Mi"
+      cpu: "500m"

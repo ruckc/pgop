@@ -1,0 +1,68 @@
+site_name: pgop - PostgreSQL Operator
+site_description: A Kubernetes operator for managing PostgreSQL databases
+site_author: ruckc
+repo_url: https://github.com/ruckc/pgop
+repo_name: ruckc/pgop
+
+theme:
+  name: material
+  palette:
+    - scheme: default
+      primary: blue
+      accent: light blue
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      primary: blue
+      accent: light blue
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.expand
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+
+nav:
+  - Home: index.md
+  - Getting Started:
+    - Installation: getting-started/installation.md
+    - Quick Start: getting-started/quickstart.md
+  - User Guide:
+    - Clusters: user-guide/clusters.md
+    - Roles: user-guide/roles.md
+    - Databases: user-guide/databases.md
+  - Reference:
+    - API Reference: reference/api.md
+    - Configuration: reference/configuration.md
+  - Contributing: contributing.md
+
+markdown_extensions:
+  - admonition
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+  - tables
+  - toc:
+      permalink: true
+
+plugins:
+  - search
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/ruckc/pgop
+
+extra_javascript:
+  - https://unpkg.com/mermaid@10/dist/mermaid.min.js

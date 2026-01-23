@@ -1,0 +1,19 @@
+apiVersion: pgop.ruck.io/v1alpha1
+kind: Database
+metadata:
+  name: myapp
+spec:
+  clusterRef:
+    name: example-cluster
+  owner: app-user
+  extensions:
+    - name: uuid-ossp
+    - name: pg_trgm
+  schemas:
+    - name: app
+      owner: app-user
+      grants:
+        - role: app-user
+          privileges:
+            - USAGE
+            - CREATE

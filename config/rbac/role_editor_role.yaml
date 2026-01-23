@@ -1,0 +1,33 @@
+# This rule is not used by the project pgop itself.
+# It is provided to allow the cluster admin to help manage permissions for users.
+#
+# Grants permissions to create, update, and delete resources within the pgop.ruck.io.
+# This role is intended for users who need to manage these resources
+# but should not control RBAC or manage permissions for others.
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/name: pgop
+    app.kubernetes.io/managed-by: kustomize
+  name: role-editor-role
+rules:
+- apiGroups:
+  - pgop.ruck.io
+  resources:
+  - roles
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - pgop.ruck.io
+  resources:
+  - roles/status
+  verbs:
+  - get
