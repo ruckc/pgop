@@ -421,7 +421,7 @@ func (r *ClusterReconciler) updateStatus(ctx context.Context, cluster *postgresv
 		condition.Message = "PostgreSQL cluster is ready"
 	} else if reconcileErr != nil {
 		condition.Status = metav1.ConditionFalse
-		condition.Reason = "ReconcileError"
+		condition.Reason = ReasonReconcileError
 		condition.Message = reconcileErr.Error()
 	} else {
 		condition.Status = metav1.ConditionFalse

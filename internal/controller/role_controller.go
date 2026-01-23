@@ -85,7 +85,7 @@ func (r *RoleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		log.Error(err, "Failed to create PostgreSQL client")
 		return r.updateStatus(ctx, role, false, "", err)
 	}
-	defer pgClient.Close()
+	defer func() { _ = pgClient.Close() }()
 
 	// Handle deletion
 	if role.DeletionTimestamp != nil {
@@ -276,7 +276,7 @@ func (r *RoleReconciler) updateStatus(ctx context.Context, role *postgresv1alpha
 		condition.Message = "Role has been created in PostgreSQL"
 	} else if reconcileErr != nil {
 		condition.Status = metav1.ConditionFalse
-		condition.Reason = "ReconcileError"
+		condition.Reason = ReasonReconcileError
 		condition.Message = reconcileErr.Error()
 	} else {
 		condition.Status = metav1.ConditionFalse

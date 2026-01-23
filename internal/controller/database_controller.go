@@ -82,7 +82,7 @@ func (r *DatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		log.Error(err, "Failed to create PostgreSQL admin client")
 		return r.updateStatus(ctx, database, false, nil, nil, err)
 	}
-	defer adminClient.Close()
+	defer func() { _ = adminClient.Close() }()
 
 	// Handle deletion
 	if database.DeletionTimestamp != nil {
@@ -121,10 +121,10 @@ func (r *DatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		log.Error(err, "Failed to create PostgreSQL database client")
 		return r.updateStatus(ctx, database, false, nil, nil, err)
 	}
-	defer dbClient.Close()
+	defer func() { _ = dbClient.Close() }()
 
 	// Install extensions
-	var installedExtensions []string
+	installedExtensions := make([]string, 0, len(database.Spec.Extensions))
 	for _, ext := range database.Spec.Extensions {
 		if err := dbClient.CreateExtension(ctx, ext.Name, ext.Schema, ext.Version); err != nil {
 			log.Error(err, "Failed to create extension", "extension", ext.Name)
@@ -134,7 +134,7 @@ func (r *DatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	}
 
 	// Create schemas and apply grants
-	var createdSchemas []string
+	createdSchemas := make([]string, 0, len(database.Spec.Schemas))
 	for _, schema := range database.Spec.Schemas {
 		if err := dbClient.CreateSchema(ctx, schema.Name, schema.Owner); err != nil {
 			log.Error(err, "Failed to create schema", "schema", schema.Name)
@@ -213,7 +213,7 @@ func (r *DatabaseReconciler) updateStatus(ctx context.Context, database *postgre
 		condition.Message = "Database has been created with extensions and schemas"
 	} else if reconcileErr != nil {
 		condition.Status = metav1.ConditionFalse
-		condition.Reason = "ReconcileError"
+		condition.Reason = ReasonReconcileError
 		condition.Message = reconcileErr.Error()
 	} else {
 		condition.Status = metav1.ConditionFalse
