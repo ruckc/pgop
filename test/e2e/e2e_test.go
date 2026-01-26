@@ -81,6 +81,19 @@ var _ = Describe("Manager", Ordered, func() {
 		cmd := exec.Command("kubectl", "delete", "pod", "curl-metrics", "-n", namespace)
 		_, _ = utils.Run(cmd)
 
+		By("removing custom resources to avoid finalizer deadlock")
+		// Clean up Database
+		cmd = exec.Command("kubectl", "delete", "database.pgop.ruck.io", "myapp", "-n", namespace, "--ignore-not-found")
+		_, _ = utils.Run(cmd)
+
+		// Clean up Role
+		cmd = exec.Command("kubectl", "delete", "role.pgop.ruck.io", "app-user", "-n", namespace, "--ignore-not-found")
+		_, _ = utils.Run(cmd)
+
+		// Clean up Cluster
+		cmd = exec.Command("kubectl", "delete", "cluster.postgres.ruck.io", "example-cluster", "-n", namespace, "--ignore-not-found")
+		_, _ = utils.Run(cmd)
+
 		By("undeploying the controller-manager")
 		cmd = exec.Command("make", "undeploy")
 		_, _ = utils.Run(cmd)
