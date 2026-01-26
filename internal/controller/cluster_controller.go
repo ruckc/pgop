@@ -286,6 +286,15 @@ func (r *ClusterReconciler) reconcileStatefulSet(ctx context.Context, cluster *p
 					Labels: labels,
 				},
 				Spec: corev1.PodSpec{
+					SecurityContext: &corev1.PodSecurityContext{
+						RunAsNonRoot: func() *bool { b := true; return &b }(),
+						SeccompProfile: &corev1.SeccompProfile{
+							Type: corev1.SeccompProfileTypeRuntimeDefault,
+						},
+						RunAsUser:  func() *int64 { i := int64(999); return &i }(),
+						RunAsGroup: func() *int64 { i := int64(999); return &i }(),
+						FSGroup:    func() *int64 { i := int64(999); return &i }(),
+					},
 					Containers: []corev1.Container{
 						{
 							Name:  "postgresql",
@@ -295,6 +304,12 @@ func (r *ClusterReconciler) reconcileStatefulSet(ctx context.Context, cluster *p
 									Name:          "postgresql",
 									ContainerPort: port,
 									Protocol:      corev1.ProtocolTCP,
+								},
+							},
+							SecurityContext: &corev1.SecurityContext{
+								AllowPrivilegeEscalation: func() *bool { b := false; return &b }(),
+								Capabilities: &corev1.Capabilities{
+									Drop: []corev1.Capability{"ALL"},
 								},
 							},
 							Env: []corev1.EnvVar{
@@ -322,10 +337,11 @@ func (r *ClusterReconciler) reconcileStatefulSet(ctx context.Context, cluster *p
 								},
 							},
 							VolumeMounts: []corev1.VolumeMount{
+
 								{
 									Name:      "data",
-									MountPath: "/var/lib/postgresql/data",
-									SubPath:   "pgdata",
+									MountPath: "/var/lib/postgresql",
+									// SubPath:   "pgdata",
 								},
 							},
 							Resources: cluster.Spec.Resources,

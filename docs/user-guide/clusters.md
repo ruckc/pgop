@@ -93,7 +93,8 @@ spec:
 Any Docker image compatible with the official PostgreSQL image environment variables:
 
 - `postgres:18`
+- `postgres:17`
+- `postgres:16`
 - `postgres:15`
 - `postgres:14`
-- `bitnami/postgresql:16`
 - Custom images that support `POSTGRES_USER` and `POSTGRES_PASSWORD` env vars

@@ -89,6 +89,10 @@ var _ = Describe("Manager", Ordered, func() {
 		cmd = exec.Command("make", "uninstall")
 		_, _ = utils.Run(cmd)
 
+		By("cleaning up the ClusterRoleBinding")
+		cmd = exec.Command("kubectl", "delete", "clusterrolebinding", metricsRoleBindingName, "--ignore-not-found")
+		_, _ = utils.Run(cmd)
+
 		By("removing manager namespace")
 		cmd = exec.Command("kubectl", "delete", "ns", namespace)
 		_, _ = utils.Run(cmd)
@@ -133,6 +137,22 @@ var _ = Describe("Manager", Ordered, func() {
 				fmt.Println("Pod description:\n", podDescription)
 			} else {
 				fmt.Println("Failed to describe controller pod")
+			}
+
+			By("Fetching PostgreSQL pod logs")
+			cmd = exec.Command("kubectl", "logs", "-l", "app.kubernetes.io/name=postgresql", "-n", namespace, "--all-containers=true")
+			pgLogs, err := utils.Run(cmd)
+			if err == nil {
+				_, _ = fmt.Fprintf(GinkgoWriter, "PostgreSQL logs:\n %s", pgLogs)
+			} else {
+				_, _ = fmt.Fprintf(GinkgoWriter, "Failed to get PostgreSQL logs: %s", err)
+			}
+			
+			By("Describing PostgreSQL pods")
+			cmd = exec.Command("kubectl", "describe", "pods", "-l", "app.kubernetes.io/name=postgresql", "-n", namespace)
+			pgDescribe, err := utils.Run(cmd)
+			if err == nil {
+				_, _ = fmt.Fprintf(GinkgoWriter, "PostgreSQL pods description:\n %s", pgDescribe)
 			}
 		}
 	})
@@ -277,6 +297,102 @@ var _ = Describe("Manager", Ordered, func() {
 		//    fmt.Sprintf(`controller_runtime_reconcile_total{controller="%s",result="success"} 1`,
 		//    strings.ToLower(<Kind>),
 		// ))
+	})
+	Context("Custom Resources", func() {
+		var (
+			clusterSample  string
+			roleSample     string
+			databaseSample string
+		)
+
+		BeforeEach(func() {
+			// Determine the correct path to samples
+			if _, err := os.Stat("../../config/samples/postgres_v1alpha1_cluster.yaml"); err == nil {
+				clusterSample = "../../config/samples/postgres_v1alpha1_cluster.yaml"
+				roleSample = "../../config/samples/postgres_v1alpha1_role.yaml"
+				databaseSample = "../../config/samples/postgres_v1alpha1_database.yaml"
+			} else {
+				clusterSample = "config/samples/postgres_v1alpha1_cluster.yaml"
+				roleSample = "config/samples/postgres_v1alpha1_role.yaml"
+				databaseSample = "config/samples/postgres_v1alpha1_database.yaml"
+			}
+		})
+
+		It("should Create Cluster, Role and Database successfully", func() {
+			absClusterSample, _ := filepath.Abs(clusterSample)
+			absRoleSample, _ := filepath.Abs(roleSample)
+			absDatabaseSample, _ := filepath.Abs(databaseSample)
+
+			By("Applying the Cluster sample")
+			cmd := exec.Command("kubectl", "apply", "-f", absClusterSample, "-n", namespace)
+			_, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to apply Cluster sample")
+
+			By("Verifying the Cluster becomes Ready")
+			verifyClusterReady := func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "cluster", "example-cluster", "-n", namespace,
+					"-o", "jsonpath={.status.ready}")
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(output).To(Equal("true"), "Cluster not ready")
+			}
+			Eventually(verifyClusterReady, 5*time.Minute, time.Second).Should(Succeed())
+
+			By("Verifying the StatefulSet is created and ready")
+			verifyStatefulSet := func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "statefulset", "example-cluster", "-n", namespace,
+					"-o", "jsonpath={.status.readyReplicas}")
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(output).To(Equal("1"), "StatefulSet not ready")
+			}
+			Eventually(verifyStatefulSet, 5*time.Minute, time.Second).Should(Succeed())
+
+			By("Verifying the Service is created")
+			cmd = exec.Command("kubectl", "get", "service", "example-cluster", "-n", namespace)
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Service not found")
+
+			By("Verifying the Superuser Secret is created")
+			cmd = exec.Command("kubectl", "get", "secret", "example-cluster-credentials", "-n", namespace)
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Superuser secret not found")
+
+			By("Applying the Role sample")
+			cmd = exec.Command("kubectl", "apply", "-f", absRoleSample, "-n", namespace)
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to apply Role sample")
+
+			By("Verifying the Role becomes Ready")
+			verifyRoleReady := func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "role.pgop.ruck.io", "app-user", "-n", namespace,
+					"-o", "jsonpath={.status.ready}")
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(output).To(Equal("true"), "Role not ready")
+			}
+			Eventually(verifyRoleReady, 2*time.Minute, time.Second).Should(Succeed())
+
+			By("Verifying the Role Secret is created")
+			cmd = exec.Command("kubectl", "get", "secret", "app-user-credentials", "-n", namespace)
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Role secret not found")
+
+			By("Applying the Database sample")
+			cmd = exec.Command("kubectl", "apply", "-f", absDatabaseSample, "-n", namespace)
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to apply Database sample")
+
+			By("Verifying the Database becomes Ready")
+			verifyDatabaseReady := func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "database.pgop.ruck.io", "myapp", "-n", namespace,
+					"-o", "jsonpath={.status.ready}")
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(output).To(Equal("true"), "Database not ready")
+			}
+			Eventually(verifyDatabaseReady, 2*time.Minute, time.Second).Should(Succeed())
+		})
 	})
 })
 
