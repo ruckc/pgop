@@ -234,6 +234,6 @@ patches:
 # +kubebuilder:scaffold:crdkustomizecainjectionname
 
 images:
-- name: controller
+- name: ghcr.io/ruckc/pgop
   newName: ghcr.io/ruckc/pgop
   newTag: latest

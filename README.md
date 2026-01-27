@@ -19,28 +19,19 @@
 
 ### Installation
 
-You can install the operator directly from the GitHub repository without cloning the code:
+You can install the operator directly from the GitHub repository without cloning the code.
 
-1.  **Install the CRDs**:
+**Deploy the Operator**:
 
-    ```sh
-    kubectl apply -f https://raw.githubusercontent.com/ruckc/pgop/main/config/crd/bases/pgop.ruck.io_clusters.yaml
-    kubectl apply -f https://raw.githubusercontent.com/ruckc/pgop/main/config/crd/bases/pgop.ruck.io_roles.yaml
-    kubectl apply -f https://raw.githubusercontent.com/ruckc/pgop/main/config/crd/bases/pgop.ruck.io_databases.yaml
-    ```
-    
-    *Alternatively, if you have cloned the repo or want to install everything at once:*
+```sh
+kubectl apply -k https://github.com/ruckc/pgop/config/default
+```
 
-2.  **Deploy the Operator**:
-
-    ```sh
-    kubectl apply -k https://github.com/ruckc/pgop/config/default
-    ```
-
-    This command will:
-    -   Create the `pgop-system` namespace.
-    -   Create the necessary ServiceAccounts, Roles, and Bindings.
-    -   Deploy the Controller Manager using the `latest` image from `ghcr.io/ruckc/pgop`.
+This command will:
+-   Install the Custom Resource Definitions (CRDs).
+-   Create the `pgop-system` namespace.
+-   Create the necessary ServiceAccounts, Roles, and Bindings.
+-   Deploy the Controller Manager using the `latest` image from `ghcr.io/ruckc/pgop`.
 
 ### Uninstallation
 

@@ -6,3 +6,6 @@ images:
 - name: controller
   newName: example.com/pgop
   newTag: coverage-v1
+- name: ghcr.io/ruckc/pgop
+  newName: ghcr.io/ruckc/pgop
+  newTag: latest
