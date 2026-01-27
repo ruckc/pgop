@@ -20,11 +20,13 @@ limitations under the License.
 package e2e
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -72,11 +74,106 @@ var _ = Describe("Manager", Ordered, func() {
 		cmd = exec.Command("make", "deploy", fmt.Sprintf("IMG=%s", managerImage))
 		_, err = utils.Run(cmd)
 		Expect(err).NotTo(HaveOccurred(), "Failed to deploy the controller-manager")
+
+		By("patching controller for coverage")
+		// Determine correct path for coverage patch
+		var coveragePatch string
+		if _, err := os.Stat("../../config/manager/manager_coverage_patch.yaml"); err == nil {
+			coveragePatch = "../../config/manager/manager_coverage_patch.yaml"
+		} else {
+			coveragePatch = "config/manager/manager_coverage_patch.yaml"
+		}
+		absCoveragePatch, _ := filepath.Abs(coveragePatch)
+		cmd = exec.Command("kubectl", "patch", "deployment", "pgop-controller-manager", "-n", namespace, "--patch-file", absCoveragePatch)
+		_, err = utils.Run(cmd)
+		// We expect this might fail if the deployment isn't ready or named differently, but standardized names should work.
+		// However, it's better to apply this patch via Kustomize in the makefile or just kubectl patch here.
+		// Since 'make deploy' runs 'kustomize build', we should arguably add the patch to the kustomize build.
+		// BUT, 'make deploy' is a single command. simpler is to patch the deployment immediately after applied.
+		Expect(err).NotTo(HaveOccurred(), "Failed to patch controller for coverage")
 	})
 
 	// After all tests have been executed, clean up by undeploying the controller, uninstalling CRDs,
 	// and deleting the namespace.
 	AfterAll(func() {
+		if controllerPodName != "" {
+			By("dumping coverage data")
+			// Create local coverage directory
+			if err := os.MkdirAll("coverage-dump", 0755); err != nil {
+				fmt.Fprintf(GinkgoWriter, "Failed to create coverage directory: %s\n", err)
+			} else {
+				// Copy coverage directory from pod
+				// We need to stop the manager to flush coverage data (covcounters)
+				// Since we use emptyDir, we must restart the container, not the pod.
+				// Sending SIGTERM to PID 1 (manager) should cause it to exit and flush.
+				By("triggering manager shutdown to flush coverage")
+				termCmd := exec.Command("kubectl", "exec", "-n", namespace, controllerPodName, "-c", "manager", "--", "/bin/sh", "-c", "kill -TERM 1")
+				output, err := utils.Run(termCmd)
+				if err != nil {
+					fmt.Fprintf(GinkgoWriter, "Failed to send SIGTERM to manager: %s\nOutput: %s\n", err, output)
+				}
+
+				// Wait for covcounters file to appear
+				timeout := 30 * time.Second
+				start := time.Now()
+				found := false
+				for time.Since(start) < timeout {
+					cmd := exec.Command("kubectl", "exec", "-n", namespace, controllerPodName, "-c", "manager", "--", "/bin/ls", "/tmp/coverage")
+					output, err := utils.Run(cmd)
+					if err == nil && strings.Contains(output, "covcounters") {
+						found = true
+						break
+					}
+					time.Sleep(2 * time.Second)
+				}
+
+				if !found {
+					fmt.Fprintf(GinkgoWriter, "Timed out waiting for covcounters file\n")
+				}
+
+				cmd := exec.Command("kubectl", "exec", "-n", namespace, controllerPodName, "-c", "manager", "--", "/bin/ls", "/tmp/coverage")
+				output, err = utils.Run(cmd)
+				if err != nil {
+					fmt.Fprintf(GinkgoWriter, "Failed to list coverage files: %s\nOutput: %s\n", err, output)
+				} else {
+					files := strings.Split(strings.TrimSpace(string(output)), "\n")
+					for _, file := range files {
+						if file == "" {
+							continue
+						}
+						By(fmt.Sprintf("copying coverage file %s", file))
+						// Use base64 to copy file content safely (avoiding binary corruption)
+						catCmd := exec.Command("kubectl", "exec", "-n", namespace, controllerPodName, "-c", "manager", "--", "base64", fmt.Sprintf("/tmp/coverage/%s", file))
+						contentBase64, err := utils.Run(catCmd)
+						if err != nil {
+							fmt.Fprintf(GinkgoWriter, "Failed to base64 coverage file %s: %s\n", file, err)
+							continue
+						}
+						// base64 output might contain n newlines, remove them
+						contentBase64 = strings.ReplaceAll(strings.TrimSpace(contentBase64), "\n", "")
+						contentBase64 = strings.ReplaceAll(contentBase64, "\r", "")
+						
+						content, err := base64.StdEncoding.DecodeString(contentBase64)
+						if err != nil {
+							fmt.Fprintf(GinkgoWriter, "Failed to decode base64 content for %s: %s\n", file, err)
+							continue
+						}
+
+						if err := os.WriteFile(filepath.Join("coverage-dump", file), content, 0644); err != nil {
+							fmt.Fprintf(GinkgoWriter, "Failed to write local file %s: %s\n", file, err)
+						}
+					}
+
+					// Process coverage data locally
+					cmd = exec.Command("go", "tool", "covdata", "textfmt", "-i=coverage-dump", "-o=../../e2e-cover.out")
+					output, err = utils.Run(cmd)
+					if err != nil {
+						fmt.Fprintf(GinkgoWriter, "Failed to process coverage data: %s\nOutput: %s\n", err, output)
+					}
+				}
+			}
+		}
+
 		By("cleaning up the curl pod for metrics")
 		cmd := exec.Command("kubectl", "delete", "pod", "curl-metrics", "-n", namespace)
 		_, _ = utils.Run(cmd)

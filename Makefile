@@ -81,14 +81,19 @@ setup-test-e2e: ## Set up a Kind cluster for e2e tests if it does not exist
 			$(KIND) create cluster --name $(KIND_CLUSTER) ;; \
 	esac
 
+.PHONY: docker-build-e2e
+docker-build-e2e: ## Build docker image with the manager for e2e tests (with coverage).
+	$(CONTAINER_TOOL) build --build-arg GO_BUILD_FLAGS="-cover" -t ${IMG} .
+
 .PHONY: test-e2e
-test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests. Expected an isolated environment using Kind.
+test-e2e: setup-test-e2e manifests generate fmt vet docker-build-e2e ## Run the e2e tests with coverage.
 	KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) go test -tags=e2e ./test/e2e/ -v -ginkgo.v
 	$(MAKE) cleanup-test-e2e
 
 .PHONY: cleanup-test-e2e
 cleanup-test-e2e: ## Tear down the Kind cluster used for e2e tests
 	@$(KIND) delete cluster --name $(KIND_CLUSTER)
+	rm -rf coverage
 
 .PHONY: lint
 lint: golangci-lint ## Run golangci-lint linter
@@ -117,7 +122,7 @@ run: manifests generate fmt vet ## Run a controller from your host.
 # More info: https://docs.docker.com/develop/develop-images/build_enhancements/
 .PHONY: docker-build
 docker-build: ## Build docker image with the manager.
-	$(CONTAINER_TOOL) build -t ${IMG} .
+	$(CONTAINER_TOOL) build --build-arg GO_BUILD_FLAGS="${GO_BUILD_FLAGS}" -t ${IMG} .
 
 .PHONY: docker-push
 docker-push: ## Push docker image with the manager.

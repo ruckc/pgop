@@ -5,4 +5,4 @@ kind: Kustomization
 images:
 - name: controller
   newName: example.com/pgop
-  newTag: v0.0.1
+  newTag: coverage-v1

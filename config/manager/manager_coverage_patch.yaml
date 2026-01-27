@@ -1,0 +1,18 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pgop-controller-manager
+spec:
+  template:
+    spec:
+      containers:
+      - name: manager
+        env:
+        - name: GOCOVERDIR
+          value: "/tmp/coverage"
+        volumeMounts:
+        - mountPath: /tmp/coverage
+          name: coverage-data
+      volumes:
+      - name: coverage-data
+        emptyDir: {}

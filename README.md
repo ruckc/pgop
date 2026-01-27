@@ -1,121 +1,111 @@
-# pgop
-// TODO(user): Add simple overview of use/purpose
+# pgop - PostgreSQL Operator
 
-## Description
-// TODO(user): An in-depth paragraph about your project and overview of use
+`pgop` is a Kubernetes Operator built with the Operator SDK and Controller Runtime for managing PostgreSQL clusters. It provides a declarative API to manage the lifecycle of PostgreSQL instances, users, and databases securely and efficiently.
+
+## Features
+
+-   **PostgreSQL Clusters**: Easily provision and manage PostgreSQL stateful sets.
+-   **User Management**: Create and manage database roles/users with auto-generated credentials.
+-   **Database Management**: specific databases within the cluster.
+-   **Secure by Design**: Enforces Restricted Pod Security Standards (RunAsNonRoot, Seccomp, Drop All Capabilities).
+-   **Observability**: Built-in metrics export for Prometheus.
 
 ## Getting Started
 
 ### Prerequisites
-- go version v1.24.6+
-- docker version 17.03+.
-- kubectl version v1.11.3+.
-- Access to a Kubernetes v1.11.3+ cluster.
 
-### To Deploy on the cluster
-**Build and push your image to the location specified by `IMG`:**
+-   **Kubernetes Cluster**: A running Kubernetes cluster (v1.24+).
+-   **Kubectl**: CLI tool for interacting with your cluster.
 
-```sh
-make docker-build docker-push IMG=<some-registry>/pgop:tag
-```
+### Installation
 
-**NOTE:** This image ought to be published in the personal registry you specified.
-And it is required to have access to pull the image from the working environment.
-Make sure you have the proper permission to the registry if the above commands don’t work.
+You can install the operator directly from the GitHub repository without cloning the code:
 
-**Install the CRDs into the cluster:**
+1.  **Install the CRDs**:
 
-```sh
-make install
-```
+    ```sh
+    kubectl apply -f https://raw.githubusercontent.com/ruckc/pgop/main/config/crd/bases/pgop.ruck.io_clusters.yaml
+    kubectl apply -f https://raw.githubusercontent.com/ruckc/pgop/main/config/crd/bases/pgop.ruck.io_roles.yaml
+    kubectl apply -f https://raw.githubusercontent.com/ruckc/pgop/main/config/crd/bases/pgop.ruck.io_databases.yaml
+    ```
+    
+    *Alternatively, if you have cloned the repo or want to install everything at once:*
 
-**Deploy the Manager to the cluster with the image specified by `IMG`:**
+2.  **Deploy the Operator**:
 
-```sh
-make deploy IMG=<some-registry>/pgop:tag
-```
+    ```sh
+    kubectl apply -k https://github.com/ruckc/pgop/config/default
+    ```
 
-> **NOTE**: If you encounter RBAC errors, you may need to grant yourself cluster-admin
-privileges or be logged in as admin.
+    This command will:
+    -   Create the `pgop-system` namespace.
+    -   Create the necessary ServiceAccounts, Roles, and Bindings.
+    -   Deploy the Controller Manager using the `latest` image from `ghcr.io/ruckc/pgop`.
 
-**Create instances of your solution**
-You can apply the samples (examples) from the config/sample:
+### Uninstallation
 
-```sh
-kubectl apply -k config/samples/
-```
-
->**NOTE**: Ensure that the samples has default values to test it out.
-
-### To Uninstall
-**Delete the instances (CRs) from the cluster:**
+To remove the operator and all CRDs:
 
 ```sh
-kubectl delete -k config/samples/
+kubectl delete -k https://github.com/ruckc/pgop/config/default
 ```
 
-**Delete the APIs(CRDs) from the cluster:**
+## Usage
+
+### 1. Create a Cluster
+
+Apply the `Cluster` sample to create a PostgreSQL instance:
 
 ```sh
-make uninstall
+kubectl apply -f config/samples/postgres_v1alpha1_cluster.yaml
 ```
 
-**UnDeploy the controller from the cluster:**
+This creates:
+- A StatefulSet with PostgreSQL (defaulting to version 18).
+- A Service for connectivity.
+- A Secret `example-cluster-credentials` containing the superuser credentials.
+
+### 2. Create a Role (User)
+
+Create a database user associated with the cluster:
 
 ```sh
-make undeploy
+kubectl apply -f config/samples/postgres_v1alpha1_role.yaml
 ```
 
-## Project Distribution
+### 3. Create a Database
 
-Following the options to release and provide this solution to the users.
-
-### By providing a bundle with all YAML files
-
-1. Build the installer for the image built and published in the registry:
+Create a specific database owned by a role:
 
 ```sh
-make build-installer IMG=<some-registry>/pgop:tag
+kubectl apply -f config/samples/postgres_v1alpha1_database.yaml
 ```
 
-**NOTE:** The makefile target mentioned above generates an 'install.yaml'
-file in the dist directory. This file contains all the resources built
-with Kustomize, which are necessary to install this project without its
-dependencies.
+## Development
 
-2. Using the installer
+### Running Tests
 
-Users can just run 'kubectl apply -f <URL for YAML BUNDLE>' to install
-the project, i.e.:
-
+Run unit tests:
 ```sh
-kubectl apply -f https://raw.githubusercontent.com/<org>/pgop/<tag or branch>/dist/install.yaml
+make test
 ```
 
-### By providing a Helm Chart
-
-1. Build the chart using the optional helm plugin
-
+Run End-to-End (E2E) tests (requires Kind):
 ```sh
-kubebuilder edit --plugins=helm/v2-alpha
+make test-e2e
 ```
 
-2. See that a chart was generated under 'dist/chart', and users
-can obtain this solution from there.
+### Building
 
-**NOTE:** If you change the project, you need to update the Helm Chart
-using the same command above to sync the latest changes. Furthermore,
-if you create webhooks, you need to use the above command with
-the '--force' flag and manually ensure that any custom configuration
-previously added to 'dist/chart/values.yaml' or 'dist/chart/manager/manager.yaml'
-is manually re-applied afterwards.
+Build the binary:
+```sh
+make build
+```
 
-## Contributing
-// TODO(user): Add detailed information on how you would like others to contribute to this project
-
-**NOTE:** Run `make help` for more information on all potential `make` targets
-
-More information can be found via the [Kubebuilder Documentation](https://book.kubebuilder.io/introduction.html)
+Build the docker image:
+```sh
+make docker-build IMG=example.com/pgop:latest
+```
 
 ## License
 
@@ -132,4 +122,3 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
-
