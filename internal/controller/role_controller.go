@@ -184,18 +184,18 @@ func (r *RoleReconciler) reconcileCredentialsSecret(ctx context.Context, role *p
 			Name:      secretName,
 			Namespace: role.Namespace,
 			Labels: map[string]string{
-				"app.kubernetes.io/name":       "postgresql-role",
-				"app.kubernetes.io/instance":   role.Name,
-				"app.kubernetes.io/managed-by": "pgop",
-				"pgop.ruck.io/cluster":         role.Spec.ClusterRef.Name,
+				LabelAppName:           "postgresql-role",
+				LabelAppInstance:       role.Name,
+				LabelAppManagedBy:      LabelValuePgop,
+				"pgop.ruck.io/cluster": role.Spec.ClusterRef.Name,
 			},
 		},
 		Type: corev1.SecretTypeOpaque,
 		StringData: map[string]string{
-			"username": role.Name,
-			"password": password,
-			"host":     fmt.Sprintf("%s.%s.svc.cluster.local", cluster.Name, cluster.Namespace),
-			"port":     fmt.Sprintf("%d", port),
+			SecretKeyUsername: role.Name,
+			SecretKeyPassword: password,
+			"host":            fmt.Sprintf("%s.%s.svc.cluster.local", cluster.Name, cluster.Namespace),
+			"port":            fmt.Sprintf("%d", port),
 		},
 	}
 
@@ -265,7 +265,7 @@ func (r *RoleReconciler) updateStatus(ctx context.Context, role *postgresv1alpha
 	role.Status.SecretName = secretName
 
 	condition := metav1.Condition{
-		Type:               "Available",
+		Type:               ConditionTypeAvailable,
 		ObservedGeneration: role.Generation,
 		LastTransitionTime: metav1.Now(),
 	}

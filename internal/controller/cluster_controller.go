@@ -146,7 +146,7 @@ func (r *ClusterReconciler) reconcileSecret(ctx context.Context, cluster *postgr
 		port = 5432
 	}
 
-	username := "pgop_operator"
+	username := DefaultOperatorUsername
 	host := fmt.Sprintf("%s.%s.svc.cluster.local", cluster.Name, cluster.Namespace)
 
 	secret = &corev1.Secret{
@@ -154,18 +154,18 @@ func (r *ClusterReconciler) reconcileSecret(ctx context.Context, cluster *postgr
 			Name:      secretName,
 			Namespace: cluster.Namespace,
 			Labels: map[string]string{
-				"app.kubernetes.io/name":       "postgresql",
-				"app.kubernetes.io/instance":   cluster.Name,
-				"app.kubernetes.io/managed-by": "pgop",
+				LabelAppName:      AppNamePostgresql,
+				LabelAppInstance:  cluster.Name,
+				LabelAppManagedBy: LabelValuePgop,
 			},
 		},
 		Type: corev1.SecretTypeOpaque,
 		StringData: map[string]string{
-			"username": username,
-			"password": password,
-			"host":     host,
-			"port":     fmt.Sprintf("%d", port),
-			"database": "postgres",
+			SecretKeyUsername: username,
+			SecretKeyPassword: password,
+			"host":            host,
+			"port":            fmt.Sprintf("%d", port),
+			"database":        "postgres",
 		},
 	}
 
@@ -201,19 +201,19 @@ func (r *ClusterReconciler) reconcileService(ctx context.Context, cluster *postg
 			Name:      serviceName,
 			Namespace: cluster.Namespace,
 			Labels: map[string]string{
-				"app.kubernetes.io/name":       "postgresql",
-				"app.kubernetes.io/instance":   cluster.Name,
-				"app.kubernetes.io/managed-by": "pgop",
+				LabelAppName:      AppNamePostgresql,
+				LabelAppInstance:  cluster.Name,
+				LabelAppManagedBy: LabelValuePgop,
 			},
 		},
 		Spec: corev1.ServiceSpec{
 			Selector: map[string]string{
-				"app.kubernetes.io/name":     "postgresql",
-				"app.kubernetes.io/instance": cluster.Name,
+				LabelAppName:     AppNamePostgresql,
+				LabelAppInstance: cluster.Name,
 			},
 			Ports: []corev1.ServicePort{
 				{
-					Name:       "postgresql",
+					Name:       AppNamePostgresql,
 					Port:       port,
 					TargetPort: intstr.FromInt32(port),
 					Protocol:   corev1.ProtocolTCP,
@@ -245,7 +245,7 @@ func (r *ClusterReconciler) reconcileStatefulSet(ctx context.Context, cluster *p
 	// Set defaults
 	image := cluster.Spec.Image
 	if image == "" {
-		image = "postgres:18"
+		image = DefaultPostgresImage
 	}
 	replicas := cluster.Spec.Replicas
 	if replicas == 0 {
@@ -261,9 +261,9 @@ func (r *ClusterReconciler) reconcileStatefulSet(ctx context.Context, cluster *p
 	}
 
 	labels := map[string]string{
-		"app.kubernetes.io/name":       "postgresql",
-		"app.kubernetes.io/instance":   cluster.Name,
-		"app.kubernetes.io/managed-by": "pgop",
+		LabelAppName:      AppNamePostgresql,
+		LabelAppInstance:  cluster.Name,
+		LabelAppManagedBy: LabelValuePgop,
 	}
 
 	sts = &appsv1.StatefulSet{
@@ -277,8 +277,8 @@ func (r *ClusterReconciler) reconcileStatefulSet(ctx context.Context, cluster *p
 			Replicas:    &replicas,
 			Selector: &metav1.LabelSelector{
 				MatchLabels: map[string]string{
-					"app.kubernetes.io/name":     "postgresql",
-					"app.kubernetes.io/instance": cluster.Name,
+					LabelAppName:     AppNamePostgresql,
+					LabelAppInstance: cluster.Name,
 				},
 			},
 			Template: corev1.PodTemplateSpec{
@@ -297,11 +297,11 @@ func (r *ClusterReconciler) reconcileStatefulSet(ctx context.Context, cluster *p
 					},
 					Containers: []corev1.Container{
 						{
-							Name:  "postgresql",
+							Name:  AppNamePostgresql,
 							Image: image,
 							Ports: []corev1.ContainerPort{
 								{
-									Name:          "postgresql",
+									Name:          AppNamePostgresql,
 									ContainerPort: port,
 									Protocol:      corev1.ProtocolTCP,
 								},
@@ -348,7 +348,7 @@ func (r *ClusterReconciler) reconcileStatefulSet(ctx context.Context, cluster *p
 							ReadinessProbe: &corev1.Probe{
 								ProbeHandler: corev1.ProbeHandler{
 									Exec: &corev1.ExecAction{
-										Command: []string{"pg_isready", "-U", "pgop_operator"},
+										Command: []string{"pg_isready", "-U", DefaultOperatorUsername},
 									},
 								},
 								InitialDelaySeconds: 5,
@@ -357,7 +357,7 @@ func (r *ClusterReconciler) reconcileStatefulSet(ctx context.Context, cluster *p
 							LivenessProbe: &corev1.Probe{
 								ProbeHandler: corev1.ProbeHandler{
 									Exec: &corev1.ExecAction{
-										Command: []string{"pg_isready", "-U", "pgop_operator"},
+										Command: []string{"pg_isready", "-U", DefaultOperatorUsername},
 									},
 								},
 								InitialDelaySeconds: 30,
@@ -426,7 +426,7 @@ func (r *ClusterReconciler) updateStatus(ctx context.Context, cluster *postgresv
 
 	// Set condition
 	condition := metav1.Condition{
-		Type:               "Available",
+		Type:               ConditionTypeAvailable,
 		ObservedGeneration: cluster.Generation,
 		LastTransitionTime: metav1.Now(),
 	}

@@ -202,7 +202,7 @@ func (r *DatabaseReconciler) updateStatus(ctx context.Context, database *postgre
 	database.Status.CreatedSchemas = schemas
 
 	condition := metav1.Condition{
-		Type:               "Available",
+		Type:               ConditionTypeAvailable,
 		ObservedGeneration: database.Generation,
 		LastTransitionTime: metav1.Now(),
 	}

@@ -25,6 +25,11 @@ import (
 	_ "github.com/lib/pq"
 )
 
+const (
+	defaultSSLMode  = "disable"
+	defaultDatabase = "postgres"
+)
+
 // Client provides PostgreSQL database operations
 type Client struct {
 	db *sql.DB
@@ -43,10 +48,10 @@ type ConnectionConfig struct {
 // NewClient creates a new PostgreSQL client connection
 func NewClient(cfg ConnectionConfig) (*Client, error) {
 	if cfg.SSLMode == "" {
-		cfg.SSLMode = "disable"
+		cfg.SSLMode = defaultSSLMode
 	}
 	if cfg.Database == "" {
-		cfg.Database = "postgres"
+		cfg.Database = defaultDatabase
 	}
 
 	connStr := fmt.Sprintf(
@@ -110,20 +115,18 @@ func (c *Client) CreateRole(ctx context.Context, name string, opts RoleOptions) 
 }
 
 func (c *Client) buildCreateRoleQuery(name string, opts RoleOptions) string {
-	var parts []string
+	roleOpts := c.buildRoleOptions(opts)
+	parts := make([]string, 0, 1+len(roleOpts))
 	parts = append(parts, fmt.Sprintf("CREATE ROLE %s", quoteIdent(name)))
-
-	parts = append(parts, c.buildRoleOptions(opts)...)
-
+	parts = append(parts, roleOpts...)
 	return strings.Join(parts, " ")
 }
 
 func (c *Client) buildAlterRoleQuery(name string, opts RoleOptions) string {
-	var parts []string
+	roleOpts := c.buildRoleOptions(opts)
+	parts := make([]string, 0, 1+len(roleOpts))
 	parts = append(parts, fmt.Sprintf("ALTER ROLE %s", quoteIdent(name)))
-
-	parts = append(parts, c.buildRoleOptions(opts)...)
-
+	parts = append(parts, roleOpts...)
 	return strings.Join(parts, " ")
 }
 

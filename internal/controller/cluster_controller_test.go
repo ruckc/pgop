@@ -51,7 +51,7 @@ var _ = Describe("Cluster Controller", func() {
 					Namespace: ClusterNamespace,
 				},
 				Spec: postgresv1alpha1.ClusterSpec{
-					Image:    "postgres:18",
+					Image:    DefaultPostgresImage,
 					Replicas: 1,
 					Port:     5432,
 					Storage: postgresv1alpha1.StorageSpec{
@@ -108,7 +108,7 @@ var _ = Describe("Cluster Controller", func() {
 					Namespace: ClusterNamespace,
 				},
 				Spec: postgresv1alpha1.ClusterSpec{
-					Image:    "postgres:18",
+					Image:    DefaultPostgresImage,
 					Replicas: 1,
 					Port:     5432,
 				},
@@ -157,7 +157,7 @@ var _ = Describe("Cluster Controller", func() {
 					Namespace: ClusterNamespace,
 				},
 				Spec: postgresv1alpha1.ClusterSpec{
-					Image:    "postgres:18",
+					Image:    DefaultPostgresImage,
 					Replicas: 1,
 				},
 			}
@@ -191,7 +191,7 @@ var _ = Describe("Cluster Controller", func() {
 			By("Verifying StatefulSet spec")
 			Expect(*sts.Spec.Replicas).To(Equal(int32(1)))
 			Expect(sts.Spec.Template.Spec.Containers).To(HaveLen(1))
-			Expect(sts.Spec.Template.Spec.Containers[0].Image).To(Equal("postgres:18"))
+			Expect(sts.Spec.Template.Spec.Containers[0].Image).To(Equal(DefaultPostgresImage))
 		})
 
 		It("should update status after reconciliation", func() {
@@ -205,7 +205,7 @@ var _ = Describe("Cluster Controller", func() {
 					Namespace: ClusterNamespace,
 				},
 				Spec: postgresv1alpha1.ClusterSpec{
-					Image: "postgres:18",
+					Image: DefaultPostgresImage,
 				},
 			}
 			Expect(k8sClient.Create(ctx, cluster)).To(Succeed())
@@ -247,7 +247,7 @@ var _ = Describe("Cluster Controller", func() {
 					Namespace: ClusterNamespace,
 				},
 				Spec: postgresv1alpha1.ClusterSpec{
-					Image: "postgres:18",
+					Image: DefaultPostgresImage,
 				},
 			}
 			Expect(k8sClient.Create(ctx, cluster)).To(Succeed())
@@ -286,7 +286,7 @@ var _ = Describe("Cluster Controller", func() {
 					Namespace: ClusterNamespace,
 				},
 				Spec: postgresv1alpha1.ClusterSpec{
-					Image: "postgres:18",
+					Image: DefaultPostgresImage,
 				},
 			}
 			Expect(k8sClient.Create(ctx, cluster)).To(Succeed())
@@ -370,7 +370,7 @@ var _ = Describe("Cluster Controller", func() {
 				Namespace: ClusterNamespace,
 			}, sts)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(sts.Spec.Template.Spec.Containers[0].Image).To(Equal("postgres:18"))
+			Expect(sts.Spec.Template.Spec.Containers[0].Image).To(Equal(DefaultPostgresImage))
 		})
 
 		It("should handle cluster deletion", func() {
@@ -384,7 +384,7 @@ var _ = Describe("Cluster Controller", func() {
 					Namespace: ClusterNamespace,
 				},
 				Spec: postgresv1alpha1.ClusterSpec{
-					Image: "postgres:18",
+					Image: DefaultPostgresImage,
 				},
 			}
 			Expect(k8sClient.Create(ctx, cluster)).To(Succeed())
@@ -423,8 +423,8 @@ var _ = Describe("Cluster Controller", func() {
 
 			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
 				NamespacedName: types.NamespacedName{
-					Name:      "nonexistent-cluster",
-					Namespace: "default",
+					Name:      nonexistentCluster,
+					Namespace: ClusterNamespace,
 				},
 			})
 			Expect(err).NotTo(HaveOccurred())

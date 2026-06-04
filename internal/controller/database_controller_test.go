@@ -34,6 +34,7 @@ import (
 var _ = Describe("Database Controller", func() {
 	const (
 		DatabaseNamespace = "default"
+		appUser           = "app_user"
 		timeout           = time.Second * 10
 		interval          = time.Millisecond * 250
 	)
@@ -51,7 +52,7 @@ var _ = Describe("Database Controller", func() {
 					Namespace: DatabaseNamespace,
 				},
 				Spec: postgresv1alpha1.ClusterSpec{
-					Image:    "postgres:18",
+					Image:    DefaultPostgresImage,
 					Replicas: 1,
 				},
 			}
@@ -73,7 +74,7 @@ var _ = Describe("Database Controller", func() {
 					ClusterRef: postgresv1alpha1.ClusterReference{
 						Name: clusterName,
 					},
-					Owner: "app_user",
+					Owner: appUser,
 					Extensions: []postgresv1alpha1.ExtensionSpec{
 						{Name: "uuid-ossp"},
 						{Name: "pg_trgm"},
@@ -81,10 +82,10 @@ var _ = Describe("Database Controller", func() {
 					Schemas: []postgresv1alpha1.SchemaSpec{
 						{
 							Name:  "app",
-							Owner: "app_user",
+							Owner: appUser,
 							Grants: []postgresv1alpha1.GrantSpec{
 								{
-									Role:       "app_user",
+									Role:       appUser,
 									Privileges: []string{"USAGE", "CREATE"},
 								},
 							},
@@ -103,7 +104,7 @@ var _ = Describe("Database Controller", func() {
 			By("Verifying the Database was created")
 			err := k8sClient.Get(ctx, types.NamespacedName{Name: databaseName, Namespace: DatabaseNamespace}, database)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(database.Spec.Owner).To(Equal("app_user"))
+			Expect(database.Spec.Owner).To(Equal(appUser))
 			Expect(database.Spec.Extensions).To(HaveLen(2))
 			Expect(database.Spec.Schemas).To(HaveLen(1))
 
@@ -117,9 +118,9 @@ var _ = Describe("Database Controller", func() {
 			By("Verifying schema configuration")
 			schema := database.Spec.Schemas[0]
 			Expect(schema.Name).To(Equal("app"))
-			Expect(schema.Owner).To(Equal("app_user"))
+			Expect(schema.Owner).To(Equal(appUser))
 			Expect(schema.Grants).To(HaveLen(1))
-			Expect(schema.Grants[0].Role).To(Equal("app_user"))
+			Expect(schema.Grants[0].Role).To(Equal(appUser))
 			Expect(schema.Grants[0].Privileges).To(ContainElements("USAGE", "CREATE"))
 
 			By("Verifying the cluster reference")
@@ -138,7 +139,7 @@ var _ = Describe("Database Controller", func() {
 					Namespace: DatabaseNamespace,
 				},
 				Spec: postgresv1alpha1.ClusterSpec{
-					Image: "postgres:18",
+					Image: DefaultPostgresImage,
 				},
 			}
 			Expect(k8sClient.Create(ctx, cluster)).To(Succeed())
@@ -194,11 +195,11 @@ var _ = Describe("Database Controller", func() {
 			database := &postgresv1alpha1.Database{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      databaseName,
-					Namespace: "default",
+					Namespace: DatabaseNamespace,
 				},
 				Spec: postgresv1alpha1.DatabaseSpec{
 					ClusterRef: postgresv1alpha1.ClusterReference{
-						Name: "nonexistent-cluster",
+						Name: nonexistentCluster,
 					},
 				},
 			}
@@ -217,12 +218,12 @@ var _ = Describe("Database Controller", func() {
 			}
 
 			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
-				NamespacedName: types.NamespacedName{Name: databaseName, Namespace: "default"},
+				NamespacedName: types.NamespacedName{Name: databaseName, Namespace: DatabaseNamespace},
 			})
 			Expect(err).NotTo(HaveOccurred())
 
 			By("Checking the Database status shows not ready")
-			err = k8sClient.Get(ctx, types.NamespacedName{Name: databaseName, Namespace: "default"}, database)
+			err = k8sClient.Get(ctx, types.NamespacedName{Name: databaseName, Namespace: DatabaseNamespace}, database)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(database.Status.Ready).To(BeFalse())
 		})
@@ -239,7 +240,7 @@ var _ = Describe("Database Controller", func() {
 			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
 				NamespacedName: types.NamespacedName{
 					Name:      "nonexistent-database",
-					Namespace: "default",
+					Namespace: DatabaseNamespace,
 				},
 			})
 			Expect(err).NotTo(HaveOccurred())

@@ -142,7 +142,3 @@ type DatabaseList struct {
 	metav1.ListMeta `json:"metadata,omitzero"`
 	Items           []Database `json:"items"`
 }
-
-func init() {
-	SchemeBuilder.Register(&Database{}, &DatabaseList{})
-}

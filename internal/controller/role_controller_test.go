@@ -51,7 +51,7 @@ var _ = Describe("Role Controller", func() {
 					Namespace: RoleNamespace,
 				},
 				Spec: postgresv1alpha1.ClusterSpec{
-					Image:    "postgres:18",
+					Image:    DefaultPostgresImage,
 					Replicas: 1,
 				},
 			}
@@ -110,7 +110,7 @@ var _ = Describe("Role Controller", func() {
 					Namespace: RoleNamespace,
 				},
 				Spec: postgresv1alpha1.ClusterSpec{
-					Image: "postgres:18",
+					Image: DefaultPostgresImage,
 				},
 			}
 			Expect(k8sClient.Create(ctx, cluster)).To(Succeed())
@@ -167,11 +167,11 @@ var _ = Describe("Role Controller", func() {
 			role := &postgresv1alpha1.Role{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      roleName,
-					Namespace: "default",
+					Namespace: RoleNamespace,
 				},
 				Spec: postgresv1alpha1.RoleSpec{
 					ClusterRef: postgresv1alpha1.ClusterReference{
-						Name: "nonexistent-cluster",
+						Name: nonexistentCluster,
 					},
 					Login: true,
 				},
@@ -191,12 +191,12 @@ var _ = Describe("Role Controller", func() {
 			}
 
 			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
-				NamespacedName: types.NamespacedName{Name: roleName, Namespace: "default"},
+				NamespacedName: types.NamespacedName{Name: roleName, Namespace: RoleNamespace},
 			})
 			Expect(err).NotTo(HaveOccurred())
 
 			By("Checking the Role status shows not ready")
-			err = k8sClient.Get(ctx, types.NamespacedName{Name: roleName, Namespace: "default"}, role)
+			err = k8sClient.Get(ctx, types.NamespacedName{Name: roleName, Namespace: RoleNamespace}, role)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(role.Status.Ready).To(BeFalse())
 		})
@@ -213,7 +213,7 @@ var _ = Describe("Role Controller", func() {
 			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
 				NamespacedName: types.NamespacedName{
 					Name:      "nonexistent-role",
-					Namespace: "default",
+					Namespace: RoleNamespace,
 				},
 			})
 			Expect(err).NotTo(HaveOccurred())

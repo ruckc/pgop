@@ -20,6 +20,20 @@ import (
 	"testing"
 )
 
+const (
+	attrLogin         = "LOGIN"
+	attrNoSuperuser   = "NOSUPERUSER"
+	attrNoCreateDB    = "NOCREATEDB"
+	attrNoCreateRole  = "NOCREATEROLE"
+	attrNoReplication = "NOREPLICATION"
+	attrNoBypassRLS   = "NOBYPASSRLS"
+	attrConnLimitNeg1 = "CONNECTION LIMIT -1"
+	attrNoInherit     = "NOINHERIT"
+	testPGUser        = "postgres"
+	testPGPassword    = "secret"
+	testPGSSLMode     = "disable"
+)
+
 func TestQuoteIdent(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -127,14 +141,14 @@ func TestBuildRoleOptions(t *testing.T) {
 				ConnectionLimit: -1,
 			},
 			expected: []string{
-				"LOGIN",
-				"NOSUPERUSER",
-				"NOCREATEDB",
-				"NOCREATEROLE",
+				attrLogin,
+				attrNoSuperuser,
+				attrNoCreateDB,
+				attrNoCreateRole,
 				"INHERIT",
-				"NOREPLICATION",
-				"NOBYPASSRLS",
-				"CONNECTION LIMIT -1",
+				attrNoReplication,
+				attrNoBypassRLS,
+				attrConnLimitNeg1,
 			},
 		},
 		{
@@ -150,7 +164,7 @@ func TestBuildRoleOptions(t *testing.T) {
 				ConnectionLimit: 100,
 			},
 			expected: []string{
-				"LOGIN",
+				attrLogin,
 				"SUPERUSER",
 				"CREATEDB",
 				"CREATEROLE",
@@ -168,12 +182,12 @@ func TestBuildRoleOptions(t *testing.T) {
 			},
 			expected: []string{
 				"NOLOGIN",
-				"NOSUPERUSER",
-				"NOCREATEDB",
-				"NOCREATEROLE",
-				"NOINHERIT",
-				"NOREPLICATION",
-				"NOBYPASSRLS",
+				attrNoSuperuser,
+				attrNoCreateDB,
+				attrNoCreateRole,
+				attrNoInherit,
+				attrNoReplication,
+				attrNoBypassRLS,
 				"CONNECTION LIMIT 0",
 			},
 		},
@@ -185,14 +199,14 @@ func TestBuildRoleOptions(t *testing.T) {
 				Password:        "secret123",
 			},
 			expected: []string{
-				"LOGIN",
-				"NOSUPERUSER",
-				"NOCREATEDB",
-				"NOCREATEROLE",
-				"NOINHERIT",
-				"NOREPLICATION",
-				"NOBYPASSRLS",
-				"CONNECTION LIMIT -1",
+				attrLogin,
+				attrNoSuperuser,
+				attrNoCreateDB,
+				attrNoCreateRole,
+				attrNoInherit,
+				attrNoReplication,
+				attrNoBypassRLS,
+				attrConnLimitNeg1,
 				"PASSWORD 'secret123'",
 			},
 		},
@@ -204,14 +218,14 @@ func TestBuildRoleOptions(t *testing.T) {
 				Password:        "pass'word",
 			},
 			expected: []string{
-				"LOGIN",
-				"NOSUPERUSER",
-				"NOCREATEDB",
-				"NOCREATEROLE",
-				"NOINHERIT",
-				"NOREPLICATION",
-				"NOBYPASSRLS",
-				"CONNECTION LIMIT -1",
+				attrLogin,
+				attrNoSuperuser,
+				attrNoCreateDB,
+				attrNoCreateRole,
+				attrNoInherit,
+				attrNoReplication,
+				attrNoBypassRLS,
+				attrConnLimitNeg1,
 				"PASSWORD 'pass''word'",
 			},
 		},
@@ -327,10 +341,10 @@ func TestConnectionConfig(t *testing.T) {
 	cfg := ConnectionConfig{
 		Host:     "localhost",
 		Port:     5432,
-		User:     "postgres",
-		Password: "secret",
+		User:     testPGUser,
+		Password: testPGPassword,
 		Database: "testdb",
-		SSLMode:  "disable",
+		SSLMode:  testPGSSLMode,
 	}
 
 	if cfg.Host != "localhost" {
@@ -339,14 +353,14 @@ func TestConnectionConfig(t *testing.T) {
 	if cfg.Port != 5432 {
 		t.Errorf("Port = %d, want %d", cfg.Port, 5432)
 	}
-	if cfg.User != "postgres" {
-		t.Errorf("User = %q, want %q", cfg.User, "postgres")
+	if cfg.User != testPGUser {
+		t.Errorf("User = %q, want %q", cfg.User, testPGUser)
 	}
 	if cfg.Database != "testdb" {
 		t.Errorf("Database = %q, want %q", cfg.Database, "testdb")
 	}
-	if cfg.SSLMode != "disable" {
-		t.Errorf("SSLMode = %q, want %q", cfg.SSLMode, "disable")
+	if cfg.SSLMode != testPGSSLMode {
+		t.Errorf("SSLMode = %q, want %q", cfg.SSLMode, testPGSSLMode)
 	}
 }
 
@@ -361,7 +375,7 @@ func TestRoleOptions(t *testing.T) {
 		Replication:     false,
 		BypassRLS:       false,
 		ConnectionLimit: 10,
-		Password:        "secret",
+		Password:        testPGPassword,
 	}
 
 	if !opts.Login {
@@ -376,8 +390,8 @@ func TestRoleOptions(t *testing.T) {
 	if opts.ConnectionLimit != 10 {
 		t.Errorf("ConnectionLimit = %d, want %d", opts.ConnectionLimit, 10)
 	}
-	if opts.Password != "secret" {
-		t.Errorf("Password = %q, want %q", opts.Password, "secret")
+	if opts.Password != testPGPassword {
+		t.Errorf("Password = %q, want %q", opts.Password, testPGPassword)
 	}
 }
 

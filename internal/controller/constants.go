@@ -16,7 +16,22 @@ limitations under the License.
 
 package controller
 
-// Common condition reasons used across controllers
+// Common constants used across controllers
 const (
 	ReasonReconcileError = "ReconcileError"
+
+	LabelAppName      = "app.kubernetes.io/name"
+	LabelAppInstance  = "app.kubernetes.io/instance"
+	LabelAppManagedBy = "app.kubernetes.io/managed-by"
+	LabelValuePgop    = "pgop"
+
+	AppNamePostgresql = "postgresql"
+
+	SecretKeyUsername = "username"
+	SecretKeyPassword = "password"
+
+	DefaultPostgresImage    = "postgres:18"
+	DefaultOperatorUsername = "pgop_operator"
+
+	ConditionTypeAvailable = "Available"
 )
