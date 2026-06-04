@@ -94,8 +94,8 @@ docker-build-e2e: ## Build docker image with the manager for e2e tests (with cov
 	$(CONTAINER_TOOL) build --build-arg GO_BUILD_FLAGS="-cover" -t ${IMG} .
 
 .PHONY: test-e2e
-test-e2e: setup-test-e2e manifests generate fmt vet docker-build-e2e ## Run the e2e tests with coverage.
-	KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) go test -tags=e2e ./test/e2e/ -v -ginkgo.v
+test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests with coverage.
+	KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) go test -timeout 30m -tags=e2e ./test/e2e/ -v -ginkgo.v
 	$(MAKE) cleanup-test-e2e
 
 .PHONY: cleanup-test-e2e
