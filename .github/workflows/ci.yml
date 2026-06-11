@@ -113,6 +113,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      workflows: write
     outputs:
       version: ${{ steps.calc.outputs.version }}
       branch: ${{ steps.commit.outputs.branch }}
@@ -254,6 +255,7 @@ jobs:
       packages: write
       pages: write
       id-token: write
+      workflows: write
     environment:
       name: github-pages
       url: ${{ steps.deploy-pages.outputs.page_url }}
