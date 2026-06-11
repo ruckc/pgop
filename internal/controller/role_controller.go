@@ -152,7 +152,7 @@ func (r *RoleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 }
 
 func (r *RoleReconciler) reconcileCredentialsSecret(ctx context.Context, role *postgresv1alpha1.Role, cluster *postgresv1alpha1.Cluster) (string, string, error) {
-	secretName := role.Name + "-credentials"
+	secretName := cluster.Name + "-" + role.Name + "-credentials"
 
 	// Check if secret already exists
 	existingSecret := &corev1.Secret{}
