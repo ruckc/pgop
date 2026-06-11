@@ -2,7 +2,7 @@ name: Deploy Documentation
 
 on:
   workflow_run:
-    workflows: ["Publish Container"]
+    workflows: ["Release"]
     types: [completed]
     branches: [main]
   workflow_dispatch:
