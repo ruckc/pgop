@@ -90,9 +90,22 @@ jobs:
           go mod tidy
           make test-e2e
 
+  lint-helm:
+    name: Lint Helm Chart
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.3
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v4
+
+      - name: Lint chart
+        run: helm lint charts/pgop --strict
+
   prepare-release:
     name: Prepare Release
-    needs: [lint, test, test-e2e]
+    needs: [lint, test, test-e2e, lint-helm]
     # Only run on main or manual dispatch, and skip if this push is itself a release merge
     if: |
       (github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch') &&
@@ -153,18 +166,27 @@ jobs:
           echo "Last tag: $LAST_TAG → $VERSION (bump: $BUMP)"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-      - name: Create release branch, commit, and tag
+      - name: Create release branch, update chart, commit, and tag
         id: commit
         run: |
           VERSION="${{ steps.calc.outputs.version }}"
+          CHART_VERSION="${VERSION#v}"
           BRANCH="release/${VERSION}"
 
           git config user.name "${{ github.actor }}"
           git config user.email "${{ github.actor }}@users.noreply.github.com"
 
           git checkout -b "$BRANCH"
+
+          # Stamp version into tracked files
           echo "$VERSION" > VERSION
-          git add VERSION
+          sed -i "s/^version:.*/version: ${CHART_VERSION}/" charts/pgop/Chart.yaml
+          sed -i "s/^appVersion:.*/appVersion: \"${VERSION}\"/" charts/pgop/Chart.yaml
+
+          # Refresh CRDs in the chart from the generated sources
+          cp config/crd/bases/*.yaml charts/pgop/crds/
+
+          git add VERSION charts/pgop/Chart.yaml charts/pgop/crds/
           git commit -m "chore: release ${VERSION}"
           git tag -a "${VERSION}" -m "Release ${VERSION}"
           git push origin "${BRANCH}" --tags
@@ -173,7 +195,7 @@ jobs:
           echo "staging_tag=staging-${{ github.sha }}" >> "$GITHUB_OUTPUT"
 
   build:
-    name: Build Container
+    name: Build
     needs: [prepare-release]
     runs-on: ubuntu-latest
     permissions:
@@ -206,6 +228,19 @@ jobs:
           tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.prepare-release.outputs.staging_tag }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v4
+
+      - name: Package Helm chart
+        run: helm package charts/pgop
+
+      - name: Upload Helm chart artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: helm-chart
+          path: "*.tgz"
+          retention-days: 1
 
   release:
     name: Release
@@ -243,6 +278,17 @@ jobs:
             --tag "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest" \
             "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.prepare-release.outputs.staging_tag }}"
 
+      - name: Download Helm chart artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: helm-chart
+
+      - name: Push Helm chart to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ${{ env.REGISTRY }} \
+            --username ${{ github.actor }} --password-stdin
+          helm push pgop-*.tgz oci://${{ env.REGISTRY }}/${{ github.repository_owner }}/charts
+
       - name: Merge release branch into main
         run: |
           git config user.name "${{ github.actor }}"
@@ -264,6 +310,11 @@ jobs:
             --title "${{ needs.prepare-release.outputs.version }}" \
             --generate-notes \
             --latest
+
+      - name: Attach Helm chart to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ needs.prepare-release.outputs.version }}" pgop-*.tgz
 
       - name: Setup Python
         uses: actions/setup-python@v6.2.0
@@ -288,4 +339,3 @@ jobs:
       - name: Deploy to GitHub Pages
         id: deploy-pages
         uses: actions/deploy-pages@v5.0.0
-

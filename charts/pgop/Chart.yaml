@@ -1,0 +1,16 @@
+apiVersion: v2
+name: pgop
+description: A Kubernetes operator for managing PostgreSQL databases
+type: application
+version: 0.0.0
+appVersion: "latest"
+keywords:
+  - postgresql
+  - operator
+  - kubernetes
+home: https://github.com/ruckc/pgop
+sources:
+  - https://github.com/ruckc/pgop
+maintainers:
+  - name: ruckc
+    url: https://github.com/ruckc

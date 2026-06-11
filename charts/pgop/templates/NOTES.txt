@@ -1,0 +1,10 @@
+pgop {{ .Chart.AppVersion }} has been deployed to namespace {{ .Release.Namespace }}.
+
+The operator manages PostgreSQL clusters via three custom resources:
+
+  kubectl apply -f https://raw.githubusercontent.com/ruckc/pgop/main/config/samples/postgres_v1alpha1_cluster.yaml
+  kubectl apply -f https://raw.githubusercontent.com/ruckc/pgop/main/config/samples/postgres_v1alpha1_role.yaml
+  kubectl apply -f https://raw.githubusercontent.com/ruckc/pgop/main/config/samples/postgres_v1alpha1_database.yaml
+
+Controller logs:
+  kubectl logs -n {{ .Release.Namespace }} deployment/{{ include "pgop.fullname" . }} -f
