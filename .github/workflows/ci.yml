@@ -113,7 +113,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-      workflows: write
     outputs:
       version: ${{ steps.calc.outputs.version }}
       branch: ${{ steps.commit.outputs.branch }}
@@ -256,7 +255,6 @@ jobs:
       packages: write
       pages: write
       id-token: write
-      workflows: write
     environment:
       name: github-pages
       url: ${{ steps.deploy-pages.outputs.page_url }}
@@ -266,7 +264,7 @@ jobs:
         with:
           ref: ${{ needs.prepare-release.outputs.branch }}
           fetch-depth: 0
-          token: ${{ secrets.RELEASE_TOKEN }}
+          token: ${{ secrets.RELEASE_TOKEN || github.token }}
 
       - name: Log in to registry
         uses: docker/login-action@v4.2.0
