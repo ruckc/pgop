@@ -484,7 +484,7 @@ var _ = Describe("Manager", Ordered, func() {
 			Eventually(verifyRoleReady, 2*time.Minute, time.Second).Should(Succeed())
 
 			By("Verifying the Role Secret is created")
-			cmd = exec.Command("kubectl", "get", "secret", "app-user-credentials", "-n", namespace)
+			cmd = exec.Command("kubectl", "get", "secret", "example-cluster-app-user-credentials", "-n", namespace)
 			_, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred(), "Role secret not found")
 
