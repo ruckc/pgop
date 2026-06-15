@@ -2,6 +2,8 @@
 # since it depends on service name and namespace that are out of this kustomize package.
 # It should be run by config/default
 resources:
+- bases/pgop.ruck.io_backupruns.yaml
+- bases/pgop.ruck.io_backups.yaml
 - bases/pgop.ruck.io_clusters.yaml
 - bases/pgop.ruck.io_databases.yaml
 - bases/pgop.ruck.io_roles.yaml

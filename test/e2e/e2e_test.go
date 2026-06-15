@@ -504,6 +504,8 @@ var _ = Describe("Manager", Ordered, func() {
 			Eventually(verifyDatabaseReady, 2*time.Minute, time.Second).Should(Succeed())
 		})
 	})
+
+	RegisterBackupTests()
 })
 
 // serviceAccountToken returns a token for the specified service account in the given namespace.

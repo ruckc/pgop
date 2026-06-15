@@ -34,43 +34,31 @@ import (
 // rustfsNamespace is where RustFS (S3-compatible) is deployed for backup tests
 const rustfsNamespace = "rustfs"
 
-var _ = Describe("Backup", Ordered, func() {
-	BeforeAll(func() {
-		By("creating rustfs namespace")
-		cmd := exec.Command("kubectl", "create", "ns", rustfsNamespace)
-		_, _ = utils.Run(cmd) // ignore error if namespace already exists
+// RegisterBackupTests adds backup test specs into the caller's Describe/Context block.
+// Must be called inside a Describe/Context that has already deployed the controller into `namespace`.
+func RegisterBackupTests() {
+	Context("Backup — logical pg_dump via RustFS", Ordered, func() {
+		BeforeAll(func() {
+			By("creating rustfs namespace")
+			cmd := exec.Command("kubectl", "create", "ns", rustfsNamespace)
+			_, _ = utils.Run(cmd) // ignore error if already exists
 
-		By("deploying RustFS as S3-compatible storage")
-		deployRustFS()
+			By("deploying RustFS as S3-compatible storage")
+			deployRustFS()
 
-		By("waiting for RustFS to be ready")
-		Eventually(func(g Gomega) {
-			cmd := exec.Command("kubectl", "rollout", "status", "deployment/rustfs", "-n", rustfsNamespace, "--timeout=2m")
-			_, err := utils.Run(cmd)
-			g.Expect(err).NotTo(HaveOccurred())
-		}, 3*time.Minute, 5*time.Second).Should(Succeed())
+			By("waiting for RustFS to be ready")
+			Eventually(func(g Gomega) {
+				cmd := exec.Command("kubectl", "rollout", "status", "deployment/rustfs",
+					"-n", rustfsNamespace, "--timeout=2m")
+				_, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+			}, 3*time.Minute, 5*time.Second).Should(Succeed())
 
-		By("creating RustFS S3 bucket for backups")
-		createRustFSBucket()
-	})
+			By("creating S3 bucket in RustFS")
+			createRustFSBucket()
 
-	AfterAll(func() {
-		By("cleaning up backup resources")
-		cmd := exec.Command("kubectl", "delete", "backup.pgop.ruck.io", "myapp-backup", "-n", namespace, "--ignore-not-found")
-		_, _ = utils.Run(cmd)
-
-		By("removing rustfs namespace")
-		cmd = exec.Command("kubectl", "delete", "ns", rustfsNamespace, "--ignore-not-found")
-		_, _ = utils.Run(cmd)
-	})
-
-	SetDefaultEventuallyTimeout(5 * time.Minute)
-	SetDefaultEventuallyPollingInterval(5 * time.Second)
-
-	Context("Logical Backup via pg_dump", func() {
-		It("should create CronJobs for schema and data backups", func() {
-			By("creating RustFS credentials secret in pgop-system namespace")
-			cmd := exec.Command("kubectl", "create", "secret", "generic", "rustfs-credentials",
+			By("creating RustFS credentials secret in manager namespace")
+			cmd = exec.Command("kubectl", "create", "secret", "generic", "rustfs-credentials",
 				"--from-literal=AWS_ACCESS_KEY_ID=minioadmin",
 				"--from-literal=AWS_SECRET_ACCESS_KEY=minioadmin",
 				"-n", namespace,
@@ -79,10 +67,26 @@ var _ = Describe("Backup", Ordered, func() {
 			out, err := utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
 			applyCmd := exec.Command("kubectl", "apply", "-f", "-")
-			applyCmd.Stdin = stringReader(out)
+			applyCmd.Stdin = newStringReader(out)
 			_, err = utils.Run(applyCmd)
 			Expect(err).NotTo(HaveOccurred())
+		})
 
+		AfterAll(func() {
+			By("cleaning up Backup CR")
+			cmd := exec.Command("kubectl", "delete", "backup.pgop.ruck.io", "myapp-backup",
+				"-n", namespace, "--ignore-not-found")
+			_, _ = utils.Run(cmd)
+
+			By("removing rustfs namespace")
+			cmd = exec.Command("kubectl", "delete", "ns", rustfsNamespace, "--ignore-not-found")
+			_, _ = utils.Run(cmd)
+		})
+
+		SetDefaultEventuallyTimeout(5 * time.Minute)
+		SetDefaultEventuallyPollingInterval(5 * time.Second)
+
+		It("should create CronJobs and successfully upload backup artifacts to S3", func() {
 			By("applying the Backup CR")
 			backupYAML := fmt.Sprintf(`
 apiVersion: pgop.ruck.io/v1alpha1
@@ -109,9 +113,9 @@ spec:
         name: rustfs-credentials
 `, namespace, rustfsNamespace)
 
-			applyCmd = exec.Command("kubectl", "apply", "-f", "-")
-			applyCmd.Stdin = stringReader(backupYAML)
-			_, err = utils.Run(applyCmd)
+			applyCmd := exec.Command("kubectl", "apply", "-f", "-")
+			applyCmd.Stdin = newStringReader(backupYAML)
+			_, err := utils.Run(applyCmd)
 			Expect(err).NotTo(HaveOccurred(), "Failed to apply Backup CR")
 
 			By("verifying schema CronJob is created")
@@ -129,7 +133,7 @@ spec:
 			}).Should(Succeed())
 
 			By("triggering a manual schema backup job")
-			cmd = exec.Command("kubectl", "create", "job", "schema-backup-manual",
+			cmd := exec.Command("kubectl", "create", "job", "schema-backup-manual",
 				"--from=cronjob/myapp-backup-schema", "-n", namespace)
 			_, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
@@ -161,26 +165,64 @@ spec:
 			}, 5*time.Minute, 10*time.Second).Should(Succeed())
 
 			By("verifying backup artifacts exist in RustFS")
+			// Clean up any prior check pod first
+			_ = exec.Command("kubectl", "delete", "pod", "check-backup",
+				"-n", rustfsNamespace, "--ignore-not-found").Run()
+
+			checkYAML := fmt.Sprintf(`
+apiVersion: v1
+kind: Pod
+metadata:
+  name: check-backup
+  namespace: %s
+spec:
+  restartPolicy: Never
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    runAsGroup: 1000
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: check
+      image: amazon/aws-cli:2.27.46
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
+      command: ["/bin/sh", "-c", "aws s3 ls s3://pgop-backups/myapp/ && echo 'found'"]
+      env:
+        - name: AWS_ACCESS_KEY_ID
+          value: minioadmin
+        - name: AWS_SECRET_ACCESS_KEY
+          value: minioadmin
+        - name: AWS_DEFAULT_REGION
+          value: us-east-1
+        - name: AWS_ENDPOINT_URL
+          value: http://rustfs:9000
+`, rustfsNamespace)
+
+			applyCmd = exec.Command("kubectl", "apply", "-f", "-")
+			applyCmd.Stdin = newStringReader(checkYAML)
+			_, err = utils.Run(applyCmd)
+			Expect(err).NotTo(HaveOccurred())
+
 			Eventually(func(g Gomega) {
-				cmd := exec.Command("kubectl", "run", "check-backup", "--restart=Never",
-					"-n", rustfsNamespace,
-					"--image=amazon/aws-cli:2.27.46",
-					"--env=AWS_ACCESS_KEY_ID=minioadmin",
-					"--env=AWS_SECRET_ACCESS_KEY=minioadmin",
-					"--env=AWS_DEFAULT_REGION=us-east-1",
-					"--env=AWS_ENDPOINT_URL=http://rustfs:9000",
-					"--command", "--",
-					"aws", "s3", "ls", "s3://pgop-backups/myapp/",
-				)
+				cmd := exec.Command("kubectl", "get", "pod", "check-backup",
+					"-n", rustfsNamespace, "-o", "jsonpath={.status.phase}")
 				out, err := utils.Run(cmd)
 				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(out).NotTo(BeEmpty(), "no backup files found in RustFS")
-				// clean up the check pod
-				_ = exec.Command("kubectl", "delete", "pod", "check-backup", "-n", rustfsNamespace, "--ignore-not-found").Run()
-			}, 2*time.Minute, 15*time.Second).Should(Succeed())
+				g.Expect(out).To(Equal("Succeeded"))
+			}, 2*time.Minute, 5*time.Second).Should(Succeed())
+
+			// Verify the pod logged 'found'
+			cmd = exec.Command("kubectl", "logs", "check-backup", "-n", rustfsNamespace)
+			out, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(out).To(ContainSubstring("found"), "backup artifacts not found in RustFS")
 		})
 	})
-})
+}
 
 // deployRustFS deploys RustFS (S3-compatible object storage) into the rustfs namespace.
 func deployRustFS() {
@@ -236,7 +278,6 @@ spec:
             allowPrivilegeEscalation: false
             capabilities:
               drop: ["ALL"]
-            readOnlyRootFilesystem: false
           volumeMounts:
             - name: data
               mountPath: /data
@@ -259,7 +300,7 @@ spec:
 `, rustfsNamespace, rustfsNamespace, rustfsNamespace)
 
 	cmd := exec.Command("kubectl", "apply", "-f", "-")
-	cmd.Stdin = stringReader(rustfsYAML)
+	cmd.Stdin = newStringReader(rustfsYAML)
 	_, err := utils.Run(cmd)
 	Expect(err).NotTo(HaveOccurred(), "Failed to deploy RustFS")
 }
@@ -292,8 +333,7 @@ spec:
           command:
             - /bin/sh
             - -c
-            - |
-              aws s3 mb s3://pgop-backups --region us-east-1
+            - aws s3 mb s3://pgop-backups --region us-east-1
           env:
             - name: AWS_ACCESS_KEY_ID
               value: minioadmin
@@ -306,11 +346,10 @@ spec:
 `, rustfsNamespace)
 
 	cmd := exec.Command("kubectl", "apply", "-f", "-")
-	cmd.Stdin = stringReader(bucketJobYAML)
+	cmd.Stdin = newStringReader(bucketJobYAML)
 	_, err := utils.Run(cmd)
 	Expect(err).NotTo(HaveOccurred(), "Failed to create bucket job")
 
-	// Wait for bucket creation job to complete
 	Eventually(func(g Gomega) {
 		cmd := exec.Command("kubectl", "get", "job", "create-bucket", "-n", rustfsNamespace,
 			"-o", "jsonpath={.status.succeeded}")
@@ -320,14 +359,13 @@ spec:
 	}, 3*time.Minute, 5*time.Second).Should(Succeed())
 }
 
-// stringReader creates an *strings.Reader that implements io.Reader for use as cmd.Stdin.
-func stringReader(s string) *stringReaderImpl {
-	return &stringReaderImpl{data: s, pos: 0}
-}
-
 type stringReaderImpl struct {
 	data string
 	pos  int
+}
+
+func newStringReader(s string) *stringReaderImpl {
+	return &stringReaderImpl{data: s}
 }
 
 func (r *stringReaderImpl) Read(p []byte) (int, error) {
