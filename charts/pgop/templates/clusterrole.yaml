@@ -6,7 +6,7 @@ metadata:
     {{- include "pgop.labels" . | nindent 4 }}
 rules:
 - apiGroups: [""]
-  resources: [persistentvolumeclaims, secrets, services]
+  resources: [configmaps, persistentvolumeclaims, secrets, services]
   verbs: [create, delete, get, list, patch, update, watch]
 - apiGroups: [apps]
   resources: [statefulsets]
