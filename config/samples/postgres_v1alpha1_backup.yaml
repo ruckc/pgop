@@ -1,0 +1,22 @@
+apiVersion: pgop.ruck.io/v1alpha1
+kind: Backup
+metadata:
+  name: myapp-backup
+  namespace: pgop-system
+spec:
+  type: logical
+  databaseRef:
+    name: myapp
+  schedule: "0 2 * * *"
+  retention:
+    disabled: true
+  backupRunTTL: "168h"
+  destination:
+    type: s3
+    s3:
+      bucket: pgop-backups
+      prefix: myapp
+      region: us-east-1
+      endpoint: http://rustfs:9000
+      credentialsSecretRef:
+        name: rustfs-credentials

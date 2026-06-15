@@ -31,8 +31,23 @@ rules:
   - update
   - watch
 - apiGroups:
+  - batch
+  resources:
+  - cronjobs
+  - jobs
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
   - pgop.ruck.io
   resources:
+  - backupruns
+  - backups
   - clusters
   - databases
   - roles
@@ -47,6 +62,8 @@ rules:
 - apiGroups:
   - pgop.ruck.io
   resources:
+  - backupruns/finalizers
+  - backups/finalizers
   - clusters/finalizers
   - databases/finalizers
   - roles/finalizers
@@ -55,6 +72,8 @@ rules:
 - apiGroups:
   - pgop.ruck.io
   resources:
+  - backupruns/status
+  - backups/status
   - clusters/status
   - databases/status
   - roles/status

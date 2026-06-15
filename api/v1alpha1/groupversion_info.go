@@ -41,6 +41,8 @@ func addKnownTypes(s *runtime.Scheme) error {
 		&Cluster{}, &ClusterList{},
 		&Database{}, &DatabaseList{},
 		&Role{}, &RoleList{},
+		&Backup{}, &BackupList{},
+		&BackupRun{}, &BackupRunList{},
 	)
 	metav1.AddToGroupVersion(s, GroupVersion)
 	return nil
