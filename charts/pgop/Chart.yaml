@@ -2,8 +2,8 @@ apiVersion: v2
 name: pgop
 description: A Kubernetes operator for managing PostgreSQL databases
 type: application
-version: 0.1.4
-appVersion: "v0.1.4"
+version: 0.2.0
+appVersion: "v0.2.0"
 keywords:
   - postgresql
   - operator
