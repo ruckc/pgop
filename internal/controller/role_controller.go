@@ -66,6 +66,38 @@ func (r *RoleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		return ctrl.Result{}, err
 	}
 
+	// Handle deletion before attempting cluster connection
+	if role.DeletionTimestamp != nil {
+		if controllerutil.ContainsFinalizer(role, roleFinalizer) {
+			cluster, err := r.getCluster(ctx, role)
+			if err != nil && !apierrors.IsNotFound(err) {
+				log.Error(err, "Failed to get Cluster during deletion")
+				return ctrl.Result{}, err
+			}
+			if err == nil {
+				pgClient, err := r.getPostgresClient(ctx, cluster)
+				if err != nil {
+					log.Error(err, "Failed to create PostgreSQL client during deletion")
+					return ctrl.Result{}, err
+				}
+				defer func() { _ = pgClient.Close() }()
+				if err := pgClient.DropRole(ctx, role.Name); err != nil {
+					log.Error(err, "Failed to drop role")
+					return ctrl.Result{}, err
+				}
+			} else {
+				log.Info("Cluster not found during deletion, skipping PG cleanup")
+			}
+
+			// Secret will be garbage collected due to owner reference
+			controllerutil.RemoveFinalizer(role, roleFinalizer)
+			if err := r.Update(ctx, role); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+		return ctrl.Result{}, nil
+	}
+
 	// Get the referenced cluster
 	cluster, err := r.getCluster(ctx, role)
 	if err != nil {
@@ -86,25 +118,6 @@ func (r *RoleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		return r.updateStatus(ctx, role, false, "", err)
 	}
 	defer func() { _ = pgClient.Close() }()
-
-	// Handle deletion
-	if role.DeletionTimestamp != nil {
-		if controllerutil.ContainsFinalizer(role, roleFinalizer) {
-			// Delete the role from PostgreSQL
-			if err := pgClient.DropRole(ctx, role.Name); err != nil {
-				log.Error(err, "Failed to drop role")
-				return ctrl.Result{}, err
-			}
-
-			// Secret will be garbage collected due to owner reference
-
-			controllerutil.RemoveFinalizer(role, roleFinalizer)
-			if err := r.Update(ctx, role); err != nil {
-				return ctrl.Result{}, err
-			}
-		}
-		return ctrl.Result{}, nil
-	}
 
 	// Add finalizer if not present
 	if !controllerutil.ContainsFinalizer(role, roleFinalizer) {

@@ -63,6 +63,37 @@ func (r *DatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{}, err
 	}
 
+	// Handle deletion before attempting cluster connection
+	if database.DeletionTimestamp != nil {
+		if controllerutil.ContainsFinalizer(database, databaseFinalizer) {
+			cluster, err := r.getCluster(ctx, database)
+			if err != nil && !apierrors.IsNotFound(err) {
+				log.Error(err, "Failed to get Cluster during deletion")
+				return ctrl.Result{}, err
+			}
+			if err == nil {
+				adminClient, err := r.getPostgresClient(ctx, cluster, "postgres")
+				if err != nil {
+					log.Error(err, "Failed to create PostgreSQL admin client during deletion")
+					return ctrl.Result{}, err
+				}
+				defer func() { _ = adminClient.Close() }()
+				if err := adminClient.DropDatabase(ctx, database.Name); err != nil {
+					log.Error(err, "Failed to drop database")
+					return ctrl.Result{}, err
+				}
+			} else {
+				log.Info("Cluster not found during deletion, skipping PG cleanup")
+			}
+
+			controllerutil.RemoveFinalizer(database, databaseFinalizer)
+			if err := r.Update(ctx, database); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+		return ctrl.Result{}, nil
+	}
+
 	// Get the referenced cluster
 	cluster, err := r.getCluster(ctx, database)
 	if err != nil {
@@ -83,23 +114,6 @@ func (r *DatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return r.updateStatus(ctx, database, false, nil, nil, err)
 	}
 	defer func() { _ = adminClient.Close() }()
-
-	// Handle deletion
-	if database.DeletionTimestamp != nil {
-		if controllerutil.ContainsFinalizer(database, databaseFinalizer) {
-			// Delete the database from PostgreSQL
-			if err := adminClient.DropDatabase(ctx, database.Name); err != nil {
-				log.Error(err, "Failed to drop database")
-				return ctrl.Result{}, err
-			}
-
-			controllerutil.RemoveFinalizer(database, databaseFinalizer)
-			if err := r.Update(ctx, database); err != nil {
-				return ctrl.Result{}, err
-			}
-		}
-		return ctrl.Result{}, nil
-	}
 
 	// Add finalizer if not present
 	if !controllerutil.ContainsFinalizer(database, databaseFinalizer) {
