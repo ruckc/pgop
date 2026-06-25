@@ -179,17 +179,22 @@ var _ = Describe("Manager", Ordered, func() {
 		_, _ = utils.Run(cmd)
 
 		By("removing custom resources to avoid finalizer deadlock")
-		// Clean up Database
-		cmd = exec.Command("kubectl", "delete", "database.pgop.ruck.io", "myapp", "-n", namespace, "--ignore-not-found")
-		_, _ = utils.Run(cmd)
-
-		// Clean up Role
-		cmd = exec.Command("kubectl", "delete", "role.pgop.ruck.io", "app-user", "-n", namespace, "--ignore-not-found")
-		_, _ = utils.Run(cmd)
-
-		// Clean up Cluster
-		cmd = exec.Command("kubectl", "delete", "cluster.postgres.ruck.io", "example-cluster", "-n", namespace, "--ignore-not-found")
-		_, _ = utils.Run(cmd)
+		// The manager was already stopped to flush coverage, so finalizers must be
+		// stripped before deletion — otherwise the delete calls block indefinitely.
+		for _, res := range []string{
+			"database.pgop.ruck.io/myapp",
+			"role.pgop.ruck.io/app-user",
+			"cluster.pgop.ruck.io/example-cluster",
+		} {
+			parts := strings.SplitN(res, "/", 2)
+			kind, name := parts[0], parts[1]
+			cmd = exec.Command("kubectl", "patch", kind, name, "-n", namespace,
+				"--type=merge", "-p", `{"metadata":{"finalizers":[]}}`,
+				"--ignore-not-found=true")
+			_, _ = utils.Run(cmd)
+			cmd = exec.Command("kubectl", "delete", kind, name, "-n", namespace, "--ignore-not-found")
+			_, _ = utils.Run(cmd)
+		}
 
 		By("undeploying the controller-manager")
 		cmd = exec.Command("make", "undeploy")
