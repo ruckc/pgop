@@ -29,6 +29,9 @@ const (
 
 	SecretKeyUsername = "username"
 	SecretKeyPassword = "password"
+	SecretKeyHost     = "host"
+	SecretKeyPort     = "port"
+	SecretKeyDatabase = "database"
 
 	DefaultPostgresImage    = "postgres:18"
 	DefaultOperatorUsername = "pgop_operator"
