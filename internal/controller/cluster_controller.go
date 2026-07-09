@@ -235,8 +235,10 @@ func (r *ClusterReconciler) reconcileStatefulSet(ctx context.Context, cluster *p
 	sts := &appsv1.StatefulSet{}
 	err := r.Get(ctx, types.NamespacedName{Name: stsName, Namespace: cluster.Namespace}, sts)
 	if err == nil {
-		// TODO: Update StatefulSet if needed
-		return nil
+		// Ensure the password-sync lifecycle hook is present on existing
+		// StatefulSets so clusters created before this fix self-heal on the
+		// next rollout. See https://github.com/ruckc/pgop/issues/7.
+		return r.ensurePasswordSyncLifecycle(ctx, sts)
 	}
 	if !apierrors.IsNotFound(err) {
 		return err
@@ -344,6 +346,7 @@ func (r *ClusterReconciler) reconcileStatefulSet(ctx context.Context, cluster *p
 									// SubPath:   "pgdata",
 								},
 							},
+							Lifecycle: operatorPasswordSyncLifecycle(),
 							Resources: cluster.Spec.Resources,
 							ReadinessProbe: &corev1.Probe{
 								ProbeHandler: corev1.ProbeHandler{
@@ -393,6 +396,44 @@ func (r *ClusterReconciler) reconcileStatefulSet(ctx context.Context, cluster *p
 	}
 
 	return r.Create(ctx, sts)
+}
+
+// operatorPasswordSyncLifecycle returns a postStart hook that converges the
+// in-database operator password to the value in the credentials Secret
+// (injected as $POSTGRES_PASSWORD) on every pod start.
+//
+// The official postgres image only applies POSTGRES_PASSWORD during initdb, so
+// when a pod restarts on a retained PVC after the credentials Secret has been
+// regenerated (e.g. Cluster delete/recreate or Helm redeploy) the database
+// keeps the old password and the operator can no longer authenticate, failing
+// every Role/Database reconcile with 28P01. Local socket connections use trust
+// auth, so this ALTER ROLE needs no password itself.
+// See https://github.com/ruckc/pgop/issues/7.
+func operatorPasswordSyncLifecycle() *corev1.Lifecycle {
+	script := `until pg_isready -q 2>/dev/null; do sleep 1; done; ` +
+		`psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d postgres ` +
+		`-c "ALTER ROLE \"$POSTGRES_USER\" WITH PASSWORD '$POSTGRES_PASSWORD'"`
+	return &corev1.Lifecycle{
+		PostStart: &corev1.LifecycleHandler{
+			Exec: &corev1.ExecAction{
+				Command: []string{"sh", "-c", script},
+			},
+		},
+	}
+}
+
+// ensurePasswordSyncLifecycle patches an existing StatefulSet to add the
+// password-sync postStart hook if it is missing.
+func (r *ClusterReconciler) ensurePasswordSyncLifecycle(ctx context.Context, sts *appsv1.StatefulSet) error {
+	containers := sts.Spec.Template.Spec.Containers
+	if len(containers) == 0 {
+		return nil
+	}
+	if containers[0].Lifecycle != nil && containers[0].Lifecycle.PostStart != nil {
+		return nil // already present
+	}
+	containers[0].Lifecycle = operatorPasswordSyncLifecycle()
+	return r.Update(ctx, sts)
 }
 
 func (r *ClusterReconciler) isStatefulSetReady(ctx context.Context, cluster *postgresv1alpha1.Cluster) (bool, error) {

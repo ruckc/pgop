@@ -194,6 +194,94 @@ var _ = Describe("Cluster Controller", func() {
 			Expect(sts.Spec.Template.Spec.Containers[0].Image).To(Equal(DefaultPostgresImage))
 		})
 
+		It("should set a password-sync postStart lifecycle hook on the container", func() {
+			ctx := context.Background()
+			clusterName := fmt.Sprintf("test-cluster-%d", time.Now().UnixNano())
+
+			By("Creating the Cluster resource")
+			cluster := &postgresv1alpha1.Cluster{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      clusterName,
+					Namespace: ClusterNamespace,
+				},
+				Spec: postgresv1alpha1.ClusterSpec{
+					Image: DefaultPostgresImage,
+				},
+			}
+			Expect(k8sClient.Create(ctx, cluster)).To(Succeed())
+
+			defer func() {
+				cluster.Finalizers = nil
+				_ = k8sClient.Update(ctx, cluster)
+				_ = k8sClient.Delete(ctx, cluster)
+			}()
+
+			controllerReconciler := &ClusterReconciler{
+				Client: k8sClient,
+				Scheme: k8sClient.Scheme(),
+			}
+
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: clusterName, Namespace: ClusterNamespace},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying the postStart hook converges the operator password")
+			sts := &appsv1.StatefulSet{}
+			err = k8sClient.Get(ctx, types.NamespacedName{Name: clusterName, Namespace: ClusterNamespace}, sts)
+			Expect(err).NotTo(HaveOccurred())
+			lifecycle := sts.Spec.Template.Spec.Containers[0].Lifecycle
+			Expect(lifecycle).NotTo(BeNil())
+			Expect(lifecycle.PostStart).NotTo(BeNil())
+			Expect(lifecycle.PostStart.Exec.Command).To(ContainElement(ContainSubstring("ALTER ROLE")))
+		})
+
+		It("should backfill the lifecycle hook on a StatefulSet that lacks it", func() {
+			ctx := context.Background()
+			clusterName := fmt.Sprintf("test-cluster-%d", time.Now().UnixNano())
+
+			By("Creating the Cluster resource")
+			cluster := &postgresv1alpha1.Cluster{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      clusterName,
+					Namespace: ClusterNamespace,
+				},
+				Spec: postgresv1alpha1.ClusterSpec{Image: DefaultPostgresImage},
+			}
+			Expect(k8sClient.Create(ctx, cluster)).To(Succeed())
+
+			defer func() {
+				cluster.Finalizers = nil
+				_ = k8sClient.Update(ctx, cluster)
+				_ = k8sClient.Delete(ctx, cluster)
+			}()
+
+			controllerReconciler := &ClusterReconciler{
+				Client: k8sClient,
+				Scheme: k8sClient.Scheme(),
+			}
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: clusterName, Namespace: ClusterNamespace},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Simulating a pre-fix StatefulSet by clearing the lifecycle hook")
+			sts := &appsv1.StatefulSet{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: clusterName, Namespace: ClusterNamespace}, sts)).To(Succeed())
+			sts.Spec.Template.Spec.Containers[0].Lifecycle = nil
+			Expect(k8sClient.Update(ctx, sts)).To(Succeed())
+
+			By("Reconciling again")
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: clusterName, Namespace: ClusterNamespace},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying the lifecycle hook was backfilled")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: clusterName, Namespace: ClusterNamespace}, sts)).To(Succeed())
+			Expect(sts.Spec.Template.Spec.Containers[0].Lifecycle).NotTo(BeNil())
+		})
+
 		It("should update status after reconciliation", func() {
 			ctx := context.Background()
 			clusterName := fmt.Sprintf("test-cluster-%d", time.Now().UnixNano())
