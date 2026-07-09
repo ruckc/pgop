@@ -292,13 +292,41 @@ jobs:
           helm push pgop-*.tgz oci://${{ env.REGISTRY }}/${{ github.repository_owner }}/charts
 
       - name: Merge release branch into main
+        env:
+          VERSION: ${{ needs.prepare-release.outputs.version }}
+          BRANCH: ${{ needs.prepare-release.outputs.branch }}
         run: |
           git config user.name "${{ github.actor }}"
           git config user.email "${{ github.actor }}@users.noreply.github.com"
           git fetch origin main
           git checkout main
-          git merge --no-ff "origin/${{ needs.prepare-release.outputs.branch }}" \
-            -m "chore: release ${{ needs.prepare-release.outputs.version }}"
+
+          # The release branch only ever bumps the version stamp on top of the
+          # main it was cut from. When several releases are in flight, main can
+          # advance to a newer version before this merge runs, so VERSION /
+          # Chart.yaml / the vendored CRDs conflict. Auto-resolve those files by
+          # taking the HIGHER of the two versions so main never regresses, and
+          # fail loudly on any other (unexpected) conflict.
+          if ! git merge --no-ff "origin/${BRANCH}" -m "chore: release ${VERSION}"; then
+            MAIN_VERSION=$(git show HEAD:VERSION 2>/dev/null | tr -d '[:space:]')
+            MAIN_VERSION="${MAIN_VERSION:-v0.0.0}"
+            HIGHER=$(printf '%s\n%s\n' "${MAIN_VERSION#v}" "${VERSION#v}" | sort -V | tail -1)
+            HIGHER="v${HIGHER}"
+            CHART_VERSION="${HIGHER#v}"
+
+            echo "${HIGHER}" > VERSION
+            sed -i "s/^version:.*/version: ${CHART_VERSION}/" charts/pgop/Chart.yaml
+            sed -i "s/^appVersion:.*/appVersion: \"${HIGHER}\"/" charts/pgop/Chart.yaml
+            cp config/crd/bases/*.yaml charts/pgop/crds/
+            git add VERSION charts/pgop/Chart.yaml charts/pgop/crds/
+
+            if git diff --name-only --diff-filter=U | grep -q .; then
+              echo "Unresolved merge conflicts outside the version stamp:" >&2
+              git diff --name-only --diff-filter=U >&2
+              exit 1
+            fi
+            git commit --no-edit
+          fi
           git push origin main
 
       - name: Delete release branch
