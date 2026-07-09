@@ -70,7 +70,9 @@ data:
 
 ## Using Credentials in Applications
 
-Reference the secret in your application:
+Prefer a per-app [Database](databases.md#connection-secret) Secret
+(`<database>-<owner>-credentials`), which includes the `database` key. Project
+the individual keys as env vars and assemble the DSN in your app:
 
 ```yaml
 apiVersion: apps/v1
@@ -81,12 +83,21 @@ spec:
       containers:
         - name: app
           env:
-            - name: DATABASE_URL
-              valueFrom:
-                secretKeyRef:
-                  name: production-db-credentials
-                  key: password
+            - name: PGHOST
+              valueFrom: { secretKeyRef: { name: myapp-app-user-credentials, key: host } }
+            - name: PGPORT
+              valueFrom: { secretKeyRef: { name: myapp-app-user-credentials, key: port } }
+            - name: PGUSER
+              valueFrom: { secretKeyRef: { name: myapp-app-user-credentials, key: username } }
+            - name: PGPASSWORD
+              valueFrom: { secretKeyRef: { name: myapp-app-user-credentials, key: password } }
+            - name: PGDATABASE
+              valueFrom: { secretKeyRef: { name: myapp-app-user-credentials, key: database } }
 ```
+
+The standard `PG*` env vars are consumed automatically by `libpq`-based clients
+(`psql`, most drivers). For a URL-style DSN, compose
+`postgres://$(PGUSER):$(PGPASSWORD)@$(PGHOST):$(PGPORT)/$(PGDATABASE)`.
 
 ## Supported Images
 
@@ -98,3 +109,21 @@ Any Docker image compatible with the official PostgreSQL image environment varia
 - `postgres:15`
 - `postgres:14`
 - Custom images that support `POSTGRES_USER` and `POSTGRES_PASSWORD` env vars
+
+For extensions that ship outside the base image (e.g. PostGIS, TimescaleDB),
+set `spec.image` to an image that bundles them, such as `postgis/postgis:18-3.5`.
+See [Databases → Extensions](databases.md#common-extensions).
+
+## Connecting: Endpoint & TLS
+
+- Apps connect through the Service `<cluster-name>.<namespace>.svc.cluster.local`
+  on `spec.port` (default `5432`). The same value is published on
+  `status.endpoint`.
+- The `<cluster-name>-credentials` Secret above holds the **operator** superuser
+  (`pgop_operator`). Application workloads should connect using a per-app
+  [Role](roles.md)/[Database](databases.md) credentials Secret rather than the
+  operator superuser.
+- **TLS:** the operator itself connects with `sslmode=disable` over the
+  in-cluster network, and TLS/`sslmode` is not currently configurable via the
+  CRDs. Apps connecting in-cluster should use `sslmode=disable` (or
+  `prefer`) unless you terminate TLS in front of PostgreSQL yourself.
