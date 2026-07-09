@@ -479,12 +479,12 @@ func (r *BackupReconciler) reconcilePhysicalCronJob(
 									Env:     envVars,
 									VolumeMounts: []corev1.VolumeMount{
 										{
-											Name:      "pgbackrest-config",
+											Name:      volPgbackrestConfig,
 											MountPath: "/etc/pgbackrest",
 											ReadOnly:  true,
 										},
 										{
-											Name:      "pgbackrest-tmp",
+											Name:      volPgbackrestTmp,
 											MountPath: "/tmp",
 										},
 									},
@@ -492,7 +492,7 @@ func (r *BackupReconciler) reconcilePhysicalCronJob(
 							},
 							Volumes: []corev1.Volume{
 								{
-									Name: "pgbackrest-config",
+									Name: volPgbackrestConfig,
 									VolumeSource: corev1.VolumeSource{
 										ConfigMap: &corev1.ConfigMapVolumeSource{
 											LocalObjectReference: corev1.LocalObjectReference{
@@ -502,7 +502,7 @@ func (r *BackupReconciler) reconcilePhysicalCronJob(
 									},
 								},
 								{
-									Name: "pgbackrest-tmp",
+									Name: volPgbackrestTmp,
 									VolumeSource: corev1.VolumeSource{
 										EmptyDir: &corev1.EmptyDirVolumeSource{},
 									},
@@ -584,20 +584,20 @@ func (r *BackupReconciler) buildS3EnvVars(backup *postgresv1alpha1.Backup) []cor
 	if s3.CredentialsSecretRef != nil {
 		vars = append(vars,
 			corev1.EnvVar{
-				Name: "AWS_ACCESS_KEY_ID",
+				Name: envAWSAccessKeyID,
 				ValueFrom: &corev1.EnvVarSource{
 					SecretKeyRef: &corev1.SecretKeySelector{
 						LocalObjectReference: *s3.CredentialsSecretRef,
-						Key:                  "AWS_ACCESS_KEY_ID",
+						Key:                  envAWSAccessKeyID,
 					},
 				},
 			},
 			corev1.EnvVar{
-				Name: "AWS_SECRET_ACCESS_KEY",
+				Name: envAWSSecretAccessKey,
 				ValueFrom: &corev1.EnvVarSource{
 					SecretKeyRef: &corev1.SecretKeySelector{
 						LocalObjectReference: *s3.CredentialsSecretRef,
-						Key:                  "AWS_SECRET_ACCESS_KEY",
+						Key:                  envAWSSecretAccessKey,
 					},
 				},
 			},

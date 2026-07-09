@@ -6,6 +6,7 @@ resources:
 - bases/pgop.ruck.io_backups.yaml
 - bases/pgop.ruck.io_clusters.yaml
 - bases/pgop.ruck.io_databases.yaml
+- bases/pgop.ruck.io_restores.yaml
 - bases/pgop.ruck.io_roles.yaml
 # +kubebuilder:scaffold:crdkustomizeresource
 

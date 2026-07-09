@@ -43,6 +43,7 @@ func addKnownTypes(s *runtime.Scheme) error {
 		&Role{}, &RoleList{},
 		&Backup{}, &BackupList{},
 		&BackupRun{}, &BackupRunList{},
+		&Restore{}, &RestoreList{},
 	)
 	metav1.AddToGroupVersion(s, GroupVersion)
 	return nil

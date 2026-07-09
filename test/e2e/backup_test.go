@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"os/exec"
+	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -73,6 +74,12 @@ func RegisterBackupTests() {
 		})
 
 		AfterAll(func() {
+			By("cleaning up Restore and BackupRun CRs")
+			_, _ = utils.Run(exec.Command("kubectl", "delete", "restore.pgop.ruck.io", "myapp-restore",
+				"-n", namespace, "--ignore-not-found"))
+			_, _ = utils.Run(exec.Command("kubectl", "delete", "backuprun.pgop.ruck.io", "myapp-restore-src",
+				"-n", namespace, "--ignore-not-found"))
+
 			By("cleaning up Backup CR")
 			cmd := exec.Command("kubectl", "delete", "backup.pgop.ruck.io", "myapp-backup",
 				"-n", namespace, "--ignore-not-found")
@@ -220,8 +227,81 @@ spec:
 			out, err := utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(out).To(ContainSubstring("found"), "backup artifacts not found in RustFS")
+
+			By("capturing the uploaded data artifact location from the backup job logs")
+			cmd = exec.Command("kubectl", "logs", "job/data-backup-manual", "-n", namespace, "-c", "s3-upload")
+			logs, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			location := parseUploadedLocation(logs)
+			Expect(location).To(HavePrefix("s3://pgop-backups/myapp/"), "could not parse uploaded artifact location from logs")
+
+			By("recording a BackupRun pointing at the uploaded artifact")
+			backupRunYAML := fmt.Sprintf(`
+apiVersion: pgop.ruck.io/v1alpha1
+kind: BackupRun
+metadata:
+  name: myapp-restore-src
+  namespace: %s
+spec:
+  backupRef:
+    name: myapp-backup
+  type: data
+`, namespace)
+			applyCmd = exec.Command("kubectl", "apply", "-f", "-")
+			applyCmd.Stdin = newStringReader(backupRunYAML)
+			_, err = utils.Run(applyCmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			// The artifact location lives on status, so patch the status subresource.
+			cmd = exec.Command("kubectl", "patch", "backuprun.pgop.ruck.io", "myapp-restore-src",
+				"-n", namespace, "--subresource=status", "--type=merge",
+				"-p", fmt.Sprintf(`{"status":{"location":%q}}`, location))
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("applying a logical Restore into the myapp database")
+			restoreYAML := fmt.Sprintf(`
+apiVersion: pgop.ruck.io/v1alpha1
+kind: Restore
+metadata:
+  name: myapp-restore
+  namespace: %s
+spec:
+  type: logical
+  backupRunRef:
+    name: myapp-restore-src
+  clusterRef:
+    name: example-cluster
+  databaseRef:
+    name: myapp
+`, namespace)
+			applyCmd = exec.Command("kubectl", "apply", "-f", "-")
+			applyCmd.Stdin = newStringReader(restoreYAML)
+			_, err = utils.Run(applyCmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("waiting for the Restore to reach Succeeded")
+			Eventually(func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "restore.pgop.ruck.io", "myapp-restore",
+					"-n", namespace, "-o", "jsonpath={.status.phase}")
+				out, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(out).To(Equal("Succeeded"), "restore did not succeed")
+			}, 5*time.Minute, 10*time.Second).Should(Succeed())
 		})
 	})
+}
+
+// parseUploadedLocation extracts the "Uploaded to <s3-url>" line emitted by the
+// backup upload script.
+func parseUploadedLocation(logs string) string {
+	for _, line := range strings.Split(logs, "\n") {
+		const marker = "Uploaded to "
+		if idx := strings.Index(line, marker); idx >= 0 {
+			return strings.TrimSpace(line[idx+len(marker):])
+		}
+	}
+	return ""
 }
 
 // deployRustFS deploys RustFS (S3-compatible object storage) into the rustfs namespace.

@@ -36,6 +36,7 @@ nav:
     - Clusters: user-guide/clusters.md
     - Roles: user-guide/roles.md
     - Databases: user-guide/databases.md
+    - Restores: user-guide/restores.md
   - Reference:
     - API Reference: reference/api.md
     - Configuration: reference/configuration.md

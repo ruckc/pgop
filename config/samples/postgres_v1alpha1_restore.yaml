@@ -1,0 +1,28 @@
+apiVersion: pgop.ruck.io/v1alpha1
+kind: Restore
+metadata:
+  name: myapp-restore
+spec:
+  # logical restore: pg_restore from a pg_dump artifact in object storage
+  type: logical
+  backupRunRef:
+    name: myapp-backup-data-20260101T020000
+  clusterRef:
+    name: example-cluster
+  databaseRef:
+    name: myapp
+---
+apiVersion: pgop.ruck.io/v1alpha1
+kind: Restore
+metadata:
+  name: example-cluster-pitr
+spec:
+  # physical restore: pgBackRest, optionally to a point in time.
+  # NOTE: scale the target Cluster's StatefulSet to 0 before running this,
+  # then back up afterward. See docs/user-guide/restores.md.
+  type: physical
+  backupRunRef:
+    name: example-cluster-full-20260101T020000
+  clusterRef:
+    name: example-cluster
+  targetTime: "2026-01-01T06:00:00Z"

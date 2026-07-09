@@ -37,4 +37,10 @@ const (
 	DefaultOperatorUsername = "pgop_operator"
 
 	ConditionTypeAvailable = "Available"
+
+	envAWSAccessKeyID     = "AWS_ACCESS_KEY_ID"
+	envAWSSecretAccessKey = "AWS_SECRET_ACCESS_KEY"
+
+	volPgbackrestConfig = "pgbackrest-config"
+	volPgbackrestTmp    = "pgbackrest-tmp"
 )
