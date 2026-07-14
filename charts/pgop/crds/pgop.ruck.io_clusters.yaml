@@ -64,6 +64,22 @@ spec:
                 maximum: 65535
                 minimum: 1
                 type: integer
+              postgresMajorVersion:
+                description: |-
+                  postgresMajorVersion is the PostgreSQL major version of the image.
+
+                  The operator uses this to pick the data-directory layout that matches the
+                  official image conventions: PG <=17 stores data at /var/lib/postgresql/data,
+                  while PG >=18 mounts /var/lib/postgresql and stores data at
+                  /var/lib/postgresql/<major>/docker.
+
+                  Normally this is auto-detected from the image tag (e.g. "postgres:18",
+                  "postgis/postgis:16-3.4"). Set it explicitly when the tag does not encode a
+                  parseable major version (e.g. "latest", a digest-pinned reference, or a
+                  custom mirror); otherwise the reconcile fails rather than guess.
+                format: int32
+                minimum: 1
+                type: integer
               replicas:
                 default: 1
                 description: |-
