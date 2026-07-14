@@ -25,6 +25,7 @@ import (
 	. "github.com/onsi/gomega"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -280,6 +281,225 @@ var _ = Describe("Cluster Controller", func() {
 			By("Verifying the lifecycle hook was backfilled")
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: clusterName, Namespace: ClusterNamespace}, sts)).To(Succeed())
 			Expect(sts.Spec.Template.Spec.Containers[0].Lifecycle).NotTo(BeNil())
+		})
+
+		It("should update the StatefulSet image when the Cluster image changes", func() {
+			ctx := context.Background()
+			clusterName := fmt.Sprintf("test-cluster-%d", time.Now().UnixNano())
+
+			By("Creating the Cluster resource")
+			cluster := &postgresv1alpha1.Cluster{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      clusterName,
+					Namespace: ClusterNamespace,
+				},
+				Spec: postgresv1alpha1.ClusterSpec{
+					Image: "postgres:18.1",
+				},
+			}
+			Expect(k8sClient.Create(ctx, cluster)).To(Succeed())
+
+			defer func() {
+				cluster.Finalizers = nil
+				_ = k8sClient.Update(ctx, cluster)
+				_ = k8sClient.Delete(ctx, cluster)
+			}()
+
+			controllerReconciler := &ClusterReconciler{
+				Client: k8sClient,
+				Scheme: k8sClient.Scheme(),
+			}
+
+			By("First reconcile creates the StatefulSet with the original image")
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: clusterName, Namespace: ClusterNamespace},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			sts := &appsv1.StatefulSet{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: clusterName, Namespace: ClusterNamespace}, sts)).To(Succeed())
+			Expect(sts.Spec.Template.Spec.Containers[0].Image).To(Equal("postgres:18.1"))
+
+			By("Bumping the Cluster image to a new patch version")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: clusterName, Namespace: ClusterNamespace}, cluster)).To(Succeed())
+			cluster.Spec.Image = "postgres:18.2"
+			Expect(k8sClient.Update(ctx, cluster)).To(Succeed())
+
+			By("Reconciling again")
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: clusterName, Namespace: ClusterNamespace},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying the StatefulSet was updated to the new image")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: clusterName, Namespace: ClusterNamespace}, sts)).To(Succeed())
+			Expect(sts.Spec.Template.Spec.Containers[0].Image).To(Equal("postgres:18.2"))
+		})
+
+		It("should update replicas and resources on an existing StatefulSet", func() {
+			ctx := context.Background()
+			clusterName := fmt.Sprintf("test-cluster-%d", time.Now().UnixNano())
+
+			By("Creating the Cluster resource")
+			cluster := &postgresv1alpha1.Cluster{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      clusterName,
+					Namespace: ClusterNamespace,
+				},
+				Spec: postgresv1alpha1.ClusterSpec{
+					Image:    DefaultPostgresImage,
+					Replicas: 1,
+				},
+			}
+			Expect(k8sClient.Create(ctx, cluster)).To(Succeed())
+
+			defer func() {
+				cluster.Finalizers = nil
+				_ = k8sClient.Update(ctx, cluster)
+				_ = k8sClient.Delete(ctx, cluster)
+			}()
+
+			controllerReconciler := &ClusterReconciler{
+				Client: k8sClient,
+				Scheme: k8sClient.Scheme(),
+			}
+
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: clusterName, Namespace: ClusterNamespace},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Changing resource requests on the Cluster")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: clusterName, Namespace: ClusterNamespace}, cluster)).To(Succeed())
+			cluster.Spec.Resources = corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceCPU: resource.MustParse("250m"),
+				},
+			}
+			Expect(k8sClient.Update(ctx, cluster)).To(Succeed())
+
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: clusterName, Namespace: ClusterNamespace},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying the StatefulSet container resources were updated")
+			sts := &appsv1.StatefulSet{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: clusterName, Namespace: ClusterNamespace}, sts)).To(Succeed())
+			Expect(sts.Spec.Template.Spec.Containers[0].Resources.Requests.Cpu().String()).To(Equal("250m"))
+		})
+
+		It("should not touch the StatefulSet when reconciling an unchanged Cluster", func() {
+			ctx := context.Background()
+			clusterName := fmt.Sprintf("test-cluster-%d", time.Now().UnixNano())
+
+			By("Creating the Cluster resource")
+			cluster := &postgresv1alpha1.Cluster{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      clusterName,
+					Namespace: ClusterNamespace,
+				},
+				Spec: postgresv1alpha1.ClusterSpec{
+					Image: DefaultPostgresImage,
+				},
+			}
+			Expect(k8sClient.Create(ctx, cluster)).To(Succeed())
+
+			defer func() {
+				cluster.Finalizers = nil
+				_ = k8sClient.Update(ctx, cluster)
+				_ = k8sClient.Delete(ctx, cluster)
+			}()
+
+			controllerReconciler := &ClusterReconciler{
+				Client: k8sClient,
+				Scheme: k8sClient.Scheme(),
+			}
+
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: clusterName, Namespace: ClusterNamespace},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			sts := &appsv1.StatefulSet{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: clusterName, Namespace: ClusterNamespace}, sts)).To(Succeed())
+			resourceVersionAfterCreate := sts.ResourceVersion
+
+			By("Reconciling again with no spec changes")
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: clusterName, Namespace: ClusterNamespace},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying the StatefulSet was not updated")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: clusterName, Namespace: ClusterNamespace}, sts)).To(Succeed())
+			Expect(sts.ResourceVersion).To(Equal(resourceVersionAfterCreate))
+		})
+
+		It("should update the Service port and Secret connection info when the Cluster port changes", func() {
+			ctx := context.Background()
+			clusterName := fmt.Sprintf("test-cluster-%d", time.Now().UnixNano())
+
+			By("Creating the Cluster resource with the default port")
+			cluster := &postgresv1alpha1.Cluster{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      clusterName,
+					Namespace: ClusterNamespace,
+				},
+				Spec: postgresv1alpha1.ClusterSpec{
+					Image: DefaultPostgresImage,
+					Port:  5432,
+				},
+			}
+			Expect(k8sClient.Create(ctx, cluster)).To(Succeed())
+
+			defer func() {
+				cluster.Finalizers = nil
+				_ = k8sClient.Update(ctx, cluster)
+				_ = k8sClient.Delete(ctx, cluster)
+			}()
+
+			controllerReconciler := &ClusterReconciler{
+				Client: k8sClient,
+				Scheme: k8sClient.Scheme(),
+			}
+
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: clusterName, Namespace: ClusterNamespace},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			secret := &corev1.Secret{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: clusterName + "-credentials", Namespace: ClusterNamespace}, secret)).To(Succeed())
+			originalPassword := string(secret.Data["password"])
+			Expect(string(secret.Data["port"])).To(Equal("5432"))
+
+			By("Changing the Cluster port")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: clusterName, Namespace: ClusterNamespace}, cluster)).To(Succeed())
+			cluster.Spec.Port = 5433
+			Expect(k8sClient.Update(ctx, cluster)).To(Succeed())
+
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: clusterName, Namespace: ClusterNamespace},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying the Service port was updated")
+			service := &corev1.Service{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: clusterName, Namespace: ClusterNamespace}, service)).To(Succeed())
+			Expect(service.Spec.Ports).To(HaveLen(1))
+			Expect(service.Spec.Ports[0].Port).To(Equal(int32(5433)))
+			Expect(service.Spec.Ports[0].TargetPort.IntValue()).To(Equal(5433))
+
+			By("Verifying the Secret's connection info was updated without touching the password")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: clusterName + "-credentials", Namespace: ClusterNamespace}, secret)).To(Succeed())
+			Expect(string(secret.Data["port"])).To(Equal("5433"))
+			Expect(string(secret.Data["password"])).To(Equal(originalPassword))
+
+			By("Verifying the StatefulSet container port was also updated")
+			sts := &appsv1.StatefulSet{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: clusterName, Namespace: ClusterNamespace}, sts)).To(Succeed())
+			Expect(sts.Spec.Template.Spec.Containers[0].Ports[0].ContainerPort).To(Equal(int32(5433)))
 		})
 
 		It("should update status after reconciliation", func() {

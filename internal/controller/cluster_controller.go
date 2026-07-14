@@ -25,6 +25,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -129,7 +130,7 @@ func (r *ClusterReconciler) reconcileSecret(ctx context.Context, cluster *postgr
 	secret := &corev1.Secret{}
 	err := r.Get(ctx, types.NamespacedName{Name: secretName, Namespace: cluster.Namespace}, secret)
 	if err == nil {
-		return secret, nil // Secret already exists
+		return r.convergeSecret(ctx, cluster, secret)
 	}
 	if !apierrors.IsNotFound(err) {
 		return nil, err
@@ -163,9 +164,9 @@ func (r *ClusterReconciler) reconcileSecret(ctx context.Context, cluster *postgr
 		StringData: map[string]string{
 			SecretKeyUsername: username,
 			SecretKeyPassword: password,
-			"host":            host,
-			"port":            fmt.Sprintf("%d", port),
-			"database":        "postgres",
+			SecretKeyHost:     host,
+			SecretKeyPort:     fmt.Sprintf("%d", port),
+			SecretKeyDatabase: "postgres",
 		},
 	}
 
@@ -180,12 +181,41 @@ func (r *ClusterReconciler) reconcileSecret(ctx context.Context, cluster *postgr
 	return secret, nil
 }
 
+// convergeSecret updates the connection-info fields (host, port) of an
+// existing credentials Secret when the Cluster's port changes. It only ever
+// sets those two keys in StringData: the Secret API merges StringData into
+// Data on write, so the existing username/password/database keys are left
+// completely untouched — this never regenerates or exposes the password.
+func (r *ClusterReconciler) convergeSecret(ctx context.Context, cluster *postgresv1alpha1.Cluster, secret *corev1.Secret) (*corev1.Secret, error) {
+	port := cluster.Spec.Port
+	if port == 0 {
+		port = 5432
+	}
+
+	host := fmt.Sprintf("%s.%s.svc.cluster.local", cluster.Name, cluster.Namespace)
+	wantPort := fmt.Sprintf("%d", port)
+
+	if string(secret.Data[SecretKeyHost]) == host && string(secret.Data[SecretKeyPort]) == wantPort {
+		return secret, nil
+	}
+
+	secret.StringData = map[string]string{
+		SecretKeyHost: host,
+		SecretKeyPort: wantPort,
+	}
+	if err := r.Update(ctx, secret); err != nil {
+		return nil, err
+	}
+
+	return secret, nil
+}
+
 func (r *ClusterReconciler) reconcileService(ctx context.Context, cluster *postgresv1alpha1.Cluster) error {
 	serviceName := cluster.Name
 	service := &corev1.Service{}
 	err := r.Get(ctx, types.NamespacedName{Name: serviceName, Namespace: cluster.Namespace}, service)
 	if err == nil {
-		return nil // Service already exists
+		return r.convergeService(ctx, cluster, service)
 	}
 	if !apierrors.IsNotFound(err) {
 		return err
@@ -230,19 +260,34 @@ func (r *ClusterReconciler) reconcileService(ctx context.Context, cluster *postg
 	return r.Create(ctx, service)
 }
 
+// convergeService updates an existing Service's port when the Cluster's port
+// changes. Selector and Type are fixed for the lifetime of the cluster, so
+// only Ports is compared.
+func (r *ClusterReconciler) convergeService(ctx context.Context, cluster *postgresv1alpha1.Cluster, service *corev1.Service) error {
+	port := cluster.Spec.Port
+	if port == 0 {
+		port = 5432
+	}
+
+	desiredPorts := []corev1.ServicePort{
+		{
+			Name:       AppNamePostgresql,
+			Port:       port,
+			TargetPort: intstr.FromInt32(port),
+			Protocol:   corev1.ProtocolTCP,
+		},
+	}
+
+	if apiequality.Semantic.DeepEqual(service.Spec.Ports, desiredPorts) {
+		return nil
+	}
+
+	service.Spec.Ports = desiredPorts
+	return r.Update(ctx, service)
+}
+
 func (r *ClusterReconciler) reconcileStatefulSet(ctx context.Context, cluster *postgresv1alpha1.Cluster, secret *corev1.Secret) error {
 	stsName := cluster.Name
-	sts := &appsv1.StatefulSet{}
-	err := r.Get(ctx, types.NamespacedName{Name: stsName, Namespace: cluster.Namespace}, sts)
-	if err == nil {
-		// Ensure the password-sync lifecycle hook is present on existing
-		// StatefulSets so clusters created before this fix self-heal on the
-		// next rollout. See https://github.com/ruckc/pgop/issues/7.
-		return r.ensurePasswordSyncLifecycle(ctx, sts)
-	}
-	if !apierrors.IsNotFound(err) {
-		return err
-	}
 
 	// Set defaults
 	image := cluster.Spec.Image
@@ -265,15 +310,27 @@ func (r *ClusterReconciler) reconcileStatefulSet(ctx context.Context, cluster *p
 	if port == 0 {
 		port = 5432
 	}
-	storageSize := cluster.Spec.Storage.Size
-	if storageSize == "" {
-		storageSize = "1Gi"
-	}
 
 	labels := map[string]string{
 		LabelAppName:      AppNamePostgresql,
 		LabelAppInstance:  cluster.Name,
 		LabelAppManagedBy: LabelValuePgop,
+	}
+
+	container := buildPostgresContainer(secret, image, port, cluster.Spec.Resources, layout)
+
+	sts := &appsv1.StatefulSet{}
+	err = r.Get(ctx, types.NamespacedName{Name: stsName, Namespace: cluster.Namespace}, sts)
+	if err == nil {
+		return r.convergeStatefulSet(ctx, sts, replicas, labels, container)
+	}
+	if !apierrors.IsNotFound(err) {
+		return err
+	}
+
+	storageSize := cluster.Spec.Storage.Size
+	if storageSize == "" {
+		storageSize = "1Gi"
 	}
 
 	sts = &appsv1.StatefulSet{
@@ -296,91 +353,8 @@ func (r *ClusterReconciler) reconcileStatefulSet(ctx context.Context, cluster *p
 					Labels: labels,
 				},
 				Spec: corev1.PodSpec{
-					SecurityContext: &corev1.PodSecurityContext{
-						RunAsNonRoot: func() *bool { b := true; return &b }(),
-						SeccompProfile: &corev1.SeccompProfile{
-							Type: corev1.SeccompProfileTypeRuntimeDefault,
-						},
-						RunAsUser:  func() *int64 { i := int64(999); return &i }(),
-						RunAsGroup: func() *int64 { i := int64(999); return &i }(),
-						FSGroup:    func() *int64 { i := int64(999); return &i }(),
-					},
-					Containers: []corev1.Container{
-						{
-							Name:  AppNamePostgresql,
-							Image: image,
-							Ports: []corev1.ContainerPort{
-								{
-									Name:          AppNamePostgresql,
-									ContainerPort: port,
-									Protocol:      corev1.ProtocolTCP,
-								},
-							},
-							SecurityContext: &corev1.SecurityContext{
-								AllowPrivilegeEscalation: func() *bool { b := false; return &b }(),
-								Capabilities: &corev1.Capabilities{
-									Drop: []corev1.Capability{"ALL"},
-								},
-							},
-							Env: []corev1.EnvVar{
-								{
-									Name: "POSTGRES_USER",
-									ValueFrom: &corev1.EnvVarSource{
-										SecretKeyRef: &corev1.SecretKeySelector{
-											LocalObjectReference: corev1.LocalObjectReference{
-												Name: secret.Name,
-											},
-											Key: "username",
-										},
-									},
-								},
-								{
-									Name: "POSTGRES_PASSWORD",
-									ValueFrom: &corev1.EnvVarSource{
-										SecretKeyRef: &corev1.SecretKeySelector{
-											LocalObjectReference: corev1.LocalObjectReference{
-												Name: secret.Name,
-											},
-											Key: "password",
-										},
-									},
-								},
-								{
-									// Pin PGDATA explicitly so the data directory
-									// does not depend on the image's own default,
-									// which differs between PG <=17 and PG >=18.
-									Name:  "PGDATA",
-									Value: layout.PGDATA,
-								},
-							},
-							VolumeMounts: []corev1.VolumeMount{
-								{
-									Name:      "data",
-									MountPath: layout.MountPath,
-								},
-							},
-							Lifecycle: operatorPasswordSyncLifecycle(),
-							Resources: cluster.Spec.Resources,
-							ReadinessProbe: &corev1.Probe{
-								ProbeHandler: corev1.ProbeHandler{
-									Exec: &corev1.ExecAction{
-										Command: []string{"pg_isready", "-U", DefaultOperatorUsername},
-									},
-								},
-								InitialDelaySeconds: 5,
-								PeriodSeconds:       10,
-							},
-							LivenessProbe: &corev1.Probe{
-								ProbeHandler: corev1.ProbeHandler{
-									Exec: &corev1.ExecAction{
-										Command: []string{"pg_isready", "-U", DefaultOperatorUsername},
-									},
-								},
-								InitialDelaySeconds: 30,
-								PeriodSeconds:       10,
-							},
-						},
-					},
+					SecurityContext: postgresPodSecurityContext(),
+					Containers:      []corev1.Container{container},
 				},
 			},
 			VolumeClaimTemplates: []corev1.PersistentVolumeClaim{
@@ -411,6 +385,192 @@ func (r *ClusterReconciler) reconcileStatefulSet(ctx context.Context, cluster *p
 	return r.Create(ctx, sts)
 }
 
+// postgresPodSecurityContext returns the pod-level SecurityContext applied to
+// every PostgreSQL StatefulSet pod.
+func postgresPodSecurityContext() *corev1.PodSecurityContext {
+	return &corev1.PodSecurityContext{
+		RunAsNonRoot: func() *bool { b := true; return &b }(),
+		SeccompProfile: &corev1.SeccompProfile{
+			Type: corev1.SeccompProfileTypeRuntimeDefault,
+		},
+		RunAsUser:  func() *int64 { i := int64(999); return &i }(),
+		RunAsGroup: func() *int64 { i := int64(999); return &i }(),
+		FSGroup:    func() *int64 { i := int64(999); return &i }(),
+	}
+}
+
+// buildPostgresContainer builds the desired postgresql container spec from
+// the Cluster's current settings. It is used both when creating a new
+// StatefulSet and when converging an existing one onto spec changes (image
+// bumps, resource changes, etc).
+func buildPostgresContainer(secret *corev1.Secret, image string, port int32, resources corev1.ResourceRequirements, layout postgresLayout) corev1.Container {
+	return corev1.Container{
+		Name:  AppNamePostgresql,
+		Image: image,
+		Ports: []corev1.ContainerPort{
+			{
+				Name:          AppNamePostgresql,
+				ContainerPort: port,
+				Protocol:      corev1.ProtocolTCP,
+			},
+		},
+		SecurityContext: &corev1.SecurityContext{
+			AllowPrivilegeEscalation: func() *bool { b := false; return &b }(),
+			Capabilities: &corev1.Capabilities{
+				Drop: []corev1.Capability{"ALL"},
+			},
+		},
+		Env: []corev1.EnvVar{
+			{
+				Name: "POSTGRES_USER",
+				ValueFrom: &corev1.EnvVarSource{
+					SecretKeyRef: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{
+							Name: secret.Name,
+						},
+						Key: "username",
+					},
+				},
+			},
+			{
+				Name: "POSTGRES_PASSWORD",
+				ValueFrom: &corev1.EnvVarSource{
+					SecretKeyRef: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{
+							Name: secret.Name,
+						},
+						Key: "password",
+					},
+				},
+			},
+			{
+				// Pin PGDATA explicitly so the data directory
+				// does not depend on the image's own default,
+				// which differs between PG <=17 and PG >=18.
+				Name:  "PGDATA",
+				Value: layout.PGDATA,
+			},
+		},
+		VolumeMounts: []corev1.VolumeMount{
+			{
+				Name:      "data",
+				MountPath: layout.MountPath,
+			},
+		},
+		Lifecycle: operatorPasswordSyncLifecycle(),
+		Resources: resources,
+		ReadinessProbe: &corev1.Probe{
+			ProbeHandler: corev1.ProbeHandler{
+				Exec: &corev1.ExecAction{
+					Command: []string{"pg_isready", "-U", DefaultOperatorUsername},
+				},
+			},
+			InitialDelaySeconds: 5,
+			PeriodSeconds:       10,
+		},
+		LivenessProbe: &corev1.Probe{
+			ProbeHandler: corev1.ProbeHandler{
+				Exec: &corev1.ExecAction{
+					Command: []string{"pg_isready", "-U", DefaultOperatorUsername},
+				},
+			},
+			InitialDelaySeconds: 30,
+			PeriodSeconds:       10,
+		},
+	}
+}
+
+// convergeStatefulSet patches an existing StatefulSet onto the current
+// Cluster spec (image, resources, replicas, port, and the data-directory
+// layout), and backfills the password-sync lifecycle hook on StatefulSets
+// created before it existed (see https://github.com/ruckc/pgop/issues/7).
+// It only issues an Update when something actually differs, so reconciling
+// an already-converged cluster is a no-op and does not trigger spurious
+// pod rollouts.
+func (r *ClusterReconciler) convergeStatefulSet(ctx context.Context, sts *appsv1.StatefulSet, replicas int32, labels map[string]string, desired corev1.Container) error {
+	changed := false
+
+	if sts.Spec.Replicas == nil || *sts.Spec.Replicas != replicas {
+		sts.Spec.Replicas = &replicas
+		changed = true
+	}
+
+	if !apiequality.Semantic.DeepEqual(sts.Spec.Template.Labels, labels) {
+		sts.Spec.Template.Labels = labels
+		changed = true
+	}
+
+	if !apiequality.Semantic.DeepEqual(sts.Spec.Template.Spec.SecurityContext, postgresPodSecurityContext()) {
+		sts.Spec.Template.Spec.SecurityContext = postgresPodSecurityContext()
+		changed = true
+	}
+
+	if len(sts.Spec.Template.Spec.Containers) == 0 {
+		sts.Spec.Template.Spec.Containers = []corev1.Container{desired}
+		changed = true
+	} else if convergeContainer(&sts.Spec.Template.Spec.Containers[0], desired) {
+		changed = true
+	}
+
+	if !changed {
+		return nil
+	}
+
+	return r.Update(ctx, sts)
+}
+
+// convergeContainer overwrites the fields of existing that pgop derives from
+// the Cluster spec (image, ports, env, volume mounts, resources, security
+// context, probes, and the password-sync lifecycle hook) with the desired
+// values. Fields the API server defaults on its own (ImagePullPolicy,
+// TerminationMessagePath, etc.) are left untouched so reconciling an
+// unchanged cluster does not perpetually diff against server-side defaults.
+// Returns whether anything was actually changed.
+func convergeContainer(existing *corev1.Container, desired corev1.Container) bool {
+	changed := false
+
+	if existing.Image != desired.Image {
+		existing.Image = desired.Image
+		changed = true
+	}
+	if !apiequality.Semantic.DeepEqual(existing.Ports, desired.Ports) {
+		existing.Ports = desired.Ports
+		changed = true
+	}
+	if !apiequality.Semantic.DeepEqual(existing.Env, desired.Env) {
+		existing.Env = desired.Env
+		changed = true
+	}
+	if !apiequality.Semantic.DeepEqual(existing.VolumeMounts, desired.VolumeMounts) {
+		existing.VolumeMounts = desired.VolumeMounts
+		changed = true
+	}
+	if !apiequality.Semantic.DeepEqual(existing.Resources, desired.Resources) {
+		existing.Resources = desired.Resources
+		changed = true
+	}
+	if !apiequality.Semantic.DeepEqual(existing.SecurityContext, desired.SecurityContext) {
+		existing.SecurityContext = desired.SecurityContext
+		changed = true
+	}
+	if !apiequality.Semantic.DeepEqual(existing.ReadinessProbe, desired.ReadinessProbe) {
+		existing.ReadinessProbe = desired.ReadinessProbe
+		changed = true
+	}
+	if !apiequality.Semantic.DeepEqual(existing.LivenessProbe, desired.LivenessProbe) {
+		existing.LivenessProbe = desired.LivenessProbe
+		changed = true
+	}
+	// Backfill only: never remove a lifecycle hook that's already present,
+	// but always ensure the password-sync postStart hook exists.
+	if existing.Lifecycle == nil || existing.Lifecycle.PostStart == nil {
+		existing.Lifecycle = desired.Lifecycle
+		changed = true
+	}
+
+	return changed
+}
+
 // operatorPasswordSyncLifecycle returns a postStart hook that converges the
 // in-database operator password to the value in the credentials Secret
 // (injected as $POSTGRES_PASSWORD) on every pod start.
@@ -433,20 +593,6 @@ func operatorPasswordSyncLifecycle() *corev1.Lifecycle {
 			},
 		},
 	}
-}
-
-// ensurePasswordSyncLifecycle patches an existing StatefulSet to add the
-// password-sync postStart hook if it is missing.
-func (r *ClusterReconciler) ensurePasswordSyncLifecycle(ctx context.Context, sts *appsv1.StatefulSet) error {
-	containers := sts.Spec.Template.Spec.Containers
-	if len(containers) == 0 {
-		return nil
-	}
-	if containers[0].Lifecycle != nil && containers[0].Lifecycle.PostStart != nil {
-		return nil // already present
-	}
-	containers[0].Lifecycle = operatorPasswordSyncLifecycle()
-	return r.Update(ctx, sts)
 }
 
 func (r *ClusterReconciler) isStatefulSetReady(ctx context.Context, cluster *postgresv1alpha1.Cluster) (bool, error) {
