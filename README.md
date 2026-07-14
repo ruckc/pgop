@@ -28,6 +28,7 @@ metadata:
   namespace: default
 spec:
   image: postgres:18        # any postgres image tag
+  # postgresMajorVersion: 18  # only needed if the tag can't be auto-detected
   replicas: 1
   port: 5432
   storage:
@@ -40,6 +41,32 @@ spec:
       memory: "512Mi"
       cpu: "500m"
 ```
+
+#### Data directory layout
+
+The operator follows the official PostgreSQL image conventions, which changed in
+PostgreSQL 18, and pins `PGDATA` explicitly so the data directory always lands
+inside the persistent volume regardless of the image's own default:
+
+| PostgreSQL major | PVC mount point         | `PGDATA`                              |
+| ---------------- | ----------------------- | ------------------------------------- |
+| ≤ 17             | `/var/lib/postgresql/data` | `/var/lib/postgresql/data`         |
+| ≥ 18             | `/var/lib/postgresql`   | `/var/lib/postgresql/<major>/docker`  |
+
+The major version is auto-detected from the image tag (`postgres:18`,
+`postgis/postgis:16-3.4`, etc.). If the tag does not encode a parseable version
+(e.g. `latest`, a digest-pinned reference, or a private mirror), set
+`spec.postgresMajorVersion` explicitly — otherwise the cluster reconcile fails
+with a clear condition rather than guessing a layout and risking data loss.
+
+> **⚠️ Upgrading from pgop ≤ 0.4.1:** earlier releases hardcoded the PVC mount at
+> `/var/lib/postgresql` and never set `PGDATA`, so the data directory depended on
+> the image. Clusters running the default `postgres:18` image are unaffected (the
+> path resolves to the same `/var/lib/postgresql/18/docker`). However, any cluster
+> that relied on the old implicit behavior with a `≤ 17` image (whose data lived at
+> `/var/lib/postgresql/data`) will resolve to a different mount after upgrading and
+> must be treated as a **data migration** (dump/restore or `pg_upgrade`), not an
+> in-place restart.
 
 ### Role
 

@@ -333,7 +333,11 @@ func (r *BackupReconciler) reconcilePhysicalBackup(ctx context.Context, backup *
 		}
 	}
 
-	pgbackrestConf := r.buildPgbackrestConfig(backup)
+	layout, err := resolvePostgresLayout(cluster)
+	if err != nil {
+		return err
+	}
+	pgbackrestConf := r.buildPgbackrestConfig(backup, layout.PGDATA)
 
 	if err := r.reconcilePgbackrestConfigMap(ctx, backup, pgbackrestConf); err != nil {
 		return err
@@ -522,7 +526,7 @@ func (r *BackupReconciler) reconcilePhysicalCronJob(
 	return r.Create(ctx, cronjob)
 }
 
-func (r *BackupReconciler) buildPgbackrestConfig(backup *postgresv1alpha1.Backup) string {
+func (r *BackupReconciler) buildPgbackrestConfig(backup *postgresv1alpha1.Backup, pgDataPath string) string {
 	dest := backup.Spec.Destination
 	s3 := dest.S3
 	if s3 == nil {
@@ -541,7 +545,7 @@ func (r *BackupReconciler) buildPgbackrestConfig(backup *postgresv1alpha1.Backup
 		conf += fmt.Sprintf("repo1-s3-endpoint=%s\nrepo1-s3-uri-style=path\n", s3.Endpoint)
 	}
 
-	conf += "\n[main]\npg1-path=/var/lib/postgresql/data\n"
+	conf += fmt.Sprintf("\n[main]\npg1-path=%s\n", pgDataPath)
 
 	return conf
 }

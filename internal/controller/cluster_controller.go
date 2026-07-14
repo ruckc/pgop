@@ -249,6 +249,14 @@ func (r *ClusterReconciler) reconcileStatefulSet(ctx context.Context, cluster *p
 	if image == "" {
 		image = DefaultPostgresImage
 	}
+
+	// Resolve the data-directory layout for this image's major version. This
+	// determines both where the PVC is mounted and the explicit PGDATA, so the
+	// data directory always lands inside the PVC regardless of the image default.
+	layout, err := resolvePostgresLayout(cluster)
+	if err != nil {
+		return err
+	}
 	replicas := cluster.Spec.Replicas
 	if replicas == 0 {
 		replicas = 1
@@ -337,13 +345,18 @@ func (r *ClusterReconciler) reconcileStatefulSet(ctx context.Context, cluster *p
 										},
 									},
 								},
+								{
+									// Pin PGDATA explicitly so the data directory
+									// does not depend on the image's own default,
+									// which differs between PG <=17 and PG >=18.
+									Name:  "PGDATA",
+									Value: layout.PGDATA,
+								},
 							},
 							VolumeMounts: []corev1.VolumeMount{
-
 								{
 									Name:      "data",
-									MountPath: "/var/lib/postgresql",
-									// SubPath:   "pgdata",
+									MountPath: layout.MountPath,
 								},
 							},
 							Lifecycle: operatorPasswordSyncLifecycle(),

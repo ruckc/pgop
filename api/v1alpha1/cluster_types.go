@@ -28,6 +28,21 @@ type ClusterSpec struct {
 	// +kubebuilder:default="postgres:18"
 	Image string `json:"image,omitempty"`
 
+	// postgresMajorVersion is the PostgreSQL major version of the image.
+	//
+	// The operator uses this to pick the data-directory layout that matches the
+	// official image conventions: PG <=17 stores data at /var/lib/postgresql/data,
+	// while PG >=18 mounts /var/lib/postgresql and stores data at
+	// /var/lib/postgresql/<major>/docker.
+	//
+	// Normally this is auto-detected from the image tag (e.g. "postgres:18",
+	// "postgis/postgis:16-3.4"). Set it explicitly when the tag does not encode a
+	// parseable major version (e.g. "latest", a digest-pinned reference, or a
+	// custom mirror); otherwise the reconcile fails rather than guess.
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	PostgresMajorVersion *int32 `json:"postgresMajorVersion,omitempty"`
+
 	// replicas is the number of PostgreSQL instances to run.
 	// Currently only single instance is supported.
 	// +kubebuilder:default=1
