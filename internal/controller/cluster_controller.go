@@ -561,9 +561,11 @@ func convergeContainer(existing *corev1.Container, desired corev1.Container) boo
 		existing.LivenessProbe = desired.LivenessProbe
 		changed = true
 	}
-	// Backfill only: never remove a lifecycle hook that's already present,
-	// but always ensure the password-sync postStart hook exists.
-	if existing.Lifecycle == nil || existing.Lifecycle.PostStart == nil {
+	// Converge the lifecycle unconditionally so that changes to the
+	// password-sync postStart hook (e.g. bug fixes) roll out to existing
+	// StatefulSets on operator upgrade rather than only applying to newly
+	// created ones.
+	if !apiequality.Semantic.DeepEqual(existing.Lifecycle, desired.Lifecycle) {
 		existing.Lifecycle = desired.Lifecycle
 		changed = true
 	}

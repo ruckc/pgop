@@ -286,6 +286,60 @@ var _ = Describe("Cluster Controller", func() {
 			Expect(sts.Spec.Template.Spec.Containers[0].Lifecycle).NotTo(BeNil())
 		})
 
+		It("should converge a stale lifecycle hook to the desired value", func() {
+			ctx := context.Background()
+			clusterName := fmt.Sprintf("test-cluster-%d", time.Now().UnixNano())
+
+			By("Creating the Cluster resource")
+			cluster := &postgresv1alpha1.Cluster{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      clusterName,
+					Namespace: ClusterNamespace,
+				},
+				Spec: postgresv1alpha1.ClusterSpec{Image: DefaultPostgresImage},
+			}
+			Expect(k8sClient.Create(ctx, cluster)).To(Succeed())
+
+			defer func() {
+				cluster.Finalizers = nil
+				_ = k8sClient.Update(ctx, cluster)
+				_ = k8sClient.Delete(ctx, cluster)
+			}()
+
+			controllerReconciler := &ClusterReconciler{
+				Client: k8sClient,
+				Scheme: k8sClient.Scheme(),
+			}
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: clusterName, Namespace: ClusterNamespace},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Simulating a stale (old) postStart hook on the existing StatefulSet")
+			sts := &appsv1.StatefulSet{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: clusterName, Namespace: ClusterNamespace}, sts)).To(Succeed())
+			sts.Spec.Template.Spec.Containers[0].Lifecycle = &corev1.Lifecycle{
+				PostStart: &corev1.LifecycleHandler{
+					Exec: &corev1.ExecAction{Command: []string{"/bin/sh", "-c", "echo stale-hook"}},
+				},
+			}
+			Expect(k8sClient.Update(ctx, sts)).To(Succeed())
+
+			By("Reconciling again")
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: clusterName, Namespace: ClusterNamespace},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Verifying the stale hook was overwritten with the desired hook")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: clusterName, Namespace: ClusterNamespace}, sts)).To(Succeed())
+			lifecycle := sts.Spec.Template.Spec.Containers[0].Lifecycle
+			Expect(lifecycle).NotTo(BeNil())
+			Expect(lifecycle.PostStart).NotTo(BeNil())
+			Expect(lifecycle.PostStart.Exec.Command).To(ContainElement(ContainSubstring("ALTER ROLE")))
+			Expect(lifecycle.PostStart.Exec.Command).NotTo(ContainElement(ContainSubstring("stale-hook")))
+		})
+
 		It("should update the StatefulSet image when the Cluster image changes", func() {
 			ctx := context.Background()
 			clusterName := fmt.Sprintf("test-cluster-%d", time.Now().UnixNano())
