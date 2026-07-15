@@ -235,6 +235,9 @@ var _ = Describe("Cluster Controller", func() {
 			Expect(lifecycle).NotTo(BeNil())
 			Expect(lifecycle.PostStart).NotTo(BeNil())
 			Expect(lifecycle.PostStart.Exec.Command).To(ContainElement(ContainSubstring("ALTER ROLE")))
+			// pg_isready must pass -U so it works on images whose runtime UID
+			// has no /etc/passwd entry (e.g. postgis:18-alpine). See issue #8.
+			Expect(lifecycle.PostStart.Exec.Command).To(ContainElement(ContainSubstring("pg_isready -q -U")))
 		})
 
 		It("should backfill the lifecycle hook on a StatefulSet that lacks it", func() {

@@ -583,7 +583,7 @@ func convergeContainer(existing *corev1.Container, desired corev1.Container) boo
 // auth, so this ALTER ROLE needs no password itself.
 // See https://github.com/ruckc/pgop/issues/7.
 func operatorPasswordSyncLifecycle() *corev1.Lifecycle {
-	script := `until pg_isready -q 2>/dev/null; do sleep 1; done; ` +
+	script := `until pg_isready -q -U "$POSTGRES_USER" -d postgres 2>/dev/null; do sleep 1; done; ` +
 		`psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d postgres ` +
 		`-c "ALTER ROLE \"$POSTGRES_USER\" WITH PASSWORD '$POSTGRES_PASSWORD'"`
 	return &corev1.Lifecycle{
