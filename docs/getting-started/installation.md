@@ -1,6 +1,6 @@
 # Installation
 
-This guide covers different methods to install pgop in your Kubernetes cluster.
+This guide covers the supported ways to install pgop in your Kubernetes cluster.
 
 ## Prerequisites
 
@@ -8,19 +8,15 @@ This guide covers different methods to install pgop in your Kubernetes cluster.
 - `kubectl` configured to access your cluster
 - Cluster admin permissions
 
-## Install with Kustomize
-
-### Install CRDs
+## Install with Helm
 
 ```bash
-kubectl apply -k https://github.com/ruckc/pgop/config/crd
+helm install pgop oci://ghcr.io/ruckc/charts/pgop \
+  --namespace pgop-system \
+  --create-namespace
 ```
 
-### Deploy the Operator
-
-```bash
-kubectl apply -k https://github.com/ruckc/pgop/config/default
-```
+This installs the CRDs and deploys the operator into the `pgop-system` namespace.
 
 ## Install from Source
 
@@ -81,11 +77,19 @@ roles.pgop.ruck.io         2026-01-01T00:00:00Z
 ## Uninstall
 
 ```bash
-# Remove CRDs (this will delete all managed resources!)
-make uninstall
+helm uninstall pgop --namespace pgop-system
+```
 
-# Remove operator
-kubectl delete -k config/default
+If you also want to remove the CRDs after uninstalling the release, run:
+
+```bash
+kubectl delete crd \
+  backupruns.pgop.ruck.io \
+  backups.pgop.ruck.io \
+  clusters.pgop.ruck.io \
+  databases.pgop.ruck.io \
+  restores.pgop.ruck.io \
+  roles.pgop.ruck.io
 ```
 
 !!! warning

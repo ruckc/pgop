@@ -11,11 +11,10 @@ A simple Kubernetes operator for managing PostgreSQL databases.
 ## Quick Start
 
 ```bash
-# Install CRDs
-kubectl apply -k config/crd
-
-# Deploy the operator
-kubectl apply -k config/default
+# Install the operator
+helm install pgop oci://ghcr.io/ruckc/charts/pgop \
+  --namespace pgop-system \
+  --create-namespace
 
 # Create a PostgreSQL cluster
 kubectl apply -f - <<EOF

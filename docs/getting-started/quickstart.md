@@ -2,6 +2,8 @@
 
 Get a PostgreSQL cluster running in minutes.
 
+Install the operator first with the [Helm chart](installation.md), then create your first PostgreSQL cluster.
+
 ## Create a Cluster
 
 Create your first PostgreSQL cluster:

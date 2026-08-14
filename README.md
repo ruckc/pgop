@@ -165,16 +165,20 @@ spec:
 ### Installation
 
 ```sh
-kubectl apply -k https://github.com/ruckc/pgop/config/default
+helm install pgop oci://ghcr.io/ruckc/charts/pgop \
+  --namespace pgop-system \
+  --create-namespace
 ```
 
-This installs the CRDs, creates the `pgop-system` namespace, configures RBAC, and deploys the controller using the `latest` image from `ghcr.io/ruckc/pgop`.
+This installs the CRDs, creates the `pgop-system` namespace, configures RBAC, and deploys the controller from the Helm chart published to GHCR.
 
 ### Uninstallation
 
 ```sh
-kubectl delete -k https://github.com/ruckc/pgop/config/default
+helm uninstall pgop --namespace pgop-system
 ```
+
+Helm leaves CRDs in place so existing custom resources are not deleted automatically. To remove the CRDs too, delete them manually after uninstalling the release.
 
 ## Development
 
