@@ -11,7 +11,7 @@ This guide covers the supported ways to install pgop in your Kubernetes cluster.
 ## Install with Helm
 
 ```bash
-helm install pgop oci://ghcr.io/ruckc/charts/pgop \
+helm upgrade -i pgop oci://ghcr.io/ruckc/charts/pgop \
   --namespace pgop-system \
   --create-namespace
 ```

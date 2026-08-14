@@ -12,7 +12,7 @@ A simple Kubernetes operator for managing PostgreSQL databases.
 
 ```bash
 # Install the operator
-helm install pgop oci://ghcr.io/ruckc/charts/pgop \
+helm upgrade -i pgop oci://ghcr.io/ruckc/charts/pgop \
   --namespace pgop-system \
   --create-namespace
 

@@ -165,7 +165,7 @@ spec:
 ### Installation
 
 ```sh
-helm install pgop oci://ghcr.io/ruckc/charts/pgop \
+helm upgrade -i pgop oci://ghcr.io/ruckc/charts/pgop \
   --namespace pgop-system \
   --create-namespace
 ```
