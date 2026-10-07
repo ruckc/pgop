@@ -80,8 +80,9 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			// Perform cleanup
 			log.Info("Cleaning up Cluster resources")
 			// Resources will be garbage collected due to owner references
+			base := cluster.DeepCopy()
 			controllerutil.RemoveFinalizer(cluster, clusterFinalizer)
-			if err := r.Update(ctx, cluster); err != nil {
+			if err := r.Patch(ctx, cluster, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})); err != nil {
 				return ctrl.Result{}, err
 			}
 		}
@@ -90,8 +91,9 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	// Add finalizer if not present
 	if !controllerutil.ContainsFinalizer(cluster, clusterFinalizer) {
+		base := cluster.DeepCopy()
 		controllerutil.AddFinalizer(cluster, clusterFinalizer)
-		if err := r.Update(ctx, cluster); err != nil {
+		if err := r.Patch(ctx, cluster, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})); err != nil {
 			return ctrl.Result{}, err
 		}
 	}

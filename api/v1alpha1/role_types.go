@@ -28,7 +28,7 @@ type RoleSpec struct {
 
 	// login allows the role to log in (connect to the database)
 	// +kubebuilder:default=true
-	Login bool `json:"login,omitempty"`
+	Login *bool `json:"login,omitempty"`
 
 	// superuser grants superuser privileges to the role
 	// +optional
@@ -44,7 +44,7 @@ type RoleSpec struct {
 
 	// inherit allows the role to inherit privileges from roles it is a member of
 	// +kubebuilder:default=true
-	Inherit bool `json:"inherit,omitempty"`
+	Inherit *bool `json:"inherit,omitempty"`
 
 	// replication allows the role to initiate replication connections
 	// +optional
@@ -58,7 +58,7 @@ type RoleSpec struct {
 	// -1 means unlimited.
 	// +kubebuilder:default=-1
 	// +kubebuilder:validation:Minimum=-1
-	ConnectionLimit int32 `json:"connectionLimit,omitempty"`
+	ConnectionLimit *int32 `json:"connectionLimit,omitempty"`
 
 	// memberOf lists roles this role should be a member of
 	// +optional
@@ -117,4 +117,18 @@ type RoleList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitzero"`
 	Items           []Role `json:"items"`
+}
+
+// IsLogin reports whether the role may log in (CRD default: true).
+func (s *RoleSpec) IsLogin() bool { return s.Login == nil || *s.Login }
+
+// IsInherit reports whether the role inherits privileges (CRD default: true).
+func (s *RoleSpec) IsInherit() bool { return s.Inherit == nil || *s.Inherit }
+
+// GetConnectionLimit returns the connection limit (CRD default: -1, unlimited).
+func (s *RoleSpec) GetConnectionLimit() int32 {
+	if s.ConnectionLimit == nil {
+		return -1
+	}
+	return *s.ConnectionLimit
 }
