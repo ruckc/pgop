@@ -21,12 +21,28 @@ import (
 )
 
 // DatabaseSpec defines the desired state of Database
+// +kubebuilder:validation:XValidation:rule="has(oldSelf.databaseName) == has(self.databaseName) && (!has(self.databaseName) || self.databaseName == oldSelf.databaseName)",message="databaseName is immutable"
 type DatabaseSpec struct {
 	// clusterRef references the PostgreSQL Cluster this database belongs to
 	// +kubebuilder:validation:Required
 	ClusterRef ClusterReference `json:"clusterRef"`
 
-	// owner is the role that owns this database.
+	// databaseName is the name of the database in PostgreSQL. It defaults to
+	// metadata.name when unset, and lets the PostgreSQL name use characters
+	// (such as underscores) that Kubernetes object names do not allow.
+	// It must be a lowercase unquoted identifier, must not be a reserved
+	// database name (postgres, template0, template1), and cannot be changed
+	// after creation.
+	// +optional
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[a-z_][a-z0-9_]*$`
+	// +kubebuilder:validation:XValidation:rule="!(self in ['postgres', 'template0', 'template1'])",message="databaseName must not be a reserved database name (postgres, template0, template1)"
+	DatabaseName string `json:"databaseName,omitempty"`
+
+	// owner is the name of the Role resource (in the same namespace) that owns
+	// this database. The database is owned by that Role's effective PostgreSQL
+	// role name (its spec.roleName, or metadata.name when unset).
 	// If not specified, the operator superuser will be the owner.
 	// +optional
 	Owner string `json:"owner,omitempty"`
@@ -94,6 +110,10 @@ type DatabaseStatus struct {
 	// ready indicates if the database has been created
 	Ready bool `json:"ready,omitempty"`
 
+	// databaseName is the effective PostgreSQL database name that was reconciled.
+	// +optional
+	DatabaseName string `json:"databaseName,omitempty"`
+
 	// installedExtensions lists extensions that have been successfully installed
 	// +optional
 	InstalledExtensions []string `json:"installedExtensions,omitempty"`
@@ -112,6 +132,7 @@ type DatabaseStatus struct {
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:printcolumn:name="Cluster",type="string",JSONPath=".spec.clusterRef.name"
+// +kubebuilder:printcolumn:name="PGName",type="string",JSONPath=".status.databaseName"
 // +kubebuilder:printcolumn:name="Owner",type="string",JSONPath=".spec.owner"
 // +kubebuilder:printcolumn:name="Ready",type="boolean",JSONPath=".status.ready"
 // +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
@@ -141,4 +162,13 @@ type DatabaseList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitzero"`
 	Items           []Database `json:"items"`
+}
+
+// PostgresName returns the database's name in PostgreSQL: spec.databaseName
+// when set, otherwise metadata.name.
+func (d *Database) PostgresName() string {
+	if d.Spec.DatabaseName != "" {
+		return d.Spec.DatabaseName
+	}
+	return d.Name
 }

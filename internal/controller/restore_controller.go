@@ -188,11 +188,11 @@ echo "Downloaded %s"
 
 	// -Fc dumps are restored with pg_restore; --no-owner avoids failures when
 	// the target cluster's role set differs from the source.
-	restoreScript := fmt.Sprintf(`
+	restoreScript := `
 set -e
-pg_restore -h $PGHOST -p $PGPORT -U $PGUSER -d %s --no-owner --clean --if-exists /restore/artifact.dump
+pg_restore -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDATABASE" --no-owner --clean --if-exists /restore/artifact.dump
 echo "Restore complete"
-`, database.Name)
+`
 
 	envVars := s3EnvVarsForDestination(backup.Spec.Destination)
 
@@ -222,6 +222,9 @@ echo "Restore complete"
 				secretEnv("PGPASSWORD", clusterSecretName, "password"),
 				{Name: "PGHOST", Value: pgHost},
 				{Name: "PGPORT", Value: fmt.Sprintf("%d", pgPort)},
+				// Passed via env rather than interpolated into the script so the
+				// name never needs shell quoting.
+				{Name: envPGDatabase, Value: database.PostgresName()},
 			},
 			VolumeMounts: []corev1.VolumeMount{{Name: restoreVolumeName, MountPath: restoreVolumeMount}},
 		},

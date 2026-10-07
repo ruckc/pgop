@@ -24,6 +24,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -138,7 +139,42 @@ var _ = Describe("Restore Controller", func() {
 		Expect(job.Spec.Template.Spec.Containers).To(HaveLen(1))
 		Expect(job.Spec.Template.Spec.Containers[0].Image).To(Equal(DefaultPostgresImage))
 		Expect(job.Spec.Template.Spec.Containers[0].Command[2]).To(ContainSubstring("pg_restore"))
-		Expect(job.Spec.Template.Spec.Containers[0].Command[2]).To(ContainSubstring(dbName))
+		Expect(job.Spec.Template.Spec.Containers[0].Command[2]).To(ContainSubstring(`-d "$PGDATABASE"`))
+		Expect(job.Spec.Template.Spec.Containers[0].Env).To(ContainElement(corev1.EnvVar{Name: envPGDatabase, Value: dbName}))
+	})
+
+	It("should restore into the Database's effective PostgreSQL name", func() {
+		runName := newBackupRun(suffix, true)
+		clusterName := "cluster-" + suffix
+		newCluster(clusterName)
+		db := &postgresv1alpha1.Database{
+			ObjectMeta: metav1.ObjectMeta{Name: "db-" + suffix, Namespace: RestoreNamespace},
+			Spec: postgresv1alpha1.DatabaseSpec{
+				ClusterRef:   postgresv1alpha1.ClusterReference{Name: clusterName},
+				DatabaseName: testPGDatabaseName,
+			},
+		}
+		Expect(k8sClient.Create(ctx, db)).To(Succeed())
+
+		restore := &postgresv1alpha1.Restore{
+			ObjectMeta: metav1.ObjectMeta{Name: "restore-" + suffix, Namespace: RestoreNamespace},
+			Spec: postgresv1alpha1.RestoreSpec{
+				Type:         postgresv1alpha1.BackupTypeLogical,
+				BackupRunRef: postgresv1alpha1.ClusterReference{Name: runName},
+				ClusterRef:   postgresv1alpha1.ClusterReference{Name: clusterName},
+				DatabaseRef:  &postgresv1alpha1.ClusterReference{Name: db.Name},
+			},
+		}
+		Expect(k8sClient.Create(ctx, restore)).To(Succeed())
+
+		_, err := reconciler.Reconcile(ctx, reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: restore.Name, Namespace: RestoreNamespace},
+		})
+		Expect(err).NotTo(HaveOccurred())
+
+		job := &batchv1.Job{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: restore.Name + "-restore", Namespace: RestoreNamespace}, job)).To(Succeed())
+		Expect(job.Spec.Template.Spec.Containers[0].Env).To(ContainElement(corev1.EnvVar{Name: envPGDatabase, Value: testPGDatabaseName}))
 	})
 
 	It("should fail a logical restore that omits databaseRef", func() {

@@ -18,6 +18,9 @@ spec:
     - jsonPath: .spec.clusterRef.name
       name: Cluster
       type: string
+    - jsonPath: .status.roleName
+      name: PGName
+      type: string
     - jsonPath: .status.ready
       name: Ready
       type: boolean
@@ -112,12 +115,33 @@ spec:
               replication:
                 description: replication allows the role to initiate replication connections
                 type: boolean
+              roleName:
+                description: |-
+                  roleName is the name of the role in PostgreSQL. It defaults to
+                  metadata.name when unset, and lets the PostgreSQL name use characters
+                  (such as underscores) that Kubernetes object names do not allow.
+                  It must be a lowercase unquoted identifier, must not start with "pg_",
+                  must not be a reserved name (postgres, pgop_operator), and cannot be
+                  changed after creation.
+                maxLength: 63
+                minLength: 1
+                pattern: ^[a-z_][a-z0-9_]*$
+                type: string
+                x-kubernetes-validations:
+                - message: roleName must not start with 'pg_' (reserved by PostgreSQL)
+                  rule: '!self.startsWith(''pg_'')'
+                - message: roleName must not be a reserved role name (postgres, pgop_operator)
+                  rule: '!(self in [''postgres'', ''pgop_operator''])'
               superuser:
                 description: superuser grants superuser privileges to the role
                 type: boolean
             required:
             - clusterRef
             type: object
+            x-kubernetes-validations:
+            - message: roleName is immutable
+              rule: has(oldSelf.roleName) == has(self.roleName) && (!has(self.roleName)
+                || self.roleName == oldSelf.roleName)
           status:
             description: status defines the observed state of Role
             properties:
@@ -184,6 +208,10 @@ spec:
               ready:
                 description: ready indicates if the role has been created in the database
                 type: boolean
+              roleName:
+                description: roleName is the effective PostgreSQL role name that was
+                  reconciled.
+                type: string
               secretName:
                 description: |-
                   secretName is the name of the Secret containing the role's credentials.

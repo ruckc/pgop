@@ -81,7 +81,12 @@ func (r *RoleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 					return ctrl.Result{}, err
 				}
 				defer func() { _ = pgClient.Close() }()
-				if err := pgClient.DropRole(ctx, role.Name); err != nil {
+				// Prefer the name recorded in status so we drop what was actually created.
+				pgName := role.Status.RoleName
+				if pgName == "" {
+					pgName = role.PostgresName()
+				}
+				if err := pgClient.DropRole(ctx, pgName); err != nil {
 					log.Error(err, "Failed to drop role")
 					return ctrl.Result{}, err
 				}
@@ -153,14 +158,17 @@ func (r *RoleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		Password:        password,
 	}
 
-	if err := pgClient.CreateRole(ctx, role.Name, opts); err != nil {
+	pgName := role.PostgresName()
+	if err := pgClient.CreateRole(ctx, pgName, opts); err != nil {
 		log.Error(err, "Failed to create/update role")
 		return r.updateStatus(ctx, role, false, secretName, err)
 	}
+	// Record the PostgreSQL name that now exists so deletion drops exactly it.
+	role.Status.RoleName = pgName
 
 	// Handle role memberships
 	for _, memberOf := range role.Spec.MemberOf {
-		if err := pgClient.GrantRole(ctx, memberOf, role.Name); err != nil {
+		if err := pgClient.GrantRole(ctx, memberOf, pgName); err != nil {
 			log.Error(err, "Failed to grant role membership", "role", memberOf)
 			return r.updateStatus(ctx, role, false, secretName, err)
 		}
@@ -211,7 +219,7 @@ func (r *RoleReconciler) reconcileCredentialsSecret(ctx context.Context, role *p
 		},
 		Type: corev1.SecretTypeOpaque,
 		StringData: map[string]string{
-			SecretKeyUsername: role.Name,
+			SecretKeyUsername: role.PostgresName(),
 			SecretKeyPassword: password,
 			"host":            fmt.Sprintf("%s.%s.svc.cluster.local", cluster.Name, cluster.Namespace),
 			"port":            fmt.Sprintf("%d", port),

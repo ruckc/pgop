@@ -31,7 +31,9 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	postgresv1alpha1 "github.com/ruckc/pgop/api/v1alpha1"
 	"github.com/ruckc/pgop/internal/postgres"
@@ -51,6 +53,7 @@ type DatabaseReconciler struct {
 // +kubebuilder:rbac:groups=pgop.ruck.io,resources=databases/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=pgop.ruck.io,resources=databases/finalizers,verbs=update
 // +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch;create;update;patch
+// +kubebuilder:rbac:groups=pgop.ruck.io,resources=roles,verbs=get;list;watch
 
 func (r *DatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
@@ -80,7 +83,12 @@ func (r *DatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 					return ctrl.Result{}, err
 				}
 				defer func() { _ = adminClient.Close() }()
-				if err := adminClient.DropDatabase(ctx, database.Name); err != nil {
+				// Prefer the name recorded in status so we drop what was actually created.
+				pgName := database.Status.DatabaseName
+				if pgName == "" {
+					pgName = database.PostgresName()
+				}
+				if err := adminClient.DropDatabase(ctx, pgName); err != nil {
 					log.Error(err, "Failed to drop database")
 					return ctrl.Result{}, err
 				}
@@ -110,6 +118,18 @@ func (r *DatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 
+	// Resolve spec.owner (a Role resource name) to its PostgreSQL role name.
+	// Done before connecting so a missing/unready owner is reported cheaply.
+	ownerRole, err := r.resolveOwnerRole(ctx, database)
+	if err != nil {
+		log.Info("Owner role not available", "reason", err.Error())
+		return r.updateStatus(ctx, database, false, nil, nil, err)
+	}
+	ownerPGName := ""
+	if ownerRole != nil {
+		ownerPGName = ownerRole.PostgresName()
+	}
+
 	// Get operator credentials for admin connection
 	adminClient, err := r.getPostgresClient(ctx, cluster, "postgres")
 	if err != nil {
@@ -128,13 +148,16 @@ func (r *DatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	}
 
 	// Create the database
-	if err := adminClient.CreateDatabase(ctx, database.Name, database.Spec.Owner); err != nil {
+	pgName := database.PostgresName()
+	if err := adminClient.CreateDatabase(ctx, pgName, ownerPGName); err != nil {
 		log.Error(err, "Failed to create database")
 		return r.updateStatus(ctx, database, false, nil, nil, err)
 	}
+	// Record the PostgreSQL name that now exists so deletion drops exactly it.
+	database.Status.DatabaseName = pgName
 
 	// Get a connection to the new database to install extensions and create schemas
-	dbClient, err := r.getPostgresClient(ctx, cluster, database.Name)
+	dbClient, err := r.getPostgresClient(ctx, cluster, pgName)
 	if err != nil {
 		log.Error(err, "Failed to create PostgreSQL database client")
 		return r.updateStatus(ctx, database, false, nil, nil, err)
@@ -169,7 +192,7 @@ func (r *DatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		}
 	}
 
-	if err := r.reconcileCredentialsSecret(ctx, database, cluster); err != nil {
+	if err := r.reconcileCredentialsSecret(ctx, database, ownerRole, cluster); err != nil {
 		log.Error(err, "Failed to reconcile database credentials secret")
 		return r.updateStatus(ctx, database, false, installedExtensions, createdSchemas, err)
 	}
@@ -178,9 +201,40 @@ func (r *DatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	return r.updateStatus(ctx, database, true, installedExtensions, createdSchemas, nil)
 }
 
-func (r *DatabaseReconciler) reconcileCredentialsSecret(ctx context.Context, database *postgresv1alpha1.Database, cluster *postgresv1alpha1.Cluster) error {
+// resolveOwnerRole returns the Role named by spec.owner, or nil when no owner
+// is set. It returns an error when the Role does not exist or is not Ready yet,
+// since CREATE DATABASE ... OWNER requires the PostgreSQL role to exist.
+func (r *DatabaseReconciler) resolveOwnerRole(ctx context.Context, database *postgresv1alpha1.Database) (*postgresv1alpha1.Role, error) {
+	if database.Spec.Owner == "" {
+		return nil, nil
+	}
+	role := &postgresv1alpha1.Role{}
+	if err := r.Get(ctx, types.NamespacedName{Name: database.Spec.Owner, Namespace: database.Namespace}, role); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, fmt.Errorf("owner Role %q not found in namespace %q", database.Spec.Owner, database.Namespace)
+		}
+		return nil, fmt.Errorf("failed to get owner Role %q: %w", database.Spec.Owner, err)
+	}
+	if !role.Status.Ready {
+		return nil, fmt.Errorf("owner Role %q is not ready", database.Spec.Owner)
+	}
+	return role, nil
+}
+
+// reconcileCredentialsSecret maintains a per-database Secret combining the
+// owner role's credentials with the database connection details. It is
+// skipped when there is no owner, or when the owner is a NOLOGIN role (which
+// has no credentials Secret).
+func (r *DatabaseReconciler) reconcileCredentialsSecret(ctx context.Context, database *postgresv1alpha1.Database, ownerRole *postgresv1alpha1.Role, cluster *postgresv1alpha1.Cluster) error {
+	if ownerRole == nil || !ownerRole.Spec.IsLogin() {
+		return nil
+	}
+
 	// Read the role's credentials secret to obtain the password.
-	roleSecretName := cluster.Name + "-" + database.Spec.Owner + "-credentials"
+	roleSecretName := ownerRole.Status.SecretName
+	if roleSecretName == "" {
+		roleSecretName = cluster.Name + "-" + ownerRole.Name + "-credentials"
+	}
 	roleSecret := &corev1.Secret{}
 	if err := r.Get(ctx, types.NamespacedName{Name: roleSecretName, Namespace: database.Namespace}, roleSecret); err != nil {
 		return fmt.Errorf("failed to get role credentials secret %s: %w", roleSecretName, err)
@@ -203,7 +257,7 @@ func (r *DatabaseReconciler) reconcileCredentialsSecret(ctx context.Context, dat
 			SecretKeyPassword: string(roleSecret.Data[SecretKeyPassword]),
 			SecretKeyHost:     fmt.Sprintf("%s.%s.svc.cluster.local", cluster.Name, cluster.Namespace),
 			SecretKeyPort:     strconv.Itoa(int(port)),
-			SecretKeyDatabase: database.Name,
+			SecretKeyDatabase: database.PostgresName(),
 		},
 	}
 	if err := controllerutil.SetControllerReference(database, desired, r.Scheme); err != nil {
@@ -302,11 +356,29 @@ func (r *DatabaseReconciler) updateStatus(ctx context.Context, database *postgre
 	return ctrl.Result{}, nil
 }
 
+// databasesForOwnerRole maps a Role to the Databases in its namespace whose
+// spec.owner names it, so they reconcile when the owner becomes Ready.
+func (r *DatabaseReconciler) databasesForOwnerRole(ctx context.Context, obj client.Object) []reconcile.Request {
+	databases := &postgresv1alpha1.DatabaseList{}
+	if err := r.List(ctx, databases, client.InNamespace(obj.GetNamespace())); err != nil {
+		logf.FromContext(ctx).Error(err, "Failed to list Databases for owner Role", "role", obj.GetName())
+		return nil
+	}
+	var requests []reconcile.Request
+	for i := range databases.Items {
+		if databases.Items[i].Spec.Owner == obj.GetName() {
+			requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&databases.Items[i])})
+		}
+	}
+	return requests
+}
+
 // SetupWithManager sets up the controller with the Manager.
 func (r *DatabaseReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&postgresv1alpha1.Database{}).
 		Owns(&corev1.Secret{}).
+		Watches(&postgresv1alpha1.Role{}, handler.EnqueueRequestsFromMapFunc(r.databasesForOwnerRole)).
 		Named("database").
 		Complete(r)
 }

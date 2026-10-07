@@ -21,10 +21,25 @@ import (
 )
 
 // RoleSpec defines the desired state of Role
+// +kubebuilder:validation:XValidation:rule="has(oldSelf.roleName) == has(self.roleName) && (!has(self.roleName) || self.roleName == oldSelf.roleName)",message="roleName is immutable"
 type RoleSpec struct {
 	// clusterRef references the PostgreSQL Cluster this role belongs to
 	// +kubebuilder:validation:Required
 	ClusterRef ClusterReference `json:"clusterRef"`
+
+	// roleName is the name of the role in PostgreSQL. It defaults to
+	// metadata.name when unset, and lets the PostgreSQL name use characters
+	// (such as underscores) that Kubernetes object names do not allow.
+	// It must be a lowercase unquoted identifier, must not start with "pg_",
+	// must not be a reserved name (postgres, pgop_operator), and cannot be
+	// changed after creation.
+	// +optional
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[a-z_][a-z0-9_]*$`
+	// +kubebuilder:validation:XValidation:rule="!self.startsWith('pg_')",message="roleName must not start with 'pg_' (reserved by PostgreSQL)"
+	// +kubebuilder:validation:XValidation:rule="!(self in ['postgres', 'pgop_operator'])",message="roleName must not be a reserved role name (postgres, pgop_operator)"
+	RoleName string `json:"roleName,omitempty"`
 
 	// login allows the role to log in (connect to the database)
 	// +kubebuilder:default=true
@@ -75,6 +90,10 @@ type RoleStatus struct {
 	// ready indicates if the role has been created in the database
 	Ready bool `json:"ready,omitempty"`
 
+	// roleName is the effective PostgreSQL role name that was reconciled.
+	// +optional
+	RoleName string `json:"roleName,omitempty"`
+
 	// secretName is the name of the Secret containing the role's credentials.
 	// The secret contains 'username' and 'password' keys.
 	SecretName string `json:"secretName,omitempty"`
@@ -89,6 +108,7 @@ type RoleStatus struct {
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:printcolumn:name="Cluster",type="string",JSONPath=".spec.clusterRef.name"
+// +kubebuilder:printcolumn:name="PGName",type="string",JSONPath=".status.roleName"
 // +kubebuilder:printcolumn:name="Ready",type="boolean",JSONPath=".status.ready"
 // +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
 
@@ -131,4 +151,13 @@ func (s *RoleSpec) GetConnectionLimit() int32 {
 		return -1
 	}
 	return *s.ConnectionLimit
+}
+
+// PostgresName returns the role's name in PostgreSQL: spec.roleName when set,
+// otherwise metadata.name.
+func (r *Role) PostgresName() string {
+	if r.Spec.RoleName != "" {
+		return r.Spec.RoleName
+	}
+	return r.Name
 }
