@@ -227,7 +227,7 @@ var _ = Describe("Role Controller", func() {
 		It("should still accept the deprecated memberOf field alongside other memberships", func() {
 			ctx := context.Background()
 			role := newMembershipRole(postgresv1alpha1.RoleSpec{
-				MemberOf:                 []string{memLegacy},
+				MemberOf:                 []string{memLegacy}, //nolint:staticcheck // deprecated field under test
 				Memberships:              []postgresv1alpha1.RoleMembership{{Role: memParent}},
 				RevokeRemovedMemberships: new(false),
 			})
@@ -242,7 +242,7 @@ var _ = Describe("Role Controller", func() {
 
 		It("should reject a role listed in both memberOf and memberships", func() {
 			role := newMembershipRole(postgresv1alpha1.RoleSpec{
-				MemberOf:    []string{memLegacy, memParent},
+				MemberOf:    []string{memLegacy, memParent}, //nolint:staticcheck // deprecated field under test
 				Memberships: []postgresv1alpha1.RoleMembership{{Role: memParent}},
 			})
 			err := k8sClient.Create(context.Background(), role)
@@ -252,7 +252,7 @@ var _ = Describe("Role Controller", func() {
 
 		It("should reject an update that adds a duplicate across the two fields", func() {
 			ctx := context.Background()
-			role := newMembershipRole(postgresv1alpha1.RoleSpec{MemberOf: []string{memParent}})
+			role := newMembershipRole(postgresv1alpha1.RoleSpec{MemberOf: []string{memParent}}) //nolint:staticcheck // deprecated field under test
 			Expect(k8sClient.Create(ctx, role)).To(Succeed())
 			defer func() { _ = k8sClient.Delete(ctx, role) }()
 

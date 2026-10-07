@@ -111,6 +111,7 @@ type RoleSpec struct {
 	// Deprecated: use memberships instead. memberOf will be removed in a future
 	// API version. Each entry is treated as a memberships entry with only role
 	// set, and a role must not appear in both fields.
+	//
 	// +optional
 	// +kubebuilder:validation:MaxItems=256
 	// +kubebuilder:validation:items:MaxLength=63

@@ -82,7 +82,7 @@ var _ = Describe("Role memberships", func() {
 	Describe("RoleSpec.DesiredMemberships", func() {
 		It("merges memberships and the deprecated memberOf", func() {
 			spec := postgresv1alpha1.RoleSpec{
-				MemberOf:    []string{memLegacy, memParent},
+				MemberOf:    []string{memLegacy, memParent}, //nolint:staticcheck // deprecated field under test
 				Memberships: []rm{{Role: memParent, Admin: true}, {Role: "other", Inherit: new(false)}},
 			}
 			Expect(spec.DesiredMemberships()).To(Equal([]rm{
@@ -152,7 +152,7 @@ var _ = Describe("Role memberships", func() {
 		})
 
 		It("treats memberOf entries like memberships without options", func() {
-			spec := postgresv1alpha1.RoleSpec{MemberOf: []string{memLegacy}, Memberships: []rm{{Role: "new", Admin: true}}}
+			spec := postgresv1alpha1.RoleSpec{MemberOf: []string{memLegacy}, Memberships: []rm{{Role: "new", Admin: true}}} //nolint:staticcheck // deprecated field under test
 			plan := diffMemberships(spec.DesiredMemberships(), []string{memLegacy, memOld},
 				map[string]st{memLegacy: {Inherit: new(true), Set: new(true)}, memOld: {}}, true)
 			Expect(plan.Grant).To(Equal([]membershipGrant{{Role: "new", Opts: postgres.MembershipOptions{Admin: true}}}))
@@ -216,7 +216,7 @@ var _ = Describe("Role memberships", func() {
 
 		It("allows plain and admin memberships before PostgreSQL 16", func() {
 			f := &fakeMembershipClient{version: 150004}
-			role := newRole(postgresv1alpha1.RoleSpec{MemberOf: []string{"a"}, Memberships: []rm{{Role: "b", Admin: true}}})
+			role := newRole(postgresv1alpha1.RoleSpec{MemberOf: []string{"a"}, Memberships: []rm{{Role: "b", Admin: true}}}) //nolint:staticcheck // deprecated field under test
 			Expect(reconcileMemberships(ctx, f, role, "app")).To(Succeed())
 			Expect(f.calls).To(Equal([]string{"grant b to app", "grant a to app"}))
 		})
