@@ -45,7 +45,7 @@ type clientTLS struct {
 }
 
 // tlsActive reports whether the Cluster's server is confirmed to serve TLS
-// with the certificate from spec.tls.secretName.
+// with the certificate from its TLS Secret (see tlsSecretName).
 func tlsActive(cluster *postgresv1alpha1.Cluster) bool {
 	return cluster.Spec.TLS != nil && meta.IsStatusConditionTrue(cluster.Status.Conditions, ConditionTypeTLSReady)
 }
@@ -76,7 +76,7 @@ func clusterClientTLS(ctx context.Context, c client.Reader, cluster *postgresv1a
 	if !tlsActive(cluster) {
 		return clientTLSFor(cluster, nil), nil
 	}
-	name := cluster.Spec.TLS.SecretName
+	name := tlsSecretName(cluster)
 	secret := &corev1.Secret{}
 	if err := c.Get(ctx, types.NamespacedName{Name: name, Namespace: cluster.Namespace}, secret); err != nil {
 		return clientTLS{}, fmt.Errorf("failed to get TLS Secret %q: %w", name, err)

@@ -74,7 +74,7 @@ func newTestCA() *testCA {
 	Expect(err).NotTo(HaveOccurred())
 	cert, err := x509.ParseCertificate(der)
 	Expect(err).NotTo(HaveOccurred())
-	return &testCA{cert: cert, key: key, pem: pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})}
+	return &testCA{cert: cert, key: key, pem: pem.EncodeToMemory(&pem.Block{Type: pemTypeCertificate, Bytes: der})}
 }
 
 // issue returns kubernetes.io/tls Secret data for a server certificate with
@@ -98,7 +98,7 @@ func (ca *testCA) issue(dnsNames []string, notBefore, notAfter time.Time) map[st
 	keyDER, err := x509.MarshalECPrivateKey(key)
 	Expect(err).NotTo(HaveOccurred())
 	return map[string][]byte{
-		TLSSecretKeyCert: pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}),
+		TLSSecretKeyCert: pem.EncodeToMemory(&pem.Block{Type: pemTypeCertificate, Bytes: der}),
 		TLSSecretKeyKey:  pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}),
 		TLSSecretKeyCA:   ca.pem,
 	}
@@ -402,12 +402,46 @@ var _ = Describe("Cluster TLS", func() {
 		Expect(t.MinProtocolVersion).To(Equal(postgresv1alpha1.TLSProtocolVersion12))
 	})
 
-	It("rejects spec.tls without secretName", func() {
-		c := &postgresv1alpha1.Cluster{
-			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testTLSNamespace},
-			Spec:       postgresv1alpha1.ClusterSpec{TLS: &postgresv1alpha1.ClusterTLSSpec{}},
+	It("restarts the pod once when the CA changed, instead of reloading", func() {
+		data := ca.issueFor(host())
+		tlsSecret := createTLSSecret(name+"-tls", data)
+		createCluster(&postgresv1alpha1.ClusterTLSSpec{SecretName: name + "-tls"})
+
+		presented := leafDER(data)
+		reloads := 0
+		r := newReconciler()
+		r.ProbeServerCertificate = func(context.Context, string, string) ([]byte, error) { return presented, nil }
+		r.ReloadServerConfig = func(context.Context, postgres.ConnectionConfig) error {
+			reloads++
+			return nil
 		}
-		Expect(apierrors.IsInvalid(k8sClient.Create(ctx, c))).To(BeTrue())
+		reconcileOnce(r)
+		markSTSReady()
+		reconcileOnce(r)
+		Expect(tlsCondition().Status).To(Equal(metav1.ConditionTrue))
+		Expect(getSTS().Spec.Template.Annotations).NotTo(HaveKey(AnnotationTLSRestart))
+
+		By("replacing the certificate with one from a new CA")
+		tlsSecret.Data = newTestCA().issueFor(host())
+		Expect(k8sClient.Update(ctx, tlsSecret)).To(Succeed())
+		reconcileOnce(r)
+		cond := tlsCondition()
+		Expect(cond.Reason).To(Equal(ReasonCertificateReloading))
+		Expect(cond.Message).To(ContainSubstring("restarting the PostgreSQL pod"))
+		Expect(reloads).To(BeZero(), "never reload over a connection the new CA cannot verify")
+		sts := getSTS()
+		hash := sts.Spec.Template.Annotations[AnnotationTLSRestart]
+		Expect(hash).NotTo(BeEmpty())
+
+		By("not restarting again for the same certificate")
+		reconcileOnce(r)
+		Expect(getSTS().ResourceVersion).To(Equal(sts.ResourceVersion))
+
+		By("becoming ready once the restarted pod presents the new certificate")
+		presented = leafDER(tlsSecret.Data)
+		reconcileOnce(r)
+		Expect(tlsCondition().Status).To(Equal(metav1.ConditionTrue))
+		Expect(getSTS().Spec.Template.Annotations[AnnotationTLSRestart]).To(Equal(hash))
 	})
 
 	It("leaves a Cluster without spec.tls exactly as before", func() {

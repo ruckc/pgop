@@ -34,8 +34,10 @@ spec:
   storage:
     size: 5Gi
     # retainPolicy: Retain   # default; Delete removes the PVC with the Cluster
-  # tls:                     # optional server TLS (off when unset)
-  #   secretName: example-cluster-tls   # tls.crt/tls.key/ca.crt, e.g. from cert-manager
+  # tls: {}                  # optional server TLS (off when unset); {} = self-managed CA
+  # tls:
+  #   issuerRef: {name: my-ca-issuer}   # or: cert-manager issues the certificate
+  #   secretName: example-cluster-tls   # or: your own tls.crt/tls.key/ca.crt Secret
   resources:
     requests:
       memory: "256Mi"
@@ -57,8 +59,11 @@ PostgreSQL on the old data; the operator reports this with an
 
 #### TLS
 
-Set `spec.tls.secretName` to a `kubernetes.io/tls`-style Secret (`tls.crt`,
-`tls.key`, `ca.crt`; cert-manager produces this) whose certificate covers
+Set `spec.tls: {}` and the operator generates, renews and rotates its own CA
+and server certificate. Alternatively set `spec.tls.issuerRef` to a
+cert-manager issuer (the operator creates the `Certificate`), or
+`spec.tls.secretName` to your own `kubernetes.io/tls`-style Secret (`tls.crt`,
+`tls.key`, `ca.crt`) whose certificate covers
 `<name>.<namespace>.svc.cluster.local`. The server then runs with `ssl=on`,
 rejects non-TLS TCP connections (`requireTLS`, default `true`), the operator
 connects with `sslmode=verify-full`, and the credentials Secrets gain `sslmode`,

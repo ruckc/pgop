@@ -86,8 +86,23 @@ func clusterPort(cluster *postgresv1alpha1.Cluster) int32 {
 	return cluster.Spec.Port
 }
 
-// tlsMaterial is the validated content of the Secret named by
-// spec.tls.secretName.
+// tlsSecretName is the Secret holding the server certificate that is mounted
+// into the pod: spec.tls.secretName, the Secret cert-manager writes for
+// spec.tls.issuerRef, or the self-managed server Secret. spec.tls must be set.
+func tlsSecretName(cluster *postgresv1alpha1.Cluster) string {
+	t := cluster.Spec.TLS
+	switch {
+	case t.SecretName != "":
+		return t.SecretName
+	case t.IssuerRef != nil:
+		return certManagerSecretName(cluster)
+	default:
+		return selfManagedServerSecretName(cluster)
+	}
+}
+
+// tlsMaterial is the validated content of the server certificate Secret
+// (see tlsSecretName).
 type tlsMaterial struct {
 	CAPEM []byte
 	// Leaf is the server certificate (first certificate in tls.crt).
@@ -97,14 +112,14 @@ type tlsMaterial struct {
 	Hash string
 }
 
-// loadTLSMaterial fetches and validates the Cluster's TLS Secret.
-func loadTLSMaterial(ctx context.Context, c client.Reader, cluster *postgresv1alpha1.Cluster) (*tlsMaterial, error) {
-	name := cluster.Spec.TLS.SecretName
+// loadTLSMaterial fetches the Cluster's TLS Secret and validates it at now.
+func loadTLSMaterial(ctx context.Context, c client.Reader, cluster *postgresv1alpha1.Cluster, now time.Time) (*tlsMaterial, error) {
+	name := tlsSecretName(cluster)
 	secret := &corev1.Secret{}
 	if err := c.Get(ctx, types.NamespacedName{Name: name, Namespace: cluster.Namespace}, secret); err != nil {
 		return nil, fmt.Errorf("failed to get TLS Secret %q: %w", name, err)
 	}
-	m, err := parseTLSMaterial(secret.Data, clusterHost(cluster), time.Now())
+	m, err := parseTLSMaterial(secret.Data, clusterHost(cluster), now)
 	if err != nil {
 		return nil, fmt.Errorf("TLS Secret %q: %w", name, err)
 	}
@@ -164,6 +179,27 @@ func parseTLSMaterial(data map[string][]byte, host string, now time.Time) (*tlsM
 	}, nil
 }
 
+// certVerifies reports whether the DER certificate der is valid for host
+// under the CA bundle caPEM at now. It is used to decide whether a server that
+// still presents an older certificate can be reached over verify-full.
+func certVerifies(der, caPEM []byte, host string, now time.Time) bool {
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		return false
+	}
+	roots := x509.NewCertPool()
+	if !roots.AppendCertsFromPEM(caPEM) {
+		return false
+	}
+	_, err = cert.Verify(x509.VerifyOptions{
+		DNSName:     host,
+		Roots:       roots,
+		CurrentTime: now,
+		KeyUsages:   []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	})
+	return err == nil
+}
+
 // postgresTLSArgs returns the container args that enable TLS on the server,
 // or nil when spec.tls is unset (the image default CMD is then used, as
 // before). The official image entrypoint passes the "-c" options through to
@@ -197,7 +233,7 @@ func postgresTLSVolumes(cluster *postgresv1alpha1.Cluster) ([]corev1.Volume, []c
 		Name: tlsVolumeName,
 		VolumeSource: corev1.VolumeSource{
 			Secret: &corev1.SecretVolumeSource{
-				SecretName:  spec.SecretName,
+				SecretName:  tlsSecretName(cluster),
 				DefaultMode: new(tlsFileMode),
 			},
 		},

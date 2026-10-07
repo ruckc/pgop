@@ -83,6 +83,17 @@ const (
 )
 
 // ClusterTLSSpec configures server-side TLS for a Cluster.
+//
+// The server certificate comes from one of three sources:
+//   - secretName: a Secret you provide (for example written by your own
+//     cert-manager Certificate);
+//   - issuerRef: the operator creates and owns a cert-manager Certificate
+//     issued by the referenced issuer;
+//   - neither (self-managed): the operator generates a CA and a server
+//     certificate, stores them in Secrets owned by the Cluster and renews and
+//     rotates them before they expire.
+//
+// +kubebuilder:validation:XValidation:rule="!(has(self.secretName) && has(self.issuerRef))",message="secretName and issuerRef are mutually exclusive; set at most one (neither selects the self-managed CA)"
 type ClusterTLSSpec struct {
 	// secretName is the name of a Secret in the Cluster namespace holding the
 	// server certificate in the kubernetes.io/tls layout: tls.crt (server
@@ -90,10 +101,21 @@ type ClusterTLSSpec struct {
 	// and ca.crt (the CA that issued tls.crt). cert-manager Certificate
 	// resources produce this layout. The certificate must be valid for the
 	// Service DNS name <cluster>.<namespace>.svc.cluster.local, which the
-	// operator verifies with sslmode=verify-full.
-	// +kubebuilder:validation:Required
+	// operator verifies with sslmode=verify-full. Mutually exclusive with
+	// issuerRef.
 	// +kubebuilder:validation:MinLength=1
-	SecretName string `json:"secretName"`
+	// +optional
+	SecretName string `json:"secretName,omitempty"`
+
+	// issuerRef makes the operator create and own a cert-manager Certificate
+	// "<cluster>-server" issued by this issuer. cert-manager writes the
+	// certificate to the Secret "<cluster>-server-tls", which is then used
+	// exactly like secretName. The issuer must populate ca.crt (CA, Vault and
+	// self-signed issuers do). Requires cert-manager; without it the Cluster
+	// reports TLSReady=False with reason CertManagerUnavailable. Mutually
+	// exclusive with secretName.
+	// +optional
+	IssuerRef *CertManagerIssuerReference `json:"issuerRef,omitempty"`
 
 	// requireTLS rejects non-TLS TCP connections through an operator-managed
 	// pg_hba.conf (hostnossl ... reject). Connections over the local Unix
@@ -108,6 +130,30 @@ type ClusterTLSSpec struct {
 	// +optional
 	MinProtocolVersion TLSProtocolVersion `json:"minProtocolVersion,omitempty"`
 }
+
+// CertManagerIssuerReference references a cert-manager issuer.
+type CertManagerIssuerReference struct {
+	// name of the issuer.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	Name string `json:"name"`
+
+	// kind of the issuer: Issuer (namespaced, in the Cluster namespace),
+	// ClusterIssuer, or the kind of an external issuer.
+	// +kubebuilder:default=Issuer
+	// +optional
+	Kind string `json:"kind,omitempty"`
+
+	// group of the issuer. Defaults to cert-manager.io; set it for external
+	// issuers.
+	// +kubebuilder:default="cert-manager.io"
+	// +optional
+	Group string `json:"group,omitempty"`
+}
+
+// IsSelfManaged reports whether the operator manages the CA and server
+// certificate itself (neither secretName nor issuerRef is set).
+func (t *ClusterTLSSpec) IsSelfManaged() bool { return t.SecretName == "" && t.IssuerRef == nil }
 
 // IsRequireTLS reports whether non-TLS TCP connections are rejected (CRD
 // default: true).

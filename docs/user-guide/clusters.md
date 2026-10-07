@@ -46,7 +46,11 @@ spec:
 | `storage.storageClassName` | string | - | Storage class name |
 | `storage.retainPolicy` | string | `Retain` | `Retain` keeps the PVC when the Cluster is deleted; `Delete` removes it. See [Storage retention](#storage-retention) |
 | `resources` | ResourceRequirements | - | CPU/memory requests/limits |
-| `tls.secretName` | string | - | Secret with `tls.crt`, `tls.key`, `ca.crt`. Setting `tls` enables server TLS. See [TLS](#tls) |
+| `tls` | object | - | Setting `tls` (even `tls: {}`) enables server TLS. See [TLS](#tls) |
+| `tls.secretName` | string | - | Your own Secret with `tls.crt`, `tls.key`, `ca.crt`. Mutually exclusive with `issuerRef` |
+| `tls.issuerRef.name` | string | - | cert-manager issuer; the operator creates the `Certificate`. Mutually exclusive with `secretName` |
+| `tls.issuerRef.kind` | string | `Issuer` | `Issuer`, `ClusterIssuer` or an external issuer kind |
+| `tls.issuerRef.group` | string | `cert-manager.io` | Issuer API group (for external issuers) |
 | `tls.requireTLS` | bool | `true` | Reject non-TLS TCP connections |
 | `tls.minProtocolVersion` | string | `TLSv1.2` | `TLSv1.2` or `TLSv1.3` |
 
@@ -194,15 +198,30 @@ See [Databases → Extensions](databases.md#common-extensions).
 
 ## TLS
 
-Setting `spec.tls` turns on TLS for the PostgreSQL server:
+Setting `spec.tls` turns on TLS for the PostgreSQL server. The server
+certificate comes from one of three sources:
+
+| `spec.tls` | Certificate source | Secret mounted into the pod |
+|------------|--------------------|-----------------------------|
+| `tls: {}` (neither field) | **Self-managed CA**: the operator generates a CA and a server certificate, and renews and rotates them | `<cluster>-server-cert` |
+| `issuerRef: {name: …}` | **cert-manager**: the operator creates and owns a `Certificate` `<cluster>-server` | `<cluster>-server-tls` (written by cert-manager) |
+| `secretName: …` | **Your own Secret** | the named Secret |
 
 ```yaml
 spec:
-  tls:
-    secretName: production-db-tls   # tls.crt, tls.key, ca.crt
-    # requireTLS: true              # default: reject non-TLS TCP connections
-    # minProtocolVersion: TLSv1.2   # or TLSv1.3
+  tls: {}                           # self-managed CA, or:
+  # tls:
+  #   issuerRef: {name: my-ca-issuer, kind: Issuer}   # cert-manager, or:
+  #   secretName: production-db-tls                   # your own Secret
+  #   requireTLS: true              # default: reject non-TLS TCP connections
+  #   minProtocolVersion: TLSv1.2   # or TLSv1.3
 ```
+
+`secretName` and `issuerRef` are mutually exclusive (rejected by the API
+server). Switching between the sources is allowed: the pod restarts once onto
+the new certificate, and the resources the operator created for the previous
+source (the `Certificate` and its Secret, or the self-managed Secrets) are
+deleted afterwards.
 
 **Clusters without `spec.tls` are not affected.** `requireTLS` defaults to
 `true`, but the default only applies inside a `tls` block: a Cluster that does
@@ -210,7 +229,73 @@ not set `spec.tls` keeps running exactly as before (no pod changes, no restart,
 `sslmode=disable`). Upgrading the operator therefore never turns TLS on, or
 starts rejecting connections, for existing Clusters.
 
-### The certificate Secret
+### Self-managed CA
+
+With `tls: {}` the operator needs nothing else (no cert-manager):
+
+- It generates an ECDSA P-256 **CA** valid for 10 years and stores it in the
+  Secret `<cluster>-ca` (`tls.crt`/`tls.key`: the CA, `ca.crt`: the trust
+  bundle clients use). The CA private key is never mounted into the pod.
+- It issues an ECDSA P-256 **server certificate** valid for 90 days for
+  `<cluster>.<namespace>.svc.cluster.local`, `<cluster>.<namespace>.svc`,
+  `<cluster>.<namespace>` and `<cluster>`, stored in `<cluster>-server-cert`
+  (`tls.crt`, `tls.key`, `ca.crt`).
+- Both Secrets are owned by the Cluster and deleted with it (or when the
+  Cluster stops using the self-managed CA). A pre-existing Secret of the same
+  name that the Cluster does not own is never overwritten; `TLSReady` reports
+  `InvalidTLSSecret` instead.
+- **Renewal:** the server certificate is renewed 30 days before it expires and
+  loaded with `pg_reload_conf()`, without a restart.
+- **CA rotation** happens in two steps so that clients never see a server
+  certificate from a CA they do not trust yet. Three years before the CA
+  expires, a new CA is generated and **added** to the `ca.crt` trust bundle in
+  every credentials Secret, while the server certificate is still issued by
+  the old CA. One year before expiry the new CA takes over and a new server
+  certificate is issued from it. The old CA stays in the bundle until it
+  expires, so the operator verifies (and reloads) the server throughout: no
+  restart. Clients that mount `ca.crt` from a credentials Secret (see
+  [Client configuration](#client-configuration)) pick up the new CA through
+  kubelet's Secret refresh, two years before they need it.
+- If `<cluster>-ca` is deleted, a new CA and server certificate are generated.
+  The old CA is not trusted any more, so the operator restarts the pod (see
+  [Certificate rotation](#certificate-rotation)) and clients must pick up the
+  new `ca.crt`.
+
+### cert-manager (`issuerRef`)
+
+```yaml
+spec:
+  tls:
+    issuerRef:
+      name: my-ca-issuer     # an Issuer in the Cluster namespace
+      kind: Issuer           # default; or ClusterIssuer, or an external issuer kind
+      # group: cert-manager.io   # default; set it for external issuers
+```
+
+The operator creates a cert-manager `Certificate` named `<cluster>-server`,
+owned by the Cluster, for the same four DNS names as the self-managed
+certificate, with `secretName: <cluster>-server-tls`. cert-manager issues and
+renews it; the Secret then goes through the same validation, mounting and
+reload as a Secret you provide. The operator adds an owner reference to that
+Secret so it is deleted with the Cluster (cert-manager does not delete the
+Secrets of deleted Certificates by default).
+
+- **The issuer must populate `ca.crt`** (CA, Vault and self-signed issuers
+  do; ACME issuers do not).
+- While the certificate is not issued yet, `TLSReady` is `False` with reason
+  `CertificatePending` and the Certificate's `Ready` condition in the message;
+  the StatefulSet is not touched until the Secret exists.
+- **Without cert-manager** (the `cert-manager.io/v1` `Certificate` API is not
+  installed), `TLSReady` is `False` with reason `CertManagerUnavailable`; the
+  Cluster keeps running as before and is retried every minute, so installing
+  cert-manager later picks it up. The operator itself starts and runs normally
+  without cert-manager.
+- A `Certificate` named `<cluster>-server` that the Cluster does not own is
+  never modified (`CertificatePending` with an explanation).
+- RBAC: the operator's ClusterRole includes `certificates.cert-manager.io`
+  (create, get, list, watch, update, patch, delete).
+
+### Your own Secret (`secretName`)
 
 `secretName` names a Secret in the Cluster's namespace in the
 `kubernetes.io/tls` layout:
@@ -226,7 +311,8 @@ The certificate must be valid for `<cluster>.<namespace>.svc.cluster.local`
 server authentication. Add any other names your clients use, such as
 `<cluster>.<namespace>.svc` and `<cluster>`.
 
-A cert-manager `Certificate` produces exactly this layout. Example with a
+A cert-manager `Certificate` produces exactly this layout (or let the
+operator create it with [`issuerRef`](#cert-manager-issuerref)). Example with a
 namespace-local CA:
 
 ```yaml
@@ -251,7 +337,8 @@ Issuers that do not populate `ca.crt` (for example ACME) are not supported.
 
 ### What the operator does
 
-1. **Validates the Secret** before touching the pod: all three keys present,
+1. **Validates the Secret** (whichever source it comes from) before touching
+   the pod: all three keys present,
    `tls.crt`/`tls.key` form a key pair, and the certificate chains to `ca.crt`,
    is currently valid and names the Service host. On failure the `TLSReady`
    condition is `False` with reason `InvalidTLSSecret`, an `InvalidTLSSecret`
@@ -320,18 +407,29 @@ the pod may start before that.
 
 ### Certificate rotation
 
-Rotation does not restart the pod. When the Secret changes (cert-manager
-renews certificates automatically), the operator re-validates it and, if the
-running server still presents the old certificate, runs `SELECT
-pg_reload_conf()`; PostgreSQL re-reads the certificate files on reload.
-Kubelet propagates Secret updates into the pod with a delay of up to about a
-minute, so `TLSReady` is briefly `False` (reason `CertificateReloading`) and the
-operator retries until the new certificate is served.
+Renewing a certificate does not restart the pod. When the Secret changes
+(cert-manager and the self-managed CA renew certificates automatically), the
+operator re-validates it and, if the running server still presents the old
+certificate, runs `SELECT pg_reload_conf()`; PostgreSQL re-reads the
+certificate files on reload. Kubelet propagates Secret updates into the pod
+with a delay of up to about a minute, so `TLSReady` is briefly `False` (reason
+`CertificateReloading`) and the operator retries until the new certificate is
+served.
 
-The reload connection is verified against the **current** `ca.crt`. If the CA
-itself was replaced, the old certificate cannot be verified and the operator
-does not fall back to an unverified connection: `TLSReady` stays `False` with
-a message asking you to restart the pod (`kubectl delete pod <cluster>-0`).
+The reload connection is verified against the **current** `ca.crt`, and the
+operator never falls back to an unverified connection. If the old certificate
+does not verify against the new `ca.crt` (the CA was replaced without an
+overlap, or the old certificate already expired), a reload is impossible, so
+the operator **restarts the pod** instead: it sets the pod template annotation
+`pgop.ruck.io/tls-restart` to the hash of the new certificate, which rolls the
+StatefulSet once. The restart happens at most once per certificate, so a
+server that keeps presenting an unexpected certificate does not cause a
+restart loop. The self-managed CA always overlaps old and new CAs and never
+needs this restart, except after `<cluster>-ca` was deleted.
+
+To replace a CA without a restart when you manage the certificate yourself,
+put both the old and the new CA into `ca.crt` first, then switch `tls.crt` to
+a certificate from the new CA.
 
 ### Turning TLS off
 
@@ -339,7 +437,9 @@ Removing `spec.tls` restarts the pod without `ssl=on` and without `hba_file`,
 so PostgreSQL uses the `pg_hba.conf` in its data directory again (the image
 default: password authentication over any address). The `<cluster>-hba`
 ConfigMap is deleted, the `TLSReady` condition is removed, and the credentials
-Secrets switch back to `sslmode=disable` and lose `ca.crt`.
+Secrets switch back to `sslmode=disable` and lose `ca.crt`. The operator's
+`Certificate` (issuerRef) or self-managed CA and server Secrets are deleted;
+turning the self-managed CA on again generates a new CA.
 
 ### Limitations
 
@@ -350,9 +450,9 @@ Secrets switch back to `sslmode=disable` and lose `ca.crt`.
   follow-up.
 - An operator running outside the cluster (`make run`) cannot reach the
   Service DNS name, so `TLSReady` stays `False` (`WaitingForServer`).
-- Not configurable yet: `issuerRef` (operator-created cert-manager
-  `Certificate`) and an operator-managed CA when no Secret is given. Both are
-  planned.
+- The self-managed CA's lifetimes (10 year CA, 90 day server certificate)
+  and the requested DNS names are not configurable. Use `issuerRef` or
+  `secretName` for other names (for example an external load balancer).
 
 ### FIPS
 
