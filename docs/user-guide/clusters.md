@@ -42,8 +42,9 @@ spec:
 | `image` | string | `postgres:18` | PostgreSQL container image |
 | `replicas` | int | `1` | Number of instances (currently only 1 supported) |
 | `port` | int | `5432` | PostgreSQL listen port |
-| `storage.size` | string | - | PVC size (e.g., "10Gi") |
+| `storage.size` | string | `1Gi` | PVC size (e.g., "10Gi") |
 | `storage.storageClassName` | string | - | Storage class name |
+| `storage.retainPolicy` | string | `Retain` | `Retain` keeps the PVC when the Cluster is deleted; `Delete` removes it. See [Storage retention](#storage-retention) |
 | `resources` | ResourceRequirements | - | CPU/memory requests/limits |
 
 ## Status
@@ -53,7 +54,64 @@ spec:
 | `ready` | Whether the cluster is ready to accept connections |
 | `endpoint` | Service endpoint (hostname:port) |
 | `secretName` | Name of the credentials secret |
-| `conditions` | Detailed status conditions |
+| `conditions` | Detailed status conditions (`Available`, `ExistingVolume`) |
+
+## Storage Retention
+
+Each Cluster stores its data in a PersistentVolumeClaim named
+`data-<cluster-name>-0`, created by the StatefulSet. What happens to that PVC
+when the Cluster is deleted is controlled by `spec.storage.retainPolicy`:
+
+| Value | Behaviour on Cluster deletion |
+|-------|-------------------------------|
+| `Retain` (default) | The PVC and its data are **kept**. |
+| `Delete` | The PVC is deleted together with the Cluster. Whether the underlying PersistentVolume and its data are destroyed depends on the StorageClass `reclaimPolicy`. |
+
+```yaml
+spec:
+  storage:
+    size: 10Gi
+    retainPolicy: Delete
+```
+
+!!! warning "Deleting a Cluster keeps its data by default"
+    With the default `Retain`, `kubectl delete cluster <name>` and
+    `helm uninstall` of a chart that created the Cluster leave the PVC behind.
+    A Cluster recreated later **with the same name in the same namespace**
+    starts PostgreSQL on that old data directory (old databases, roles and
+    data). Delete the PVC by hand (`kubectl delete pvc data-<name>-0`) if you
+    want a clean start, or set `retainPolicy: Delete`.
+
+Notes:
+
+- `retainPolicy` maps onto the StatefulSet
+  `persistentVolumeClaimRetentionPolicy.whenDeleted`. `whenScaled` is always
+  `Retain`, so scaling never destroys data.
+- **Requires Kubernetes 1.27+** (the field is beta and enabled by default since
+  1.27, GA since 1.32). On older clusters `Delete` is silently ignored and PVCs
+  are always retained.
+- The field is mutable. Changing it updates the existing StatefulSet in place;
+  it only takes effect when the Cluster is later deleted.
+- `kubectl delete cluster <name> --cascade=orphan` leaves the StatefulSet and
+  PVC behind regardless of `retainPolicy`.
+
+### Starting on a pre-existing volume
+
+When the operator creates a Cluster's StatefulSet and finds that
+`data-<name>-0` already exists, it sets the `ExistingVolume` condition to
+`True` (reason `PreExistingPVC`) and records a `PreExistingPVC` Warning event on
+the Cluster. Otherwise the condition is `False` (reason `NewVolume`). The
+condition is evaluated only once, at StatefulSet creation.
+
+This is informational: the regenerated operator password in
+`<name>-credentials` is synced into the existing database automatically on pod
+start, so the operator can still connect. Application roles and databases from
+the old data directory remain as they were.
+
+```sh
+kubectl get cluster <name> -o jsonpath='{.status.conditions[?(@.type=="ExistingVolume")]}'
+kubectl get events --field-selector reason=PreExistingPVC
+```
 
 ## Credentials Secret
 

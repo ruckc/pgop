@@ -34,6 +34,21 @@ type SecretKeySelector struct {
 	Key string `json:"key"`
 }
 
+// StorageRetainPolicy controls what happens to a Cluster's PersistentVolumeClaim
+// when the Cluster is deleted.
+// +kubebuilder:validation:Enum=Retain;Delete
+type StorageRetainPolicy string
+
+const (
+	// StorageRetainPolicyRetain keeps the PVC (and its data) after the Cluster
+	// is deleted. A Cluster recreated with the same name reuses the volume.
+	StorageRetainPolicyRetain StorageRetainPolicy = "Retain"
+
+	// StorageRetainPolicyDelete deletes the PVC (and, depending on the
+	// StorageClass reclaim policy, its data) when the Cluster is deleted.
+	StorageRetainPolicyDelete StorageRetainPolicy = "Delete"
+)
+
 // StorageSpec defines storage configuration for the cluster
 type StorageSpec struct {
 	// size is the size of the persistent volume claim
@@ -43,4 +58,13 @@ type StorageSpec struct {
 	// storageClassName is the name of the StorageClass to use
 	// +optional
 	StorageClassName *string `json:"storageClassName,omitempty"`
+
+	// retainPolicy controls whether the PersistentVolumeClaim is kept or
+	// deleted when the Cluster is deleted. Retain (the default) keeps the data,
+	// so a Cluster recreated with the same name starts on the old volume.
+	// Delete removes the PVC together with the Cluster. Delete requires
+	// Kubernetes 1.27+ (StatefulSet persistentVolumeClaimRetentionPolicy).
+	// +kubebuilder:default=Retain
+	// +optional
+	RetainPolicy StorageRetainPolicy `json:"retainPolicy,omitempty"`
 }

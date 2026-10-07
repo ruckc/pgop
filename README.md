@@ -33,6 +33,7 @@ spec:
   port: 5432
   storage:
     size: 5Gi
+    # retainPolicy: Retain   # default; Delete removes the PVC with the Cluster
   resources:
     requests:
       memory: "256Mi"
@@ -41,6 +42,16 @@ spec:
       memory: "512Mi"
       cpu: "500m"
 ```
+
+#### Volume retention
+
+By default (`storage.retainPolicy: Retain`) the data PVC `data-<name>-0` is
+**kept** when the Cluster is deleted, including via `helm uninstall` or
+`kubectl delete cluster`. Recreating a Cluster with the same name starts
+PostgreSQL on the old data; the operator reports this with an
+`ExistingVolume=True` condition and a `PreExistingPVC` Warning event. Set
+`storage.retainPolicy: Delete` to remove the PVC together with the Cluster
+(Kubernetes 1.27+). See [Clusters → Storage retention](docs/user-guide/clusters.md#storage-retention).
 
 #### Data directory layout
 
@@ -159,7 +170,7 @@ spec:
 
 ### Prerequisites
 
-- Kubernetes v1.24+
+- Kubernetes v1.27+ (needed for `storage.retainPolicy: Delete`)
 - `kubectl`
 
 ### Installation

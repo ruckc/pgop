@@ -38,6 +38,18 @@ const (
 
 	ConditionTypeAvailable = "Available"
 
+	// ConditionTypeExistingVolume reports whether the Cluster's StatefulSet
+	// was created on top of a pre-existing data PVC (e.g. one retained from a
+	// previously deleted Cluster of the same name). It is set once, when the
+	// StatefulSet is first created, and never recomputed.
+	ConditionTypeExistingVolume = "ExistingVolume"
+	ReasonPreExistingPVC        = "PreExistingPVC"
+	ReasonNewVolume             = "NewVolume"
+
+	// dataVolumeName is the name of the StatefulSet volumeClaimTemplate; the
+	// StatefulSet controller names PVCs "<dataVolumeName>-<sts>-<ordinal>".
+	dataVolumeName = "data"
+
 	envAWSAccessKeyID     = "AWS_ACCESS_KEY_ID"
 	envAWSSecretAccessKey = "AWS_SECRET_ACCESS_KEY"
 

@@ -33,6 +33,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -49,6 +50,11 @@ const (
 type ClusterReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+
+	// Recorder emits Kubernetes Events for the Cluster. Optional: when nil
+	// (e.g. in tests that construct the reconciler directly) no events are
+	// recorded.
+	Recorder events.EventRecorder
 }
 
 // +kubebuilder:rbac:groups=pgop.ruck.io,resources=clusters,verbs=get;list;watch;create;update;patch;delete
@@ -58,6 +64,7 @@ type ClusterReconciler struct {
 // +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 
 func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
@@ -324,9 +331,13 @@ func (r *ClusterReconciler) reconcileStatefulSet(ctx context.Context, cluster *p
 	sts := &appsv1.StatefulSet{}
 	err = r.Get(ctx, types.NamespacedName{Name: stsName, Namespace: cluster.Namespace}, sts)
 	if err == nil {
-		return r.convergeStatefulSet(ctx, sts, replicas, labels, container)
+		return r.convergeStatefulSet(ctx, sts, replicas, labels, container, desiredPVCRetentionPolicy(cluster))
 	}
 	if !apierrors.IsNotFound(err) {
+		return err
+	}
+
+	if err := r.detectExistingVolume(ctx, cluster); err != nil {
 		return err
 	}
 
@@ -342,8 +353,9 @@ func (r *ClusterReconciler) reconcileStatefulSet(ctx context.Context, cluster *p
 			Labels:    labels,
 		},
 		Spec: appsv1.StatefulSetSpec{
-			ServiceName: cluster.Name,
-			Replicas:    &replicas,
+			ServiceName:                          cluster.Name,
+			Replicas:                             &replicas,
+			PersistentVolumeClaimRetentionPolicy: desiredPVCRetentionPolicy(cluster),
 			Selector: &metav1.LabelSelector{
 				MatchLabels: map[string]string{
 					LabelAppName:     AppNamePostgresql,
@@ -362,7 +374,7 @@ func (r *ClusterReconciler) reconcileStatefulSet(ctx context.Context, cluster *p
 			VolumeClaimTemplates: []corev1.PersistentVolumeClaim{
 				{
 					ObjectMeta: metav1.ObjectMeta{
-						Name: "data",
+						Name: dataVolumeName,
 					},
 					Spec: corev1.PersistentVolumeClaimSpec{
 						AccessModes: []corev1.PersistentVolumeAccessMode{
@@ -385,6 +397,72 @@ func (r *ClusterReconciler) reconcileStatefulSet(ctx context.Context, cluster *p
 	}
 
 	return r.Create(ctx, sts)
+}
+
+// desiredPVCRetentionPolicy maps the Cluster's storage.retainPolicy onto the
+// StatefulSet persistentVolumeClaimRetentionPolicy. whenDeleted follows the
+// Cluster setting (Retain by default); whenScaled is always Retain so that a
+// scale-down can never destroy data. With whenDeleted=Delete the StatefulSet
+// controller adds an ownerReference from the StatefulSet to each PVC, so the
+// existing Cluster -> StatefulSet ownership cascade removes the PVC through
+// normal garbage collection.
+func desiredPVCRetentionPolicy(cluster *postgresv1alpha1.Cluster) *appsv1.StatefulSetPersistentVolumeClaimRetentionPolicy {
+	whenDeleted := appsv1.RetainPersistentVolumeClaimRetentionPolicyType
+	if cluster.Spec.Storage.RetainPolicy == postgresv1alpha1.StorageRetainPolicyDelete {
+		whenDeleted = appsv1.DeletePersistentVolumeClaimRetentionPolicyType
+	}
+	return &appsv1.StatefulSetPersistentVolumeClaimRetentionPolicy{
+		WhenDeleted: whenDeleted,
+		WhenScaled:  appsv1.RetainPersistentVolumeClaimRetentionPolicyType,
+	}
+}
+
+// dataPVCName returns the name of the PVC the StatefulSet controller creates
+// for the given Cluster's first (and only) replica.
+func dataPVCName(cluster *postgresv1alpha1.Cluster) string {
+	return fmt.Sprintf("%s-%s-0", dataVolumeName, cluster.Name)
+}
+
+// detectExistingVolume is called right before the StatefulSet is created. If
+// the data PVC already exists (typically retained from a previously deleted
+// Cluster of the same name), the new StatefulSet will adopt it and PostgreSQL
+// starts on the old data directory. That is surfaced via the ExistingVolume
+// condition and a Warning event. The condition is only computed here: once the
+// StatefulSet exists the operator can no longer tell the two cases apart.
+// The postStart password-sync hook already handles the credential mismatch,
+// so this is informational only.
+func (r *ClusterReconciler) detectExistingVolume(ctx context.Context, cluster *postgresv1alpha1.Cluster) error {
+	pvcName := dataPVCName(cluster)
+	pvc := &corev1.PersistentVolumeClaim{}
+	err := r.Get(ctx, types.NamespacedName{Name: pvcName, Namespace: cluster.Namespace}, pvc)
+	if err != nil && !apierrors.IsNotFound(err) {
+		return err
+	}
+
+	if apierrors.IsNotFound(err) {
+		meta.SetStatusCondition(&cluster.Status.Conditions, metav1.Condition{
+			Type:               ConditionTypeExistingVolume,
+			Status:             metav1.ConditionFalse,
+			ObservedGeneration: cluster.Generation,
+			Reason:             ReasonNewVolume,
+			Message:            fmt.Sprintf("StatefulSet created without a pre-existing data PVC; %s will be provisioned fresh", pvcName),
+		})
+		return nil
+	}
+
+	msg := fmt.Sprintf("Starting on pre-existing PersistentVolumeClaim %s; PostgreSQL will reuse its existing data", pvcName)
+	logf.FromContext(ctx).Info(msg, "pvc", pvcName)
+	meta.SetStatusCondition(&cluster.Status.Conditions, metav1.Condition{
+		Type:               ConditionTypeExistingVolume,
+		Status:             metav1.ConditionTrue,
+		ObservedGeneration: cluster.Generation,
+		Reason:             ReasonPreExistingPVC,
+		Message:            msg,
+	})
+	if r.Recorder != nil {
+		r.Recorder.Eventf(cluster, pvc, corev1.EventTypeWarning, ReasonPreExistingPVC, "CreateStatefulSet", "%s", msg)
+	}
+	return nil
 }
 
 // postgresPodSecurityContext returns the pod-level SecurityContext applied to
@@ -455,7 +533,7 @@ func buildPostgresContainer(secret *corev1.Secret, image string, port int32, res
 		},
 		VolumeMounts: []corev1.VolumeMount{
 			{
-				Name:      "data",
+				Name:      dataVolumeName,
 				MountPath: layout.MountPath,
 			},
 		},
@@ -483,14 +561,22 @@ func buildPostgresContainer(secret *corev1.Secret, image string, port int32, res
 }
 
 // convergeStatefulSet patches an existing StatefulSet onto the current
-// Cluster spec (image, resources, replicas, port, and the data-directory
-// layout), and backfills the password-sync lifecycle hook on StatefulSets
+// Cluster spec (image, resources, replicas, port, the data-directory layout,
+// and the PVC retention policy), and backfills the password-sync lifecycle hook on StatefulSets
 // created before it existed (see https://github.com/ruckc/pgop/issues/7).
 // It only issues an Update when something actually differs, so reconciling
 // an already-converged cluster is a no-op and does not trigger spurious
 // pod rollouts.
-func (r *ClusterReconciler) convergeStatefulSet(ctx context.Context, sts *appsv1.StatefulSet, replicas int32, labels map[string]string, desired corev1.Container) error {
+func (r *ClusterReconciler) convergeStatefulSet(ctx context.Context, sts *appsv1.StatefulSet, replicas int32, labels map[string]string, desired corev1.Container, retention *appsv1.StatefulSetPersistentVolumeClaimRetentionPolicy) error {
 	changed := false
+
+	// Compare the two fields explicitly: the API server defaults the struct
+	// (to Retain/Retain), so a nil-vs-defaulted DeepEqual would diff forever.
+	if cur := sts.Spec.PersistentVolumeClaimRetentionPolicy; cur == nil ||
+		cur.WhenDeleted != retention.WhenDeleted || cur.WhenScaled != retention.WhenScaled {
+		sts.Spec.PersistentVolumeClaimRetentionPolicy = retention
+		changed = true
+	}
 
 	if sts.Spec.Replicas == nil || *sts.Spec.Replicas != replicas {
 		sts.Spec.Replicas = &replicas
