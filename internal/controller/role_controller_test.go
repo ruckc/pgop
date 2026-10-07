@@ -24,7 +24,6 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -76,10 +75,10 @@ var _ = Describe("Role Controller", func() {
 					ClusterRef: postgresv1alpha1.ClusterReference{
 						Name: clusterName,
 					},
-					Login:           ptr.To(true),
+					Login:           new(true),
 					Superuser:       false,
 					CreateDB:        true,
-					ConnectionLimit: ptr.To(int32(10)),
+					ConnectionLimit: new(int32(10)),
 				},
 			}
 			Expect(k8sClient.Create(ctx, role)).To(Succeed())
@@ -134,7 +133,7 @@ var _ = Describe("Role Controller", func() {
 					ClusterRef: postgresv1alpha1.ClusterReference{
 						Name: clusterName,
 					},
-					Login: ptr.To(true),
+					Login: new(true),
 				},
 			}
 			Expect(k8sClient.Create(ctx, role)).To(Succeed())
@@ -169,9 +168,9 @@ var _ = Describe("Role Controller", func() {
 				ObjectMeta: metav1.ObjectMeta{Name: roleName, Namespace: RoleNamespace},
 				Spec: postgresv1alpha1.RoleSpec{
 					ClusterRef:      postgresv1alpha1.ClusterReference{Name: nonexistentCluster},
-					Login:           ptr.To(false),
-					Inherit:         ptr.To(false),
-					ConnectionLimit: ptr.To(int32(0)),
+					Login:           new(false),
+					Inherit:         new(false),
+					ConnectionLimit: new(int32(0)),
 				},
 			}
 			Expect(k8sClient.Create(ctx, role)).To(Succeed())
@@ -210,7 +209,7 @@ var _ = Describe("Role Controller", func() {
 					ClusterRef: postgresv1alpha1.ClusterReference{
 						Name: nonexistentCluster,
 					},
-					Login: ptr.To(true),
+					Login: new(true),
 				},
 			}
 			Expect(k8sClient.Create(ctx, role)).To(Succeed())
