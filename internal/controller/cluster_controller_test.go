@@ -25,9 +25,12 @@ import (
 	. "github.com/onsi/gomega"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	postgresv1alpha1 "github.com/ruckc/pgop/api/v1alpha1"
@@ -598,7 +601,9 @@ var _ = Describe("Cluster Controller", func() {
 
 			Expect(cluster.Status.SecretName).To(Equal(clusterName + "-credentials"))
 			Expect(cluster.Status.Endpoint).To(ContainSubstring(clusterName))
-			Expect(cluster.Status.Conditions).To(HaveLen(1))
+			Expect(cluster.Status.Conditions).To(HaveLen(2))
+			Expect(meta.FindStatusCondition(cluster.Status.Conditions, ConditionTypeAvailable)).NotTo(BeNil())
+			Expect(meta.FindStatusCondition(cluster.Status.Conditions, ConditionTypeExistingVolume)).NotTo(BeNil())
 		})
 
 		It("should add a finalizer", func() {
@@ -775,6 +780,194 @@ var _ = Describe("Cluster Controller", func() {
 				NamespacedName: types.NamespacedName{Name: clusterName, Namespace: ClusterNamespace},
 			})
 			Expect(err).NotTo(HaveOccurred())
+		})
+	})
+
+	Context("PVC retention policy", func() {
+		newCluster := func(retain postgresv1alpha1.StorageRetainPolicy) *postgresv1alpha1.Cluster {
+			return &postgresv1alpha1.Cluster{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      fmt.Sprintf("test-cluster-%d", time.Now().UnixNano()),
+					Namespace: ClusterNamespace,
+				},
+				Spec: postgresv1alpha1.ClusterSpec{
+					Image:   DefaultPostgresImage,
+					Storage: postgresv1alpha1.StorageSpec{RetainPolicy: retain},
+				},
+			}
+		}
+
+		cleanup := func(ctx context.Context, cluster *postgresv1alpha1.Cluster) {
+			cluster.Finalizers = nil
+			_ = k8sClient.Update(ctx, cluster)
+			_ = k8sClient.Delete(ctx, cluster)
+		}
+
+		reconcileCluster := func(ctx context.Context, r *ClusterReconciler, cluster *postgresv1alpha1.Cluster) {
+			_, err := r.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: cluster.Name, Namespace: cluster.Namespace},
+			})
+			Expect(err).NotTo(HaveOccurred())
+		}
+
+		getSts := func(ctx context.Context, cluster *postgresv1alpha1.Cluster) *appsv1.StatefulSet {
+			sts := &appsv1.StatefulSet{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cluster.Name, Namespace: cluster.Namespace}, sts)).To(Succeed())
+			return sts
+		}
+
+		It("should default storage.retainPolicy to Retain and keep PVCs on delete and scale", func() {
+			ctx := context.Background()
+			cluster := newCluster("")
+			Expect(k8sClient.Create(ctx, cluster)).To(Succeed())
+			defer cleanup(ctx, cluster)
+			Expect(cluster.Spec.Storage.RetainPolicy).To(Equal(postgresv1alpha1.StorageRetainPolicyRetain))
+
+			reconcileCluster(ctx, &ClusterReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}, cluster)
+
+			policy := getSts(ctx, cluster).Spec.PersistentVolumeClaimRetentionPolicy
+			Expect(policy).NotTo(BeNil())
+			Expect(policy.WhenDeleted).To(Equal(appsv1.RetainPersistentVolumeClaimRetentionPolicyType))
+			Expect(policy.WhenScaled).To(Equal(appsv1.RetainPersistentVolumeClaimRetentionPolicyType))
+		})
+
+		It("should set whenDeleted=Delete when storage.retainPolicy is Delete", func() {
+			ctx := context.Background()
+			cluster := newCluster(postgresv1alpha1.StorageRetainPolicyDelete)
+			Expect(k8sClient.Create(ctx, cluster)).To(Succeed())
+			defer cleanup(ctx, cluster)
+
+			reconcileCluster(ctx, &ClusterReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}, cluster)
+
+			policy := getSts(ctx, cluster).Spec.PersistentVolumeClaimRetentionPolicy
+			Expect(policy).NotTo(BeNil())
+			Expect(policy.WhenDeleted).To(Equal(appsv1.DeletePersistentVolumeClaimRetentionPolicyType))
+			Expect(policy.WhenScaled).To(Equal(appsv1.RetainPersistentVolumeClaimRetentionPolicyType))
+		})
+
+		It("should converge the StatefulSet when retainPolicy changes from Retain to Delete", func() {
+			ctx := context.Background()
+			cluster := newCluster(postgresv1alpha1.StorageRetainPolicyRetain)
+			Expect(k8sClient.Create(ctx, cluster)).To(Succeed())
+			defer cleanup(ctx, cluster)
+
+			r := &ClusterReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+			reconcileCluster(ctx, r, cluster)
+			rvBefore := getSts(ctx, cluster).ResourceVersion
+
+			By("Reconciling again unchanged does not touch the StatefulSet")
+			reconcileCluster(ctx, r, cluster)
+			Expect(getSts(ctx, cluster).ResourceVersion).To(Equal(rvBefore))
+
+			By("Flipping retainPolicy to Delete")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cluster.Name, Namespace: cluster.Namespace}, cluster)).To(Succeed())
+			cluster.Spec.Storage.RetainPolicy = postgresv1alpha1.StorageRetainPolicyDelete
+			Expect(k8sClient.Update(ctx, cluster)).To(Succeed())
+			reconcileCluster(ctx, r, cluster)
+
+			policy := getSts(ctx, cluster).Spec.PersistentVolumeClaimRetentionPolicy
+			Expect(policy).NotTo(BeNil())
+			Expect(policy.WhenDeleted).To(Equal(appsv1.DeletePersistentVolumeClaimRetentionPolicyType))
+			Expect(policy.WhenScaled).To(Equal(appsv1.RetainPersistentVolumeClaimRetentionPolicyType))
+		})
+
+		It("should backfill the retention policy on a StatefulSet that lacks it", func() {
+			ctx := context.Background()
+			cluster := newCluster(postgresv1alpha1.StorageRetainPolicyDelete)
+			Expect(k8sClient.Create(ctx, cluster)).To(Succeed())
+			defer cleanup(ctx, cluster)
+
+			r := &ClusterReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+			reconcileCluster(ctx, r, cluster)
+
+			By("Simulating a StatefulSet created by an older operator version")
+			sts := getSts(ctx, cluster)
+			sts.Spec.PersistentVolumeClaimRetentionPolicy = &appsv1.StatefulSetPersistentVolumeClaimRetentionPolicy{
+				WhenDeleted: appsv1.RetainPersistentVolumeClaimRetentionPolicyType,
+				WhenScaled:  appsv1.RetainPersistentVolumeClaimRetentionPolicyType,
+			}
+			Expect(k8sClient.Update(ctx, sts)).To(Succeed())
+
+			reconcileCluster(ctx, r, cluster)
+			Expect(getSts(ctx, cluster).Spec.PersistentVolumeClaimRetentionPolicy.WhenDeleted).
+				To(Equal(appsv1.DeletePersistentVolumeClaimRetentionPolicyType))
+		})
+
+		It("should set ExistingVolume=True and emit a Warning event when the data PVC already exists", func() {
+			ctx := context.Background()
+			cluster := newCluster("")
+			Expect(k8sClient.Create(ctx, cluster)).To(Succeed())
+			defer cleanup(ctx, cluster)
+
+			By("Pre-creating the data PVC, as if retained from a deleted Cluster")
+			pvc := &corev1.PersistentVolumeClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "data-" + cluster.Name + "-0",
+					Namespace: ClusterNamespace,
+				},
+				Spec: corev1.PersistentVolumeClaimSpec{
+					AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+					Resources: corev1.VolumeResourceRequirements{
+						Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("1Gi")},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, pvc)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, pvc) }()
+
+			recorder := events.NewFakeRecorder(10)
+			r := &ClusterReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), Recorder: recorder}
+			reconcileCluster(ctx, r, cluster)
+
+			updated := &postgresv1alpha1.Cluster{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cluster.Name, Namespace: cluster.Namespace}, updated)).To(Succeed())
+			cond := meta.FindStatusCondition(updated.Status.Conditions, ConditionTypeExistingVolume)
+			Expect(cond).NotTo(BeNil())
+			Expect(cond.Status).To(Equal(metav1.ConditionTrue))
+			Expect(cond.Reason).To(Equal(ReasonPreExistingPVC))
+			Expect(cond.Message).To(ContainSubstring(pvc.Name))
+			Expect(meta.FindStatusCondition(updated.Status.Conditions, ConditionTypeAvailable)).NotTo(BeNil())
+
+			var event string
+			Expect(recorder.Events).To(Receive(&event))
+			Expect(event).To(HavePrefix(corev1.EventTypeWarning + " " + ReasonPreExistingPVC))
+			Expect(event).To(ContainSubstring(pvc.Name))
+
+			By("Reconciling again keeps the condition and emits no further events")
+			reconcileCluster(ctx, r, updated)
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cluster.Name, Namespace: cluster.Namespace}, updated)).To(Succeed())
+			cond = meta.FindStatusCondition(updated.Status.Conditions, ConditionTypeExistingVolume)
+			Expect(cond).NotTo(BeNil())
+			Expect(cond.Status).To(Equal(metav1.ConditionTrue))
+			Expect(recorder.Events).NotTo(Receive())
+		})
+
+		It("should set ExistingVolume=False when no data PVC exists", func() {
+			ctx := context.Background()
+			cluster := newCluster("")
+			Expect(k8sClient.Create(ctx, cluster)).To(Succeed())
+			defer cleanup(ctx, cluster)
+
+			recorder := events.NewFakeRecorder(10)
+			r := &ClusterReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), Recorder: recorder}
+			reconcileCluster(ctx, r, cluster)
+
+			updated := &postgresv1alpha1.Cluster{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cluster.Name, Namespace: cluster.Namespace}, updated)).To(Succeed())
+			cond := meta.FindStatusCondition(updated.Status.Conditions, ConditionTypeExistingVolume)
+			Expect(cond).NotTo(BeNil())
+			Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+			Expect(cond.Reason).To(Equal(ReasonNewVolume))
+			Expect(recorder.Events).NotTo(Receive())
+		})
+
+		It("should reject an invalid storage.retainPolicy", func() {
+			ctx := context.Background()
+			cluster := newCluster("Foo")
+			err := k8sClient.Create(ctx, cluster)
+			Expect(err).To(HaveOccurred())
+			Expect(apierrors.IsInvalid(err)).To(BeTrue())
+			Expect(err.Error()).To(ContainSubstring("retainPolicy"))
 		})
 	})
 

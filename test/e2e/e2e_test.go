@@ -511,6 +511,7 @@ var _ = Describe("Manager", Ordered, func() {
 	})
 
 	RegisterBackupTests()
+	RegisterRetentionTests()
 })
 
 // serviceAccountToken returns a token for the specified service account in the given namespace.

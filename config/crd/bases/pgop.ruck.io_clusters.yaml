@@ -152,6 +152,18 @@ spec:
               storage:
                 description: storage defines the persistent storage configuration
                 properties:
+                  retainPolicy:
+                    default: Retain
+                    description: |-
+                      retainPolicy controls whether the PersistentVolumeClaim is kept or
+                      deleted when the Cluster is deleted. Retain (the default) keeps the data,
+                      so a Cluster recreated with the same name starts on the old volume.
+                      Delete removes the PVC together with the Cluster. Delete requires
+                      Kubernetes 1.27+ (StatefulSet persistentVolumeClaimRetentionPolicy).
+                    enum:
+                    - Retain
+                    - Delete
+                    type: string
                   size:
                     default: 1Gi
                     description: size is the size of the persistent volume claim

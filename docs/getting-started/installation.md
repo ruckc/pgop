@@ -4,7 +4,9 @@ This guide covers the supported ways to install pgop in your Kubernetes cluster.
 
 ## Prerequisites
 
-- Kubernetes cluster (v1.24+)
+- Kubernetes cluster (v1.27+; `storage.retainPolicy: Delete` relies on the
+  StatefulSet `persistentVolumeClaimRetentionPolicy`, which is beta and enabled
+  by default since 1.27 and GA since 1.32)
 - `kubectl` configured to access your cluster
 - Cluster admin permissions
 

@@ -21,8 +21,9 @@ spec:
 
   # Storage configuration
   storage:
-    size: string           # e.g., "10Gi"
+    size: string           # e.g., "10Gi" (default "1Gi")
     storageClassName: string  # Optional
+    retainPolicy: string   # Retain (default) | Delete
 
   # Container resources
   resources:
@@ -48,6 +49,13 @@ status:
       message: string
       lastTransitionTime: string
 ```
+
+Condition types:
+
+| Type | Meaning |
+|------|---------|
+| `Available` | `True` (reason `ClusterReady`) once the StatefulSet is ready. |
+| `ExistingVolume` | Set once when the StatefulSet is created. `True` (reason `PreExistingPVC`) if the data PVC already existed, so PostgreSQL started on retained data; `False` (reason `NewVolume`) otherwise. Never recomputed afterwards. |
 
 ---
 
@@ -175,6 +183,13 @@ Storage configuration for Clusters:
 
 ```yaml
 storage:
-  size: string             # Required: PVC size (e.g., "10Gi")
+  size: string             # Optional: PVC size (e.g., "10Gi"), default "1Gi"
   storageClassName: string # Optional: StorageClass name
+  retainPolicy: string     # Optional: Retain (default) | Delete
 ```
+
+`retainPolicy` controls what happens to the data PVC (`data-<cluster>-0`) when
+the Cluster is deleted. `Retain` keeps it; `Delete` removes it with the Cluster.
+It maps onto the StatefulSet `persistentVolumeClaimRetentionPolicy.whenDeleted`
+(`whenScaled` is always `Retain`) and requires Kubernetes 1.27+. The field is
+mutable; changing it updates the StatefulSet in place.
