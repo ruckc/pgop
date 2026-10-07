@@ -173,6 +173,42 @@ spec:
                       to use
                     type: string
                 type: object
+              tls:
+                description: |-
+                  tls enables TLS on the PostgreSQL server. When unset (the default) the
+                  server runs without TLS and the operator connects with sslmode=disable,
+                  exactly as before TLS support existed.
+                properties:
+                  minProtocolVersion:
+                    default: TLSv1.2
+                    description: |-
+                      minProtocolVersion is the minimum TLS protocol version the server accepts
+                      (PostgreSQL ssl_min_protocol_version).
+                    enum:
+                    - TLSv1.2
+                    - TLSv1.3
+                    type: string
+                  requireTLS:
+                    default: true
+                    description: |-
+                      requireTLS rejects non-TLS TCP connections through an operator-managed
+                      pg_hba.conf (hostnossl ... reject). Connections over the local Unix
+                      socket (probes, the postStart hook) are unaffected. Defaults to true.
+                    type: boolean
+                  secretName:
+                    description: |-
+                      secretName is the name of a Secret in the Cluster namespace holding the
+                      server certificate in the kubernetes.io/tls layout: tls.crt (server
+                      certificate, optionally followed by intermediates), tls.key (private key)
+                      and ca.crt (the CA that issued tls.crt). cert-manager Certificate
+                      resources produce this layout. The certificate must be valid for the
+                      Service DNS name <cluster>.<namespace>.svc.cluster.local, which the
+                      operator verifies with sslmode=verify-full.
+                    minLength: 1
+                    type: string
+                required:
+                - secretName
+                type: object
             type: object
           status:
             description: status defines the observed state of Cluster
@@ -248,6 +284,13 @@ spec:
               secretName:
                 description: secretName is the name of the Secret containing operator
                   credentials
+                type: string
+              tlsSecretHash:
+                description: |-
+                  tlsSecretHash is a hash of the certificate material (tls.crt and ca.crt)
+                  that the running server was last confirmed to present. It changes when
+                  the certificate is rotated and is empty while TLS is disabled or not yet
+                  active.
                 type: string
             type: object
         required:

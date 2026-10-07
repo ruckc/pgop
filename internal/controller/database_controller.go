@@ -19,16 +19,17 @@ package controller
 import (
 	"context"
 	"fmt"
-	"strconv"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
@@ -36,7 +37,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	postgresv1alpha1 "github.com/ruckc/pgop/api/v1alpha1"
-	"github.com/ruckc/pgop/internal/postgres"
 )
 
 const (
@@ -77,7 +77,7 @@ func (r *DatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 				return ctrl.Result{}, err
 			}
 			if err == nil {
-				adminClient, err := r.getPostgresClient(ctx, cluster, "postgres")
+				adminClient, err := newOperatorClient(ctx, r.Client, cluster, defaultDatabaseName)
 				if err != nil {
 					log.Error(err, "Failed to create PostgreSQL admin client during deletion")
 					return ctrl.Result{}, err
@@ -131,7 +131,7 @@ func (r *DatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	}
 
 	// Get operator credentials for admin connection
-	adminClient, err := r.getPostgresClient(ctx, cluster, "postgres")
+	adminClient, err := newOperatorClient(ctx, r.Client, cluster, defaultDatabaseName)
 	if err != nil {
 		log.Error(err, "Failed to create PostgreSQL admin client")
 		return r.updateStatus(ctx, database, false, nil, nil, err)
@@ -157,7 +157,7 @@ func (r *DatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	database.Status.DatabaseName = pgName
 
 	// Get a connection to the new database to install extensions and create schemas
-	dbClient, err := r.getPostgresClient(ctx, cluster, pgName)
+	dbClient, err := newOperatorClient(ctx, r.Client, cluster, pgName)
 	if err != nil {
 		log.Error(err, "Failed to create PostgreSQL database client")
 		return r.updateStatus(ctx, database, false, nil, nil, err)
@@ -240,10 +240,17 @@ func (r *DatabaseReconciler) reconcileCredentialsSecret(ctx context.Context, dat
 		return fmt.Errorf("failed to get role credentials secret %s: %w", roleSecretName, err)
 	}
 
-	port := cluster.Spec.Port
-	if port == 0 {
-		port = 5432
+	t, err := clusterClientTLS(ctx, r.Client, cluster)
+	if err != nil {
+		return err
 	}
+
+	data := map[string][]byte{
+		SecretKeyUsername: roleSecret.Data[SecretKeyUsername],
+		SecretKeyPassword: roleSecret.Data[SecretKeyPassword],
+		SecretKeyDatabase: []byte(database.PostgresName()),
+	}
+	applyConnectionInfo(data, clusterHost(cluster), clusterPort(cluster), database.PostgresName(), t)
 
 	secretName := database.Name + "-" + database.Spec.Owner + "-credentials"
 	desired := &corev1.Secret{
@@ -252,20 +259,14 @@ func (r *DatabaseReconciler) reconcileCredentialsSecret(ctx context.Context, dat
 			Namespace: database.Namespace,
 		},
 		Type: corev1.SecretTypeOpaque,
-		StringData: map[string]string{
-			SecretKeyUsername: string(roleSecret.Data[SecretKeyUsername]),
-			SecretKeyPassword: string(roleSecret.Data[SecretKeyPassword]),
-			SecretKeyHost:     fmt.Sprintf("%s.%s.svc.cluster.local", cluster.Name, cluster.Namespace),
-			SecretKeyPort:     strconv.Itoa(int(port)),
-			SecretKeyDatabase: database.PostgresName(),
-		},
+		Data: data,
 	}
 	if err := controllerutil.SetControllerReference(database, desired, r.Scheme); err != nil {
 		return fmt.Errorf("failed to set owner reference on credentials secret: %w", err)
 	}
 
 	existing := &corev1.Secret{}
-	err := r.Get(ctx, types.NamespacedName{Name: secretName, Namespace: database.Namespace}, existing)
+	err = r.Get(ctx, types.NamespacedName{Name: secretName, Namespace: database.Namespace}, existing)
 	if apierrors.IsNotFound(err) {
 		return r.Create(ctx, desired)
 	}
@@ -273,7 +274,12 @@ func (r *DatabaseReconciler) reconcileCredentialsSecret(ctx context.Context, dat
 		return fmt.Errorf("failed to get credentials secret: %w", err)
 	}
 
-	existing.StringData = desired.StringData
+	// The Secret is fully derived, so its data is replaced wholesale; this
+	// also drops keys that no longer apply (ca.crt once TLS is turned off).
+	if apiequality.Semantic.DeepEqual(existing.Data, data) {
+		return nil
+	}
+	existing.Data = data
 	return r.Update(ctx, existing)
 }
 
@@ -288,34 +294,6 @@ func (r *DatabaseReconciler) getCluster(ctx context.Context, database *postgresv
 	}
 
 	return cluster, nil
-}
-
-func (r *DatabaseReconciler) getPostgresClient(ctx context.Context, cluster *postgresv1alpha1.Cluster, dbName string) (*postgres.Client, error) {
-	// Get the credentials secret
-	secret := &corev1.Secret{}
-	err := r.Get(ctx, types.NamespacedName{
-		Name:      cluster.Status.SecretName,
-		Namespace: cluster.Namespace,
-	}, secret)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get credentials secret: %w", err)
-	}
-
-	user := string(secret.Data["username"])
-	password := string(secret.Data["password"])
-
-	port := cluster.Spec.Port
-	if port == 0 {
-		port = 5432
-	}
-
-	return postgres.NewClient(postgres.ConnectionConfig{
-		Host:     fmt.Sprintf("%s.%s.svc.cluster.local", cluster.Name, cluster.Namespace),
-		Port:     port,
-		User:     user,
-		Password: password,
-		Database: dbName,
-	})
 }
 
 func (r *DatabaseReconciler) updateStatus(ctx context.Context, database *postgresv1alpha1.Database, ready bool, extensions, schemas []string, reconcileErr error) (ctrl.Result, error) {
@@ -379,6 +357,26 @@ func (r *DatabaseReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&postgresv1alpha1.Database{}).
 		Owns(&corev1.Secret{}).
 		Watches(&postgresv1alpha1.Role{}, handler.EnqueueRequestsFromMapFunc(r.databasesForOwnerRole)).
+		Watches(&postgresv1alpha1.Cluster{},
+			handler.EnqueueRequestsFromMapFunc(r.databasesForCluster),
+			builder.WithPredicates(clusterConnectionChanged)).
 		Named("database").
 		Complete(r)
+}
+
+// databasesForCluster maps a Cluster to the Databases in its namespace that
+// reference it, so their credentials Secrets follow port and TLS changes.
+func (r *DatabaseReconciler) databasesForCluster(ctx context.Context, obj client.Object) []reconcile.Request {
+	databases := &postgresv1alpha1.DatabaseList{}
+	if err := r.List(ctx, databases, client.InNamespace(obj.GetNamespace())); err != nil {
+		logf.FromContext(ctx).Error(err, "Failed to list Databases for Cluster", "cluster", obj.GetName())
+		return nil
+	}
+	var requests []reconcile.Request
+	for i := range databases.Items {
+		if databases.Items[i].Spec.ClusterRef.Name == obj.GetName() {
+			requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&databases.Items[i])})
+		}
+	}
+	return requests
 }

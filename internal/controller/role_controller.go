@@ -30,9 +30,12 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	postgresv1alpha1 "github.com/ruckc/pgop/api/v1alpha1"
 	"github.com/ruckc/pgop/internal/postgres"
@@ -75,7 +78,7 @@ func (r *RoleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 				return ctrl.Result{}, err
 			}
 			if err == nil {
-				pgClient, err := r.getPostgresClient(ctx, cluster)
+				pgClient, err := newOperatorClient(ctx, r.Client, cluster, defaultDatabaseName)
 				if err != nil {
 					log.Error(err, "Failed to create PostgreSQL client during deletion")
 					return ctrl.Result{}, err
@@ -118,7 +121,7 @@ func (r *RoleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	}
 
 	// Get operator credentials
-	pgClient, err := r.getPostgresClient(ctx, cluster)
+	pgClient, err := newOperatorClient(ctx, r.Client, cluster, defaultDatabaseName)
 	if err != nil {
 		log.Error(err, "Failed to create PostgreSQL client")
 		return r.updateStatus(ctx, role, false, "", err)
@@ -181,13 +184,28 @@ func (r *RoleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 func (r *RoleReconciler) reconcileCredentialsSecret(ctx context.Context, role *postgresv1alpha1.Role, cluster *postgresv1alpha1.Cluster) (string, string, error) {
 	secretName := cluster.Name + "-" + role.Name + "-credentials"
 
+	t, err := clusterClientTLS(ctx, r.Client, cluster)
+	if err != nil {
+		return "", "", err
+	}
+	host, port := clusterHost(cluster), clusterPort(cluster)
+
 	// Check if secret already exists
 	existingSecret := &corev1.Secret{}
-	err := r.Get(ctx, types.NamespacedName{Name: secretName, Namespace: role.Namespace}, existingSecret)
+	err = r.Get(ctx, types.NamespacedName{Name: secretName, Namespace: role.Namespace}, existingSecret)
 	if err == nil {
-		// Secret exists, return the password from it
-		password := string(existingSecret.Data["password"])
-		return password, secretName, nil
+		// Secret exists: keep its username/password and converge the
+		// connection info (host, port, sslmode, uri, ca.crt) so existing
+		// Secrets pick up port and TLS changes.
+		if existingSecret.Data == nil {
+			existingSecret.Data = map[string][]byte{}
+		}
+		if applyConnectionInfo(existingSecret.Data, host, port, defaultDatabaseName, t) {
+			if err := r.Update(ctx, existingSecret); err != nil {
+				return "", "", err
+			}
+		}
+		return string(existingSecret.Data[SecretKeyPassword]), secretName, nil
 	}
 	if !apierrors.IsNotFound(err) {
 		return "", "", err
@@ -199,11 +217,11 @@ func (r *RoleReconciler) reconcileCredentialsSecret(ctx context.Context, role *p
 		return "", "", fmt.Errorf("failed to generate password: %w", err)
 	}
 
-	// Get port for connection string
-	port := cluster.Spec.Port
-	if port == 0 {
-		port = 5432
+	data := map[string][]byte{
+		SecretKeyUsername: []byte(role.PostgresName()),
+		SecretKeyPassword: []byte(password),
 	}
+	applyConnectionInfo(data, host, port, defaultDatabaseName, t)
 
 	// Create the credentials secret
 	secret := &corev1.Secret{
@@ -218,12 +236,7 @@ func (r *RoleReconciler) reconcileCredentialsSecret(ctx context.Context, role *p
 			},
 		},
 		Type: corev1.SecretTypeOpaque,
-		StringData: map[string]string{
-			SecretKeyUsername: role.PostgresName(),
-			SecretKeyPassword: password,
-			"host":            fmt.Sprintf("%s.%s.svc.cluster.local", cluster.Name, cluster.Namespace),
-			"port":            fmt.Sprintf("%d", port),
-		},
+		Data: data,
 	}
 
 	// Set owner reference so secret is garbage collected when Role is deleted
@@ -257,34 +270,6 @@ func (r *RoleReconciler) getCluster(ctx context.Context, role *postgresv1alpha1.
 	}
 
 	return cluster, nil
-}
-
-func (r *RoleReconciler) getPostgresClient(ctx context.Context, cluster *postgresv1alpha1.Cluster) (*postgres.Client, error) {
-	// Get the credentials secret
-	secret := &corev1.Secret{}
-	err := r.Get(ctx, types.NamespacedName{
-		Name:      cluster.Status.SecretName,
-		Namespace: cluster.Namespace,
-	}, secret)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get credentials secret: %w", err)
-	}
-
-	user := string(secret.Data["username"])
-	password := string(secret.Data["password"])
-
-	port := cluster.Spec.Port
-	if port == 0 {
-		port = 5432
-	}
-
-	return postgres.NewClient(postgres.ConnectionConfig{
-		Host:     fmt.Sprintf("%s.%s.svc.cluster.local", cluster.Name, cluster.Namespace),
-		Port:     port,
-		User:     user,
-		Password: password,
-		Database: "postgres",
-	})
 }
 
 func (r *RoleReconciler) updateStatus(ctx context.Context, role *postgresv1alpha1.Role, ready bool, secretName string, reconcileErr error) (ctrl.Result, error) {
@@ -329,6 +314,26 @@ func (r *RoleReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&postgresv1alpha1.Role{}).
 		Owns(&corev1.Secret{}).
+		Watches(&postgresv1alpha1.Cluster{},
+			handler.EnqueueRequestsFromMapFunc(r.rolesForCluster),
+			builder.WithPredicates(clusterConnectionChanged)).
 		Named("role").
 		Complete(r)
+}
+
+// rolesForCluster maps a Cluster to the Roles in its namespace that reference
+// it, so their credentials Secrets follow port and TLS changes.
+func (r *RoleReconciler) rolesForCluster(ctx context.Context, obj client.Object) []reconcile.Request {
+	roles := &postgresv1alpha1.RoleList{}
+	if err := r.List(ctx, roles, client.InNamespace(obj.GetNamespace())); err != nil {
+		logf.FromContext(ctx).Error(err, "Failed to list Roles for Cluster", "cluster", obj.GetName())
+		return nil
+	}
+	var requests []reconcile.Request
+	for i := range roles.Items {
+		if roles.Items[i].Spec.ClusterRef.Name == obj.GetName() {
+			requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&roles.Items[i])})
+		}
+	}
+	return requests
 }

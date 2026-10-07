@@ -32,9 +32,41 @@ const (
 	SecretKeyHost     = "host"
 	SecretKeyPort     = "port"
 	SecretKeyDatabase = "database"
+	// SecretKeySSLMode is the libpq sslmode clients should use.
+	SecretKeySSLMode = "sslmode"
+	// SecretKeyCACert holds the CA that issued the server certificate; only
+	// present while TLS is active.
+	SecretKeyCACert = "ca.crt"
+	// SecretKeyURI is a ready-made postgresql:// connection URI.
+	SecretKeyURI = "uri"
+
+	// Keys of a kubernetes.io/tls Secret referenced by spec.tls.secretName.
+	TLSSecretKeyCert = "tls.crt"
+	TLSSecretKeyKey  = "tls.key"
+	TLSSecretKeyCA   = "ca.crt"
+
+	// ConditionTypeTLSReady reports whether the server is serving TLS with the
+	// certificate from spec.tls.secretName. Only set while spec.tls is set.
+	ConditionTypeTLSReady = "TLSReady"
+	// ReasonTLSActive: the server presents the expected certificate.
+	ReasonTLSActive = "TLSActive"
+	// ReasonInvalidTLSSecret: the referenced Secret is missing, incomplete,
+	// or its certificate is unusable. The StatefulSet is left untouched.
+	ReasonInvalidTLSSecret = "InvalidTLSSecret"
+	// ReasonWaitingForServer: the pod is not (yet) serving TLS, e.g. while it
+	// restarts after TLS was enabled.
+	ReasonWaitingForServer = "WaitingForServer"
+	// ReasonCertificateReloading: the server still presents a previous
+	// certificate; the operator asked it to reload (pg_reload_conf()).
+	ReasonCertificateReloading = "CertificateReloading"
 
 	DefaultPostgresImage    = "postgres:18"
 	DefaultOperatorUsername = "pgop_operator"
+
+	// defaultDatabaseName is the maintenance database the operator connects to.
+	defaultDatabaseName = "postgres"
+	// postgresBinary is the server command passed to the image entrypoint.
+	postgresBinary = "postgres"
 
 	ConditionTypeAvailable = "Available"
 

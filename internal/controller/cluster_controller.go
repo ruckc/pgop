@@ -17,10 +17,13 @@ limitations under the License.
 package controller
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"net"
+	"strconv"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -37,9 +40,12 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	postgresv1alpha1 "github.com/ruckc/pgop/api/v1alpha1"
+	"github.com/ruckc/pgop/internal/postgres"
 )
 
 const (
@@ -55,6 +61,15 @@ type ClusterReconciler struct {
 	// (e.g. in tests that construct the reconciler directly) no events are
 	// recorded.
 	Recorder events.EventRecorder
+
+	// ProbeServerCertificate returns the DER certificate the server at addr
+	// presents. Optional; defaults to a real SSLRequest + TLS handshake. Tests
+	// override it since envtest runs no PostgreSQL.
+	ProbeServerCertificate func(ctx context.Context, addr, serverName string) ([]byte, error)
+
+	// ReloadServerConfig runs pg_reload_conf() using cfg. Optional; defaults
+	// to a real PostgreSQL connection. Tests override it.
+	ReloadServerConfig func(ctx context.Context, cfg postgres.ConnectionConfig) error
 }
 
 // +kubebuilder:rbac:groups=pgop.ruck.io,resources=clusters,verbs=get;list;watch;create;update;patch;delete
@@ -64,6 +79,7 @@ type ClusterReconciler struct {
 // +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=core,resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 
 func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -118,9 +134,53 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return r.updateStatus(ctx, cluster, false, err)
 	}
 
+	// Validate the TLS Secret before touching the pod: a Secret that is
+	// missing, incomplete or unusable for verify-full would otherwise roll the
+	// pod into a broken (or unreachable) state. On failure the StatefulSet is
+	// left exactly as it is and TLSReady=False explains why.
+	var material *tlsMaterial
+	if cluster.Spec.TLS != nil {
+		material, err = loadTLSMaterial(ctx, r.Client, cluster)
+		if err != nil {
+			log.Info("TLS Secret is not usable; leaving the StatefulSet unchanged", "reason", err.Error())
+			prev := meta.FindStatusCondition(cluster.Status.Conditions, ConditionTypeTLSReady)
+			changed := prev == nil || prev.Reason != ReasonInvalidTLSSecret || prev.Message != err.Error()
+			r.setTLSCondition(cluster, metav1.ConditionFalse, ReasonInvalidTLSSecret, err.Error())
+			cluster.Status.TLSSecretHash = ""
+			if r.Recorder != nil && changed {
+				r.Recorder.Eventf(cluster, nil, corev1.EventTypeWarning, ReasonInvalidTLSSecret, "ValidateTLSSecret", "%s", err.Error())
+			}
+			ready, rerr := r.isStatefulSetReady(ctx, cluster)
+			if rerr != nil {
+				return r.updateStatus(ctx, cluster, false, rerr)
+			}
+			if err := r.convergeSecretConnectionInfo(ctx, cluster, secret, nil); err != nil {
+				return r.updateStatus(ctx, cluster, false, err)
+			}
+			// No requeue needed: the TLS Secret is watched.
+			return r.updateStatus(ctx, cluster, ready, nil)
+		}
+	} else {
+		meta.RemoveStatusCondition(&cluster.Status.Conditions, ConditionTypeTLSReady)
+		cluster.Status.TLSSecretHash = ""
+	}
+
+	// The pg_hba ConfigMap must exist before a pod that mounts it starts.
+	if err := r.reconcileHBAConfigMap(ctx, cluster); err != nil {
+		log.Error(err, "Failed to reconcile pg_hba ConfigMap")
+		return r.updateStatus(ctx, cluster, false, err)
+	}
+
 	// Reconcile StatefulSet
 	if err := r.reconcileStatefulSet(ctx, cluster, secret); err != nil {
 		log.Error(err, "Failed to reconcile StatefulSet")
+		return r.updateStatus(ctx, cluster, false, err)
+	}
+
+	// Remove a no longer needed pg_hba ConfigMap only after the StatefulSet
+	// stopped referencing it.
+	if err := r.cleanupHBAConfigMap(ctx, cluster); err != nil {
+		log.Error(err, "Failed to clean up pg_hba ConfigMap")
 		return r.updateStatus(ctx, cluster, false, err)
 	}
 
@@ -131,7 +191,168 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return r.updateStatus(ctx, cluster, false, err)
 	}
 
-	return r.updateStatus(ctx, cluster, ready, nil)
+	tlsPending := false
+	if material != nil {
+		tlsPending = r.reconcileTLSState(ctx, cluster, material, ready)
+	}
+
+	// Converge the client-facing connection info last, once the TLS state of
+	// this reconcile is known.
+	var caPEM []byte
+	if material != nil {
+		caPEM = material.CAPEM
+	}
+	if err := r.convergeSecretConnectionInfo(ctx, cluster, secret, caPEM); err != nil {
+		log.Error(err, "Failed to update credentials Secret connection info")
+		return r.updateStatus(ctx, cluster, false, err)
+	}
+
+	result, err := r.updateStatus(ctx, cluster, ready, nil)
+	if err == nil && tlsPending && result.RequeueAfter == 0 {
+		result.RequeueAfter = 10 * time.Second
+	}
+	return result, err
+}
+
+// setTLSCondition sets the TLSReady condition on the in-memory Cluster.
+func (r *ClusterReconciler) setTLSCondition(cluster *postgresv1alpha1.Cluster, status metav1.ConditionStatus, reason, message string) {
+	meta.SetStatusCondition(&cluster.Status.Conditions, metav1.Condition{
+		Type:               ConditionTypeTLSReady,
+		Status:             status,
+		ObservedGeneration: cluster.Generation,
+		Reason:             reason,
+		Message:            message,
+	})
+}
+
+// reconcileTLSState checks that the running server presents the certificate
+// from the TLS Secret and sets TLSReady accordingly. When the server still
+// presents an older certificate (the Secret was rotated), it asks PostgreSQL to
+// reload its configuration, which re-reads the certificate files without a
+// restart. Kubelet propagates Secret updates into the pod with a delay, so this
+// is retried until the server presents the new certificate. Returns whether
+// TLS is still pending and the Cluster should be requeued.
+func (r *ClusterReconciler) reconcileTLSState(ctx context.Context, cluster *postgresv1alpha1.Cluster, material *tlsMaterial, ready bool) bool {
+	if !ready {
+		r.setTLSCondition(cluster, metav1.ConditionFalse, ReasonWaitingForServer, "Waiting for the PostgreSQL pod to become ready")
+		return true
+	}
+
+	host := clusterHost(cluster)
+	probe := r.ProbeServerCertificate
+	if probe == nil {
+		probe = probeServerCertificate
+	}
+	presented, err := probe(ctx, net.JoinHostPort(host, strconv.Itoa(int(clusterPort(cluster)))), host)
+	if err != nil {
+		r.setTLSCondition(cluster, metav1.ConditionFalse, ReasonWaitingForServer,
+			fmt.Sprintf("Server is not serving TLS yet: %v", err))
+		return true
+	}
+
+	if bytes.Equal(presented, material.Leaf.Raw) {
+		r.setTLSCondition(cluster, metav1.ConditionTrue, ReasonTLSActive,
+			fmt.Sprintf("Server presents the certificate from Secret %q", cluster.Spec.TLS.SecretName))
+		cluster.Status.TLSSecretHash = material.Hash
+		return false
+	}
+
+	// The server presents a different (older) certificate. Reload over a
+	// connection verified against the current CA. If the CA itself was
+	// replaced, the old certificate cannot be verified and the reload is not
+	// attempted over an unverified connection; the pod must be restarted.
+	msg := "Server presents an outdated certificate; requested a configuration reload"
+	if err := r.reloadServerConfig(ctx, cluster, material.CAPEM); err != nil {
+		msg = fmt.Sprintf("Server presents an outdated certificate and the reload failed "+
+			"(if the CA changed, restart the pod to load the new certificate): %v", err)
+	}
+	r.setTLSCondition(cluster, metav1.ConditionFalse, ReasonCertificateReloading, msg)
+	return true
+}
+
+// reloadServerConfig runs pg_reload_conf() as the operator over a verify-full
+// connection using caPEM.
+func (r *ClusterReconciler) reloadServerConfig(ctx context.Context, cluster *postgresv1alpha1.Cluster, caPEM []byte) error {
+	secret := &corev1.Secret{}
+	if err := r.Get(ctx, types.NamespacedName{Name: cluster.Name + "-credentials", Namespace: cluster.Namespace}, secret); err != nil {
+		return fmt.Errorf("failed to get credentials secret: %w", err)
+	}
+	cfg := postgres.ConnectionConfig{
+		Host:        clusterHost(cluster),
+		Port:        clusterPort(cluster),
+		User:        string(secret.Data[SecretKeyUsername]),
+		Password:    string(secret.Data[SecretKeyPassword]),
+		Database:    defaultDatabaseName,
+		SSLMode:     postgres.SSLModeVerifyFull,
+		RootCertPEM: caPEM,
+	}
+	if r.ReloadServerConfig != nil {
+		return r.ReloadServerConfig(ctx, cfg)
+	}
+	pgClient, err := postgres.NewClient(cfg)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = pgClient.Close() }()
+	return pgClient.ReloadConfig(ctx)
+}
+
+// reconcileHBAConfigMap creates or updates the operator-managed pg_hba
+// ConfigMap while spec.tls.requireTLS is in effect.
+func (r *ClusterReconciler) reconcileHBAConfigMap(ctx context.Context, cluster *postgresv1alpha1.Cluster) error {
+	if cluster.Spec.TLS == nil || !cluster.Spec.TLS.IsRequireTLS() {
+		return nil
+	}
+	cm := &corev1.ConfigMap{}
+	err := r.Get(ctx, types.NamespacedName{Name: hbaConfigMapName(cluster), Namespace: cluster.Namespace}, cm)
+	if err == nil {
+		if cm.Data[hbaFileName] == managedPgHBA {
+			return nil
+		}
+		cm.Data = map[string]string{hbaFileName: managedPgHBA}
+		return r.Update(ctx, cm)
+	}
+	if !apierrors.IsNotFound(err) {
+		return err
+	}
+	cm = &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      hbaConfigMapName(cluster),
+			Namespace: cluster.Namespace,
+			Labels: map[string]string{
+				LabelAppName:      AppNamePostgresql,
+				LabelAppInstance:  cluster.Name,
+				LabelAppManagedBy: LabelValuePgop,
+			},
+		},
+		Data: map[string]string{hbaFileName: managedPgHBA},
+	}
+	if err := controllerutil.SetControllerReference(cluster, cm, r.Scheme); err != nil {
+		return err
+	}
+	return r.Create(ctx, cm)
+}
+
+// cleanupHBAConfigMap deletes the operator-managed pg_hba ConfigMap once TLS
+// or requireTLS is turned off. Without hba_file the server falls back to the
+// pg_hba.conf in its data directory (the image default), which was never
+// modified.
+func (r *ClusterReconciler) cleanupHBAConfigMap(ctx context.Context, cluster *postgresv1alpha1.Cluster) error {
+	if cluster.Spec.TLS != nil && cluster.Spec.TLS.IsRequireTLS() {
+		return nil
+	}
+	cm := &corev1.ConfigMap{}
+	err := r.Get(ctx, types.NamespacedName{Name: hbaConfigMapName(cluster), Namespace: cluster.Namespace}, cm)
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !metav1.IsControlledBy(cm, cluster) {
+		return nil
+	}
+	return client.IgnoreNotFound(r.Delete(ctx, cm))
 }
 
 func (r *ClusterReconciler) reconcileSecret(ctx context.Context, cluster *postgresv1alpha1.Cluster) (*corev1.Secret, error) {
@@ -139,7 +360,9 @@ func (r *ClusterReconciler) reconcileSecret(ctx context.Context, cluster *postgr
 	secret := &corev1.Secret{}
 	err := r.Get(ctx, types.NamespacedName{Name: secretName, Namespace: cluster.Namespace}, secret)
 	if err == nil {
-		return r.convergeSecret(ctx, cluster, secret)
+		// Connection info is converged at the end of the reconcile, once the
+		// TLS state is known (convergeSecretConnectionInfo).
+		return secret, nil
 	}
 	if !apierrors.IsNotFound(err) {
 		return nil, err
@@ -151,13 +374,12 @@ func (r *ClusterReconciler) reconcileSecret(ctx context.Context, cluster *postgr
 		return nil, fmt.Errorf("failed to generate password: %w", err)
 	}
 
-	port := cluster.Spec.Port
-	if port == 0 {
-		port = 5432
+	data := map[string][]byte{
+		SecretKeyUsername: []byte(DefaultOperatorUsername),
+		SecretKeyPassword: []byte(password),
+		SecretKeyDatabase: []byte(defaultDatabaseName),
 	}
-
-	username := DefaultOperatorUsername
-	host := fmt.Sprintf("%s.%s.svc.cluster.local", cluster.Name, cluster.Namespace)
+	applyConnectionInfo(data, clusterHost(cluster), clusterPort(cluster), defaultDatabaseName, clientTLSFor(cluster, nil))
 
 	secret = &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
@@ -170,13 +392,7 @@ func (r *ClusterReconciler) reconcileSecret(ctx context.Context, cluster *postgr
 			},
 		},
 		Type: corev1.SecretTypeOpaque,
-		StringData: map[string]string{
-			SecretKeyUsername: username,
-			SecretKeyPassword: password,
-			SecretKeyHost:     host,
-			SecretKeyPort:     fmt.Sprintf("%d", port),
-			SecretKeyDatabase: "postgres",
-		},
+		Data: data,
 	}
 
 	if err := controllerutil.SetControllerReference(cluster, secret, r.Scheme); err != nil {
@@ -190,33 +406,23 @@ func (r *ClusterReconciler) reconcileSecret(ctx context.Context, cluster *postgr
 	return secret, nil
 }
 
-// convergeSecret updates the connection-info fields (host, port) of an
-// existing credentials Secret when the Cluster's port changes. It only ever
-// sets those two keys in StringData: the Secret API merges StringData into
-// Data on write, so the existing username/password/database keys are left
-// completely untouched — this never regenerates or exposes the password.
-func (r *ClusterReconciler) convergeSecret(ctx context.Context, cluster *postgresv1alpha1.Cluster, secret *corev1.Secret) (*corev1.Secret, error) {
-	port := cluster.Spec.Port
-	if port == 0 {
-		port = 5432
+// convergeSecretConnectionInfo updates the connection-info keys of the
+// credentials Secret (host, port, sslmode, uri, ca.crt) when the Cluster's
+// port or TLS state changes. username, password and database are never
+// touched, so this never regenerates the password. caPEM is the CA from the
+// validated TLS Secret (nil when TLS is off or the Secret is invalid).
+func (r *ClusterReconciler) convergeSecretConnectionInfo(ctx context.Context, cluster *postgresv1alpha1.Cluster, secret *corev1.Secret, caPEM []byte) error {
+	if secret.Data == nil {
+		secret.Data = map[string][]byte{}
 	}
-
-	host := fmt.Sprintf("%s.%s.svc.cluster.local", cluster.Name, cluster.Namespace)
-	wantPort := fmt.Sprintf("%d", port)
-
-	if string(secret.Data[SecretKeyHost]) == host && string(secret.Data[SecretKeyPort]) == wantPort {
-		return secret, nil
+	database := string(secret.Data[SecretKeyDatabase])
+	if database == "" {
+		database = defaultDatabaseName
 	}
-
-	secret.StringData = map[string]string{
-		SecretKeyHost: host,
-		SecretKeyPort: wantPort,
+	if !applyConnectionInfo(secret.Data, clusterHost(cluster), clusterPort(cluster), database, clientTLSFor(cluster, caPEM)) {
+		return nil
 	}
-	if err := r.Update(ctx, secret); err != nil {
-		return nil, err
-	}
-
-	return secret, nil
+	return r.Update(ctx, secret)
 }
 
 func (r *ClusterReconciler) reconcileService(ctx context.Context, cluster *postgresv1alpha1.Cluster) error {
@@ -328,10 +534,16 @@ func (r *ClusterReconciler) reconcileStatefulSet(ctx context.Context, cluster *p
 
 	container := buildPostgresContainer(secret, image, port, cluster.Spec.Resources, layout)
 
+	// TLS (spec.tls): extra volumes, mounts and server args. All empty when
+	// TLS is disabled, so StatefulSets of non-TLS Clusters are unchanged.
+	volumes, tlsMounts := postgresTLSVolumes(cluster)
+	container.VolumeMounts = append(container.VolumeMounts, tlsMounts...)
+	container.Args = postgresTLSArgs(cluster.Spec.TLS)
+
 	sts := &appsv1.StatefulSet{}
 	err = r.Get(ctx, types.NamespacedName{Name: stsName, Namespace: cluster.Namespace}, sts)
 	if err == nil {
-		return r.convergeStatefulSet(ctx, sts, replicas, labels, container, desiredPVCRetentionPolicy(cluster))
+		return r.convergeStatefulSet(ctx, sts, replicas, labels, container, volumes, desiredPVCRetentionPolicy(cluster))
 	}
 	if !apierrors.IsNotFound(err) {
 		return err
@@ -369,6 +581,7 @@ func (r *ClusterReconciler) reconcileStatefulSet(ctx context.Context, cluster *p
 				Spec: corev1.PodSpec{
 					SecurityContext: postgresPodSecurityContext(),
 					Containers:      []corev1.Container{container},
+					Volumes:         volumes,
 				},
 			},
 			VolumeClaimTemplates: []corev1.PersistentVolumeClaim{
@@ -562,13 +775,22 @@ func buildPostgresContainer(secret *corev1.Secret, image string, port int32, res
 
 // convergeStatefulSet patches an existing StatefulSet onto the current
 // Cluster spec (image, resources, replicas, port, the data-directory layout,
-// and the PVC retention policy), and backfills the password-sync lifecycle hook on StatefulSets
+// TLS volumes and args, and the PVC retention policy), and backfills the
+// password-sync lifecycle hook on StatefulSets
 // created before it existed (see https://github.com/ruckc/pgop/issues/7).
 // It only issues an Update when something actually differs, so reconciling
 // an already-converged cluster is a no-op and does not trigger spurious
 // pod rollouts.
-func (r *ClusterReconciler) convergeStatefulSet(ctx context.Context, sts *appsv1.StatefulSet, replicas int32, labels map[string]string, desired corev1.Container, retention *appsv1.StatefulSetPersistentVolumeClaimRetentionPolicy) error {
+func (r *ClusterReconciler) convergeStatefulSet(ctx context.Context, sts *appsv1.StatefulSet, replicas int32, labels map[string]string, desired corev1.Container, volumes []corev1.Volume, retention *appsv1.StatefulSetPersistentVolumeClaimRetentionPolicy) error {
 	changed := false
+
+	// Pod volumes are entirely operator-owned (the data volume comes from
+	// volumeClaimTemplates), so they are replaced wholesale. Semantic.DeepEqual
+	// treats nil and empty as equal, so non-TLS StatefulSets never diff here.
+	if !apiequality.Semantic.DeepEqual(sts.Spec.Template.Spec.Volumes, volumes) {
+		sts.Spec.Template.Spec.Volumes = volumes
+		changed = true
+	}
 
 	// Compare the two fields explicitly: the API server defaults the struct
 	// (to Retain/Retain), so a nil-vs-defaulted DeepEqual would diff forever.
@@ -608,7 +830,7 @@ func (r *ClusterReconciler) convergeStatefulSet(ctx context.Context, sts *appsv1
 }
 
 // convergeContainer overwrites the fields of existing that pgop derives from
-// the Cluster spec (image, ports, env, volume mounts, resources, security
+// the Cluster spec (image, args, ports, env, volume mounts, resources, security
 // context, probes, and the password-sync lifecycle hook) with the desired
 // values. Fields the API server defaults on its own (ImagePullPolicy,
 // TerminationMessagePath, etc.) are left untouched so reconciling an
@@ -619,6 +841,10 @@ func convergeContainer(existing *corev1.Container, desired corev1.Container) boo
 
 	if existing.Image != desired.Image {
 		existing.Image = desired.Image
+		changed = true
+	}
+	if !apiequality.Semantic.DeepEqual(existing.Args, desired.Args) {
+		existing.Args = desired.Args
 		changed = true
 	}
 	if !apiequality.Semantic.DeepEqual(existing.Ports, desired.Ports) {
@@ -750,11 +976,11 @@ func (r *ClusterReconciler) updateStatus(ctx context.Context, cluster *postgresv
 }
 
 func generatePassword(length int) (string, error) {
-	bytes := make([]byte, length/2)
-	if _, err := rand.Read(bytes); err != nil {
+	buf := make([]byte, length/2)
+	if _, err := rand.Read(buf); err != nil {
 		return "", err
 	}
-	return hex.EncodeToString(bytes), nil
+	return hex.EncodeToString(buf), nil
 }
 
 // SetupWithManager sets up the controller with the Manager.
@@ -764,6 +990,26 @@ func (r *ClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&appsv1.StatefulSet{}).
 		Owns(&corev1.Service{}).
 		Owns(&corev1.Secret{}).
+		Owns(&corev1.ConfigMap{}).
+		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.clustersForTLSSecret)).
 		Named("cluster").
 		Complete(r)
+}
+
+// clustersForTLSSecret maps a Secret to the Clusters in its namespace whose
+// spec.tls.secretName names it, so creating, fixing or rotating the TLS
+// Secret re-validates the certificate and reloads the server.
+func (r *ClusterReconciler) clustersForTLSSecret(ctx context.Context, obj client.Object) []reconcile.Request {
+	clusters := &postgresv1alpha1.ClusterList{}
+	if err := r.List(ctx, clusters, client.InNamespace(obj.GetNamespace())); err != nil {
+		logf.FromContext(ctx).Error(err, "Failed to list Clusters for TLS Secret", "secret", obj.GetName())
+		return nil
+	}
+	var requests []reconcile.Request
+	for i := range clusters.Items {
+		if t := clusters.Items[i].Spec.TLS; t != nil && t.SecretName == obj.GetName() {
+			requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&clusters.Items[i])})
+		}
+	}
+	return requests
 }
