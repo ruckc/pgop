@@ -18,6 +18,9 @@ spec:
     - jsonPath: .spec.clusterRef.name
       name: Cluster
       type: string
+    - jsonPath: .status.databaseName
+      name: PGName
+      type: string
     - jsonPath: .spec.owner
       name: Owner
       type: string
@@ -65,6 +68,22 @@ spec:
                 required:
                 - name
                 type: object
+              databaseName:
+                description: |-
+                  databaseName is the name of the database in PostgreSQL. It defaults to
+                  metadata.name when unset, and lets the PostgreSQL name use characters
+                  (such as underscores) that Kubernetes object names do not allow.
+                  It must be a lowercase unquoted identifier, must not be a reserved
+                  database name (postgres, template0, template1), and cannot be changed
+                  after creation.
+                maxLength: 63
+                minLength: 1
+                pattern: ^[a-z_][a-z0-9_]*$
+                type: string
+                x-kubernetes-validations:
+                - message: databaseName must not be a reserved database name (postgres,
+                    template0, template1)
+                  rule: '!(self in [''postgres'', ''template0'', ''template1''])'
               extensions:
                 description: extensions lists PostgreSQL extensions to install in
                   this database
@@ -90,7 +109,9 @@ spec:
                 type: array
               owner:
                 description: |-
-                  owner is the role that owns this database.
+                  owner is the name of the Role resource (in the same namespace) that owns
+                  this database. The database is owned by that Role's effective PostgreSQL
+                  role name (its spec.roleName, or metadata.name when unset).
                   If not specified, the operator superuser will be the owner.
                 type: string
               schemas:
@@ -137,6 +158,10 @@ spec:
             required:
             - clusterRef
             type: object
+            x-kubernetes-validations:
+            - message: databaseName is immutable
+              rule: has(oldSelf.databaseName) == has(self.databaseName) && (!has(self.databaseName)
+                || self.databaseName == oldSelf.databaseName)
           status:
             description: status defines the observed state of Database
             properties:
@@ -207,6 +232,10 @@ spec:
                 items:
                   type: string
                 type: array
+              databaseName:
+                description: databaseName is the effective PostgreSQL database name
+                  that was reconciled.
+                type: string
               installedExtensions:
                 description: installedExtensions lists extensions that have been successfully
                   installed

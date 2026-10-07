@@ -71,6 +71,11 @@ spec:
   clusterRef:
     name: string           # Cluster name
 
+  # Optional PostgreSQL role name (default: metadata.name). Immutable.
+  # Must match ^[a-z_][a-z0-9_]*$, max 63 chars, no "pg_" prefix,
+  # not "postgres" or "pgop_operator".
+  roleName: string
+
   # PostgreSQL role options
   login: boolean           # LOGIN/NOLOGIN (default: false)
   superuser: boolean       # SUPERUSER/NOSUPERUSER (default: false)
@@ -96,6 +101,7 @@ spec:
 ```yaml
 status:
   ready: boolean           # Role exists in PostgreSQL
+  roleName: string         # Effective PostgreSQL role name
   secretName: string       # Auto-generated credentials secret
   conditions:
     - type: string
@@ -119,7 +125,13 @@ spec:
   clusterRef:
     name: string
 
-  # Database owner role
+  # Optional PostgreSQL database name (default: metadata.name). Immutable.
+  # Must match ^[a-z_][a-z0-9_]*$, max 63 chars,
+  # not "postgres", "template0" or "template1".
+  databaseName: string
+
+  # Name of the owning Role resource (same namespace). The database is owned
+  # by that Role's effective PostgreSQL name.
   owner: string
 
   # Extensions to install

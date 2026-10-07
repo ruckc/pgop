@@ -186,9 +186,9 @@ func (r *BackupReconciler) reconcileLogicalCronJob(
 	dumpScript := fmt.Sprintf(`
 set -e
 FILENAME=$(date +%%Y%%m%%dT%%H%%M%%S).dump
-pg_dump -h $PGHOST -p $PGPORT -U $PGUSER -d %s %s -Fc -f /backup/$FILENAME
+pg_dump -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDATABASE" %s -Fc -f /backup/$FILENAME
 echo "dump_file=$FILENAME" > /backup/metadata
-`, database.Name, dumpFlag)
+`, dumpFlag)
 
 	uploadScript := fmt.Sprintf(`
 set -e
@@ -278,6 +278,12 @@ echo "Uploaded to $DEST"
 										{
 											Name:  "PGPORT",
 											Value: fmt.Sprintf("%d", pgPort),
+										},
+										{
+											// Passed via env rather than interpolated into the
+											// script so the name never needs shell quoting.
+											Name:  envPGDatabase,
+											Value: database.PostgresName(),
 										},
 									},
 									VolumeMounts: []corev1.VolumeMount{

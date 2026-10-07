@@ -5,11 +5,13 @@ metadata:
 spec:
   clusterRef:
     name: example-cluster
+  # Optional PostgreSQL role name; defaults to metadata.name. Immutable.
+  # roleName: app_user
   login: true
   superuser: false
   createDB: false
   createRole: false
   inherit: true
   connectionLimit: 10
-  # Password is auto-generated and stored in a Secret named: <role-name>-credentials
+  # Password is auto-generated and stored in a Secret named: <cluster-name>-<role-name>-credentials
   # The secret contains keys: username, password, host, port

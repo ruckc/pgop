@@ -52,6 +52,7 @@ const (
 
 	envAWSAccessKeyID     = "AWS_ACCESS_KEY_ID"
 	envAWSSecretAccessKey = "AWS_SECRET_ACCESS_KEY"
+	envPGDatabase         = "PGDATABASE"
 
 	volPgbackrestConfig = "pgbackrest-config"
 	volPgbackrestTmp    = "pgbackrest-tmp"

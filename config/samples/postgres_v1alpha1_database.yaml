@@ -5,6 +5,9 @@ metadata:
 spec:
   clusterRef:
     name: example-cluster
+  # Optional PostgreSQL database name; defaults to metadata.name. Immutable.
+  # databaseName: my_app
+  # owner is the name of a Role resource (not a raw PostgreSQL role name).
   owner: app-user
   extensions:
     - name: uuid-ossp

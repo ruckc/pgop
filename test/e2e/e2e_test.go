@@ -508,6 +508,75 @@ var _ = Describe("Manager", Ordered, func() {
 			}
 			Eventually(verifyDatabaseReady, 2*time.Minute, time.Second).Should(Succeed())
 		})
+
+		It("should honor spec.roleName and spec.databaseName", func() {
+			manifest := `
+apiVersion: pgop.ruck.io/v1alpha1
+kind: Role
+metadata:
+  name: rs-app
+spec:
+  clusterRef:
+    name: example-cluster
+  roleName: rs_app
+---
+apiVersion: pgop.ruck.io/v1alpha1
+kind: Database
+metadata:
+  name: rs-app-db
+spec:
+  clusterRef:
+    name: example-cluster
+  databaseName: rs_app_db
+  owner: rs-app
+`
+			By("Applying a Role and Database with PostgreSQL name overrides")
+			cmd := exec.Command("kubectl", "apply", "-n", namespace, "-f", "-")
+			cmd.Stdin = strings.NewReader(manifest)
+			_, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to apply name-override manifests")
+
+			psql := func(query string) (string, error) {
+				cmd := exec.Command("kubectl", "exec", "-n", namespace, "example-cluster-0", "-c", "postgresql", "--",
+					"sh", "-c", `psql -U "$POSTGRES_USER" -d postgres -tAc "$0"`, query)
+				out, err := utils.Run(cmd)
+				return strings.TrimSpace(out), err
+			}
+
+			By("Verifying both resources become Ready")
+			for _, res := range []string{"role.pgop.ruck.io/rs-app", "database.pgop.ruck.io/rs-app-db"} {
+				Eventually(func(g Gomega) {
+					out, err := utils.Run(exec.Command("kubectl", "get", res, "-n", namespace,
+						"-o", "jsonpath={.status.ready}"))
+					g.Expect(err).NotTo(HaveOccurred())
+					g.Expect(out).To(Equal("true"), res+" not ready")
+				}, 2*time.Minute, time.Second).Should(Succeed())
+			}
+
+			By("Verifying the PostgreSQL objects use the overridden names")
+			out, err := psql("SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname = 'rs_app_db'")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(out).To(Equal("rs_app"))
+
+			By("Verifying the per-database Secret")
+			out, err = utils.Run(exec.Command("kubectl", "get", "secret", "rs-app-db-rs-app-credentials", "-n", namespace,
+				"-o", "jsonpath={.data.database}"))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(out).To(Equal(base64.StdEncoding.EncodeToString([]byte("rs_app_db"))))
+
+			By("Deleting both and verifying the PostgreSQL objects are dropped")
+			// Database first: a role cannot be dropped while it still owns a database.
+			for _, res := range []string{"database.pgop.ruck.io/rs-app-db", "role.pgop.ruck.io/rs-app"} {
+				_, err = utils.Run(exec.Command("kubectl", "delete", "-n", namespace, "--wait=true", "--timeout=2m", res))
+				Expect(err).NotTo(HaveOccurred())
+			}
+			Eventually(func(g Gomega) {
+				out, err := psql("SELECT (SELECT count(*) FROM pg_database WHERE datname = 'rs_app_db') + " +
+					"(SELECT count(*) FROM pg_roles WHERE rolname = 'rs_app')")
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(out).To(Equal("0"))
+			}, time.Minute, time.Second).Should(Succeed())
+		})
 	})
 
 	RegisterBackupTests()
