@@ -63,6 +63,63 @@ type ClusterSpec struct {
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=65535
 	Port int32 `json:"port,omitempty"`
+
+	// tls enables TLS on the PostgreSQL server. When unset (the default) the
+	// server runs without TLS and the operator connects with sslmode=disable,
+	// exactly as before TLS support existed.
+	// +optional
+	TLS *ClusterTLSSpec `json:"tls,omitempty"`
+}
+
+// TLSProtocolVersion is a minimum TLS protocol version accepted by the server.
+// +kubebuilder:validation:Enum=TLSv1.2;TLSv1.3
+type TLSProtocolVersion string
+
+const (
+	// TLSProtocolVersion12 is TLS 1.2.
+	TLSProtocolVersion12 TLSProtocolVersion = "TLSv1.2"
+	// TLSProtocolVersion13 is TLS 1.3.
+	TLSProtocolVersion13 TLSProtocolVersion = "TLSv1.3"
+)
+
+// ClusterTLSSpec configures server-side TLS for a Cluster.
+type ClusterTLSSpec struct {
+	// secretName is the name of a Secret in the Cluster namespace holding the
+	// server certificate in the kubernetes.io/tls layout: tls.crt (server
+	// certificate, optionally followed by intermediates), tls.key (private key)
+	// and ca.crt (the CA that issued tls.crt). cert-manager Certificate
+	// resources produce this layout. The certificate must be valid for the
+	// Service DNS name <cluster>.<namespace>.svc.cluster.local, which the
+	// operator verifies with sslmode=verify-full.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	SecretName string `json:"secretName"`
+
+	// requireTLS rejects non-TLS TCP connections through an operator-managed
+	// pg_hba.conf (hostnossl ... reject). Connections over the local Unix
+	// socket (probes, the postStart hook) are unaffected. Defaults to true.
+	// +kubebuilder:default=true
+	// +optional
+	RequireTLS *bool `json:"requireTLS,omitempty"`
+
+	// minProtocolVersion is the minimum TLS protocol version the server accepts
+	// (PostgreSQL ssl_min_protocol_version).
+	// +kubebuilder:default="TLSv1.2"
+	// +optional
+	MinProtocolVersion TLSProtocolVersion `json:"minProtocolVersion,omitempty"`
+}
+
+// IsRequireTLS reports whether non-TLS TCP connections are rejected (CRD
+// default: true).
+func (t *ClusterTLSSpec) IsRequireTLS() bool { return t.RequireTLS == nil || *t.RequireTLS }
+
+// GetMinProtocolVersion returns the minimum TLS protocol version (CRD
+// default: TLSv1.2).
+func (t *ClusterTLSSpec) GetMinProtocolVersion() TLSProtocolVersion {
+	if t.MinProtocolVersion == "" {
+		return TLSProtocolVersion12
+	}
+	return t.MinProtocolVersion
 }
 
 // ClusterStatus defines the observed state of Cluster.
@@ -75,6 +132,13 @@ type ClusterStatus struct {
 
 	// secretName is the name of the Secret containing operator credentials
 	SecretName string `json:"secretName,omitempty"`
+
+	// tlsSecretHash is a hash of the certificate material (tls.crt and ca.crt)
+	// that the running server was last confirmed to present. It changes when
+	// the certificate is rotated and is empty while TLS is disabled or not yet
+	// active.
+	// +optional
+	TLSSecretHash string `json:"tlsSecretHash,omitempty"`
 
 	// conditions represent the current state of the Cluster resource.
 	// +listType=map

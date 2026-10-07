@@ -36,6 +36,14 @@ type Client struct {
 	db *sql.DB
 }
 
+// SSL modes understood by ConnectionConfig.SSLMode.
+const (
+	SSLModeDisable    = "disable"
+	SSLModePrefer     = "prefer"
+	SSLModeRequire    = "require"
+	SSLModeVerifyFull = "verify-full"
+)
+
 // ConnectionConfig holds connection parameters for PostgreSQL
 type ConnectionConfig struct {
 	Host     string
@@ -43,22 +51,20 @@ type ConnectionConfig struct {
 	User     string
 	Password string
 	Database string
-	SSLMode  string
+	// SSLMode is a libpq sslmode. Defaults to "disable".
+	SSLMode string
+	// RootCertPEM is the PEM-encoded CA bundle used to verify the server
+	// certificate. It is required when SSLMode is "verify-full" (there is no
+	// fallback to the system trust store) and ignored otherwise.
+	RootCertPEM []byte
 }
 
 // NewClient creates a new PostgreSQL client connection
 func NewClient(cfg ConnectionConfig) (*Client, error) {
-	if cfg.SSLMode == "" {
-		cfg.SSLMode = defaultSSLMode
+	connStr, err := buildDSN(cfg)
+	if err != nil {
+		return nil, err
 	}
-	if cfg.Database == "" {
-		cfg.Database = defaultDatabase
-	}
-
-	connStr := fmt.Sprintf(
-		"host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
-		cfg.Host, cfg.Port, cfg.User, cfg.Password, cfg.Database, cfg.SSLMode,
-	)
 
 	db, err := sql.Open("postgres", connStr)
 	if err != nil {
@@ -76,6 +82,20 @@ func NewClient(cfg ConnectionConfig) (*Client, error) {
 // Close closes the database connection
 func (c *Client) Close() error {
 	return c.db.Close()
+}
+
+// ReloadConfig asks the server to re-read its configuration files
+// (pg_reload_conf()). PostgreSQL also reloads its TLS certificate, key and CA
+// files on reload, so this rotates certificates without a restart.
+func (c *Client) ReloadConfig(ctx context.Context) error {
+	var ok bool
+	if err := c.db.QueryRowContext(ctx, "SELECT pg_reload_conf()").Scan(&ok); err != nil {
+		return fmt.Errorf("failed to reload configuration: %w", err)
+	}
+	if !ok {
+		return fmt.Errorf("pg_reload_conf() returned false")
+	}
+	return nil
 }
 
 // RoleOptions defines PostgreSQL role attributes

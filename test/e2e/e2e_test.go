@@ -694,6 +694,7 @@ spec:
 
 	RegisterBackupTests()
 	RegisterRetentionTests()
+	RegisterTLSTests()
 })
 
 // serviceAccountToken returns a token for the specified service account in the given namespace.
