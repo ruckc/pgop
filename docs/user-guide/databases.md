@@ -97,7 +97,14 @@ data:
   host: my-cluster.default.svc.cluster.local
   port: "5432"
   database: myapp          # this Database's PostgreSQL name
+  sslmode: disable         # verify-full once Cluster TLS is active
+  uri: postgresql://app-user:<password>@my-cluster.default.svc.cluster.local:5432/myapp?sslmode=disable
+  ca.crt: <PEM>            # only while Cluster TLS is active
 ```
+
+`sslmode`, `uri` and `ca.crt` follow the Cluster's [TLS](clusters.md#tls)
+state. With `sslmode=verify-full`, mount `ca.crt` and point `sslrootcert` (or
+`PGSSLROOTCERT`) at it; a URI cannot carry the CA itself.
 
 The credentials mirror the owner Role's password (read from the Role's
 `<cluster>-<owner>-credentials` Secret), with the `database` key set to this

@@ -33,7 +33,15 @@ spec:
     limits:
       cpu: string
       memory: string
+
+  # Server TLS (optional). Unset = no TLS, sslmode=disable (unchanged behaviour).
+  tls:
+    secretName: string          # Required: kubernetes.io/tls-style Secret (tls.crt, tls.key, ca.crt)
+    requireTLS: boolean         # Reject non-TLS TCP connections (default: true)
+    minProtocolVersion: string  # TLSv1.2 (default) | TLSv1.3
 ```
+
+See [Clusters → TLS](../user-guide/clusters.md#tls) for details.
 
 ### ClusterStatus
 
@@ -42,6 +50,7 @@ status:
   ready: boolean           # Cluster is accepting connections
   endpoint: string         # Service endpoint (host:port)
   secretName: string       # Credentials secret name
+  tlsSecretHash: string    # Hash of the certificate the server was last confirmed to present
   conditions:
     - type: string
       status: string       # True/False/Unknown
@@ -56,6 +65,7 @@ Condition types:
 |------|---------|
 | `Available` | `True` (reason `ClusterReady`) once the StatefulSet is ready. |
 | `ExistingVolume` | Set once when the StatefulSet is created. `True` (reason `PreExistingPVC`) if the data PVC already existed, so PostgreSQL started on retained data; `False` (reason `NewVolume`) otherwise. Never recomputed afterwards. |
+| `TLSReady` | Only present while `spec.tls` is set. `True` (reason `TLSActive`) once the server presents the certificate from `spec.tls.secretName`. `False` with reason `InvalidTLSSecret` (Secret missing/incomplete/unusable; the StatefulSet is left unchanged), `WaitingForServer` (pod not ready or not serving TLS yet) or `CertificateReloading` (a rotated certificate is not loaded yet; the operator ran `pg_reload_conf()`). |
 
 ---
 

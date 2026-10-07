@@ -34,6 +34,8 @@ spec:
   storage:
     size: 5Gi
     # retainPolicy: Retain   # default; Delete removes the PVC with the Cluster
+  # tls:                     # optional server TLS (off when unset)
+  #   secretName: example-cluster-tls   # tls.crt/tls.key/ca.crt, e.g. from cert-manager
   resources:
     requests:
       memory: "256Mi"
@@ -52,6 +54,16 @@ PostgreSQL on the old data; the operator reports this with an
 `ExistingVolume=True` condition and a `PreExistingPVC` Warning event. Set
 `storage.retainPolicy: Delete` to remove the PVC together with the Cluster
 (Kubernetes 1.27+). See [Clusters → Storage retention](docs/user-guide/clusters.md#storage-retention).
+
+#### TLS
+
+Set `spec.tls.secretName` to a `kubernetes.io/tls`-style Secret (`tls.crt`,
+`tls.key`, `ca.crt`; cert-manager produces this) whose certificate covers
+`<name>.<namespace>.svc.cluster.local`. The server then runs with `ssl=on`,
+rejects non-TLS TCP connections (`requireTLS`, default `true`), the operator
+connects with `sslmode=verify-full`, and the credentials Secrets gain `sslmode`,
+`ca.crt` and `uri`. Without `spec.tls` nothing changes. See
+[Clusters → TLS](docs/user-guide/clusters.md#tls).
 
 #### Data directory layout
 
@@ -136,6 +148,9 @@ The resulting Secret `myapp-app-user-credentials` contains:
 | `host`     | `example-cluster.<namespace>.svc.cluster.local`    |
 | `port`     | `5432`                                             |
 | `database` | `myapp`                                            |
+| `sslmode`  | `disable`, or `verify-full` when Cluster TLS is on |
+| `uri`      | ready-made `postgresql://…?sslmode=…` URI          |
+| `ca.crt`   | server CA (only when Cluster TLS is on)            |
 
 ### Backup (alpha)
 
