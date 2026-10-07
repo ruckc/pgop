@@ -9,7 +9,7 @@ The Role controller:
 1. Connects to the referenced PostgreSQL cluster
 2. Creates or updates the role with specified permissions
 3. Auto-generates a password and creates a credentials Secret
-4. Manages role membership (GRANT role TO role)
+4. Manages role memberships (GRANT, option changes, and REVOKE of memberships it granted)
 5. Cleans up the role on deletion
 
 ## Example
@@ -26,8 +26,8 @@ spec:
   login: true
   createDB: false
   connectionLimit: 100
-  memberOf:
-    - app_read_role
+  memberships:
+    - role: app_read_role
 ```
 
 ## Spec Reference
@@ -44,7 +44,9 @@ spec:
 | `replication` | bool | `false` | Can role initiate replication? |
 | `bypassRLS` | bool | `false` | Bypass row-level security? |
 | `connectionLimit` | int | `-1` | Max concurrent connections (-1 = unlimited) |
-| `memberOf` | []string | - | Roles this role is a member of |
+| `memberships` | []RoleMembership | - | Roles this role is a member of, with grant options (see [Memberships](#memberships)) |
+| `memberOf` | []string | - | **Deprecated**, use `memberships`. Roles this role is a member of |
+| `revokeRemovedMemberships` | bool | `true` | Revoke pgop-granted memberships removed from the spec (transitional opt-out) |
 | `passwordSecretRef` | SecretKeySelector | - | Use existing password (optional) |
 
 ## Status
@@ -54,6 +56,7 @@ spec:
 | `ready` | Whether the role exists in PostgreSQL |
 | `roleName` | The effective PostgreSQL role name that was reconciled |
 | `secretName` | Name of the auto-generated credentials secret (`<cluster>-<role>-credentials`) |
+| `managedMemberships` | PostgreSQL roles whose membership pgop granted to this role |
 | `conditions` | Detailed status conditions |
 
 ## Credentials Secret
@@ -103,12 +106,96 @@ spec:
 - Kubernetes-side names still use `metadata.name`: the credentials Secret is
   `<cluster>-rs-app-credentials`, and a Database refers to this Role with
   `owner: rs-app`. The Secret's `username` key holds `rs_app`.
-- `memberOf` entries are raw PostgreSQL role names (for example `rs_app`), not
+- `memberships[].role` and `memberOf` entries are raw PostgreSQL role names (for example `rs_app`), not
   Role resource names.
 
 !!! warning
     Two Role resources on the same cluster that resolve to the same PostgreSQL
     name are not detected yet; deleting either one drops the shared role.
+
+## Memberships
+
+`spec.memberships` makes this role a member of other PostgreSQL roles
+(`GRANT <role> TO <this role>`), with per-grant options:
+
+```yaml
+spec:
+  clusterRef:
+    name: my-cluster
+  memberships:
+    - role: app_read_role          # plain membership, PostgreSQL defaults
+    - role: app_owner
+      inherit: false               # must SET ROLE app_owner to use its privileges
+      set: true
+    - role: app_admins
+      admin: true                  # may grant app_admins to others
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `role` | string | **required** | PostgreSQL name of the role to be a member of |
+| `inherit` | bool | PostgreSQL default | `INHERIT` grant option: use the role's privileges automatically |
+| `set` | bool | PostgreSQL default | `SET` grant option: allow `SET ROLE` to the role |
+| `admin` | bool | `false` | `ADMIN` grant option: allow granting the role to others |
+
+- `inherit` and `set` require **PostgreSQL 16 or later**. On an older server,
+  a Role that sets them fails with a clear `ReconcileError` condition; plain
+  and `admin` memberships still work.
+- When `inherit` or `set` is unset, a new grant gets PostgreSQL's default
+  (`inherit` follows this role's `inherit` attribute, `set` is true) and the
+  option of an existing grant is left as it is.
+- Changing an option updates the existing grant. Setting `admin` back to
+  `false` (or omitting it) runs `REVOKE ADMIN OPTION FOR`.
+- Each role may appear only once in `memberships`.
+
+### Revoking removed memberships
+
+pgop records the memberships it manages in `status.managedMemberships`.
+When an entry is removed from `memberships` (or `memberOf`), pgop revokes that
+membership. Memberships granted outside pgop (for example by a DBA with
+`GRANT`) are never revoked, because they were never in
+`status.managedMemberships`.
+
+Things to know:
+
+- **Upgrading:** existing Roles have no `status.managedMemberships` yet. The
+  first reconcile after upgrading records the current spec without revoking
+  anything, so a membership removed from the spec *before* the upgrade stays
+  in place. Revoke it manually if needed.
+- **Status loss:** if the status is lost (the Role is deleted and recreated,
+  or restored from a backup without status), memberships removed in the
+  meantime are not revoked.
+- Listing a role that a DBA granted manually adopts it: it becomes managed and
+  is revoked when later removed from the spec.
+
+To keep the previous grant-only behavior, set `revokeRemovedMemberships:
+false`. Memberships removed while it is `false` are dropped from
+`status.managedMemberships` without being revoked, and are not revoked later
+if the setting is turned back on.
+
+!!! warning
+    `revokeRemovedMemberships` is a transitional opt-out. It will be removed
+    together with the deprecated `memberOf` field, after which removed
+    memberships are always revoked.
+
+### Deprecated `memberOf`
+
+`spec.memberOf` is deprecated in favor of `spec.memberships` and will be
+removed in a future API version. Each `memberOf` entry behaves like a
+`memberships` entry with only `role` set. A role must not be listed in both
+fields; the API server rejects such a Role. To migrate, move each entry:
+
+```yaml
+# before
+memberOf:
+  - app_read_role
+# after
+memberships:
+  - role: app_read_role
+```
+
+Moving an entry from `memberOf` to `memberships` in a single update does not
+revoke and re-grant it.
 
 ## Role Types
 

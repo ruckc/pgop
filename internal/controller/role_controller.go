@@ -166,12 +166,10 @@ func (r *RoleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// Record the PostgreSQL name that now exists so deletion drops exactly it.
 	role.Status.RoleName = pgName
 
-	// Handle role memberships
-	for _, memberOf := range role.Spec.MemberOf {
-		if err := pgClient.GrantRole(ctx, memberOf, pgName); err != nil {
-			log.Error(err, "Failed to grant role membership", "role", memberOf)
-			return r.updateStatus(ctx, role, false, secretName, err)
-		}
+	// Handle role memberships (grant, update options, revoke removed ones)
+	if err := reconcileMemberships(ctx, pgClient, role, pgName); err != nil {
+		log.Error(err, "Failed to reconcile role memberships")
+		return r.updateStatus(ctx, role, false, secretName, err)
 	}
 
 	log.Info("Role reconciled successfully")

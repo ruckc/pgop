@@ -20,8 +20,38 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+// RoleMembership declares that this role is a member of another PostgreSQL role.
+type RoleMembership struct {
+	// role is the PostgreSQL name of the role to be a member of (a raw
+	// PostgreSQL role name, not a Role resource name).
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	Role string `json:"role"`
+
+	// inherit sets the grant's INHERIT option: whether the member automatically
+	// uses the privileges of the role. When unset, PostgreSQL's default applies
+	// for a new grant (the member's own inherit attribute) and an existing grant
+	// is left unchanged. Requires PostgreSQL 16 or later.
+	// +optional
+	Inherit *bool `json:"inherit,omitempty"`
+
+	// set sets the grant's SET option: whether the member may SET ROLE to the
+	// role. When unset, PostgreSQL's default applies for a new grant (true) and
+	// an existing grant is left unchanged. Requires PostgreSQL 16 or later.
+	// +optional
+	Set *bool `json:"set,omitempty"`
+
+	// admin sets the grant's ADMIN option: whether the member may grant
+	// membership in the role to others. Defaults to false; a grant that has
+	// the ADMIN option while admin is false has it revoked.
+	// +optional
+	Admin bool `json:"admin,omitempty"`
+}
+
 // RoleSpec defines the desired state of Role
 // +kubebuilder:validation:XValidation:rule="has(oldSelf.roleName) == has(self.roleName) && (!has(self.roleName) || self.roleName == oldSelf.roleName)",message="roleName is immutable"
+// +kubebuilder:validation:XValidation:rule="!has(self.memberOf) || !has(self.memberships) || self.memberOf.all(r, !self.memberships.exists(m, m.role == r))",message="a role must not be listed in both memberOf and memberships"
 type RoleSpec struct {
 	// clusterRef references the PostgreSQL Cluster this role belongs to
 	// +kubebuilder:validation:Required
@@ -75,9 +105,39 @@ type RoleSpec struct {
 	// +kubebuilder:validation:Minimum=-1
 	ConnectionLimit *int32 `json:"connectionLimit,omitempty"`
 
-	// memberOf lists roles this role should be a member of
+	// memberOf lists PostgreSQL roles this role should be a member of, granted
+	// with PostgreSQL's default options.
+	//
+	// Deprecated: use memberships instead. memberOf will be removed in a future
+	// API version. Each entry is treated as a memberships entry with only role
+	// set, and a role must not appear in both fields.
 	// +optional
+	// +kubebuilder:validation:MaxItems=256
+	// +kubebuilder:validation:items:MaxLength=63
 	MemberOf []string `json:"memberOf,omitempty"`
+
+	// memberships lists PostgreSQL roles this role should be a member of, with
+	// per-grant options. Memberships that pgop granted and that are later
+	// removed from the spec are revoked (see revokeRemovedMemberships);
+	// memberships granted outside pgop are never revoked.
+	// +optional
+	// +listType=map
+	// +listMapKey=role
+	// +kubebuilder:validation:MaxItems=256
+	Memberships []RoleMembership `json:"memberships,omitempty"`
+
+	// revokeRemovedMemberships controls whether memberships that pgop granted
+	// (tracked in status.managedMemberships) are revoked once they are removed
+	// from memberOf/memberships. Set it to false to keep the legacy grant-only
+	// behavior; memberships removed while it is false are no longer tracked and
+	// are never revoked later.
+	//
+	// This is a transitional opt-out: it will be removed together with the
+	// deprecated memberOf field, after which removed memberships are always
+	// revoked.
+	// +kubebuilder:default=true
+	// +optional
+	RevokeRemovedMemberships *bool `json:"revokeRemovedMemberships,omitempty"`
 
 	// passwordSecretRef references a Secret containing the password for this role.
 	// The secret must contain a key with the password value.
@@ -97,6 +157,13 @@ type RoleStatus struct {
 	// secretName is the name of the Secret containing the role's credentials.
 	// The secret contains 'username' and 'password' keys.
 	SecretName string `json:"secretName,omitempty"`
+
+	// managedMemberships lists the PostgreSQL roles whose membership pgop has
+	// granted to this role. Only these are revoked when they are removed from
+	// the spec.
+	// +optional
+	// +listType=set
+	ManagedMemberships []string `json:"managedMemberships,omitempty"`
 
 	// conditions represent the current state of the Role resource.
 	// +listType=map
@@ -151,6 +218,33 @@ func (s *RoleSpec) GetConnectionLimit() int32 {
 		return -1
 	}
 	return *s.ConnectionLimit
+}
+
+// ShouldRevokeRemovedMemberships reports whether memberships removed from the
+// spec are revoked (CRD default: true).
+func (s *RoleSpec) ShouldRevokeRemovedMemberships() bool {
+	return s.RevokeRemovedMemberships == nil || *s.RevokeRemovedMemberships
+}
+
+// DesiredMemberships returns the memberships from memberships followed by the
+// deprecated memberOf entries (as memberships with default options). Duplicate
+// roles keep their first occurrence.
+func (s *RoleSpec) DesiredMemberships() []RoleMembership {
+	out := make([]RoleMembership, 0, len(s.Memberships)+len(s.MemberOf))
+	seen := make(map[string]bool, cap(out))
+	for _, m := range s.Memberships {
+		if !seen[m.Role] {
+			seen[m.Role] = true
+			out = append(out, m)
+		}
+	}
+	for _, r := range s.MemberOf {
+		if !seen[r] {
+			seen[r] = true
+			out = append(out, RoleMembership{Role: r})
+		}
+	}
+	return out
 }
 
 // PostgresName returns the role's name in PostgreSQL: spec.roleName when set,

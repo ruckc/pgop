@@ -86,9 +86,21 @@ spec:
   bypassRLS: boolean       # BYPASSRLS/NOBYPASSRLS (default: false)
   connectionLimit: integer # CONNECTION LIMIT (default: -1)
 
-  # Role memberships
+  # Role memberships (PostgreSQL role names, not Role resource names)
+  memberships:             # max 256, each role at most once
+    - role: string         # Role to be a member of (required)
+      inherit: boolean     # INHERIT option (optional; PostgreSQL 16+)
+      set: boolean         # SET option (optional; PostgreSQL 16+)
+      admin: boolean       # ADMIN option (default: false)
+
+  # DEPRECATED: use memberships. Each entry acts like {role: <name>}.
+  # A role must not appear in both memberOf and memberships.
   memberOf:
-    - string               # Role names to be a member of
+    - string
+
+  # Revoke pgop-granted memberships removed from the spec (default: true).
+  # Transitional opt-out; removed together with memberOf.
+  revokeRemovedMemberships: boolean
 
   # Optional: use existing password
   passwordSecretRef:
@@ -103,6 +115,8 @@ status:
   ready: boolean           # Role exists in PostgreSQL
   roleName: string         # Effective PostgreSQL role name
   secretName: string       # Auto-generated credentials secret
+  managedMemberships:      # Roles whose membership pgop granted (revoked when removed)
+    - string
   conditions:
     - type: string
       status: string

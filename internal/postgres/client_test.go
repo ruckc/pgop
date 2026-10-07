@@ -29,6 +29,8 @@ const (
 	attrNoBypassRLS   = "NOBYPASSRLS"
 	attrConnLimitNeg1 = "CONNECTION LIMIT -1"
 	attrNoInherit     = "NOINHERIT"
+	testMember        = "app"
+	testParent        = "parent"
 	testPGUser        = "postgres"
 	testPGPassword    = "secret"
 	testPGSSLMode     = "disable"
@@ -392,6 +394,37 @@ func TestRoleOptions(t *testing.T) {
 	}
 	if opts.Password != testPGPassword {
 		t.Errorf("Password = %q, want %q", opts.Password, testPGPassword)
+	}
+}
+
+func TestBuildGrantRoleQuery(t *testing.T) {
+	tests := []struct {
+		name     string
+		role     string
+		member   string
+		opts     MembershipOptions
+		expected string
+	}{
+		{"no options", testParent, testMember, MembershipOptions{}, `GRANT "parent" TO "app"`},
+		{"admin true", testParent, testMember, MembershipOptions{Admin: true}, `GRANT "parent" TO "app" WITH ADMIN OPTION`},
+		{"inherit true", testParent, testMember, MembershipOptions{Inherit: new(true)}, `GRANT "parent" TO "app" WITH INHERIT TRUE`},
+		{"inherit false", testParent, testMember, MembershipOptions{Inherit: new(false)}, `GRANT "parent" TO "app" WITH INHERIT FALSE`},
+		{"set true", testParent, testMember, MembershipOptions{Set: new(true)}, `GRANT "parent" TO "app" WITH SET TRUE`},
+		{"set false", testParent, testMember, MembershipOptions{Set: new(false)}, `GRANT "parent" TO "app" WITH SET FALSE`},
+		{
+			"all combined", testParent, testMember,
+			MembershipOptions{Admin: true, Inherit: new(false), Set: new(true)},
+			`GRANT "parent" TO "app" WITH ADMIN OPTION, INHERIT FALSE, SET TRUE`,
+		},
+		{"identifier quoting", `we"ird`, "my-app", MembershipOptions{}, `GRANT "we""ird" TO "my-app"`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := buildGrantRoleQuery(tt.role, tt.member, tt.opts); got != tt.expected {
+				t.Errorf("buildGrantRoleQuery() = %q, want %q", got, tt.expected)
+			}
+		})
 	}
 }
 

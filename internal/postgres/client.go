@@ -20,6 +20,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strconv"
 	"strings"
 
 	_ "github.com/lib/pq"
@@ -204,12 +205,79 @@ func (c *Client) RoleExists(ctx context.Context, name string) (bool, error) {
 	return exists, nil
 }
 
-// GrantRole grants membership in a role to another role
-func (c *Client) GrantRole(ctx context.Context, role, member string) error {
-	query := fmt.Sprintf("GRANT %s TO %s", quoteIdent(role), quoteIdent(member))
-	_, err := c.db.ExecContext(ctx, query)
+// MinMembershipOptionsVersion is the first server_version_num that supports
+// the INHERIT and SET grant options (PostgreSQL 16).
+const MinMembershipOptionsVersion = 160000
+
+// bootstrapSuperuserOID is the OID of the bootstrap superuser. On PostgreSQL
+// 16+, grants made by any superuser are recorded with it as the grantor.
+const bootstrapSuperuserOID = 10
+
+// MembershipOptions are the options of a role membership grant. Nil
+// Inherit/Set are not emitted, so PostgreSQL's default applies to a new grant
+// and an existing grant keeps its current value.
+type MembershipOptions struct {
+	Admin   bool
+	Inherit *bool
+	Set     *bool
+}
+
+// MembershipState is the current state of a membership grant. Inherit and Set
+// are nil on servers older than PostgreSQL 16.
+type MembershipState struct {
+	Admin   bool
+	Inherit *bool
+	Set     *bool
+}
+
+// ServerVersionNum returns the server's server_version_num (e.g. 180001).
+func (c *Client) ServerVersionNum(ctx context.Context) (int, error) {
+	var v string
+	if err := c.db.QueryRowContext(ctx, "SHOW server_version_num").Scan(&v); err != nil {
+		return 0, fmt.Errorf("failed to read server version: %w", err)
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(v))
 	if err != nil {
-		return fmt.Errorf("failed to grant role: %w", err)
+		return 0, fmt.Errorf("failed to parse server_version_num %q: %w", v, err)
+	}
+	return n, nil
+}
+
+// buildGrantRoleQuery builds GRANT role TO member, adding a WITH clause for
+// ADMIN (only when true; it is removed with REVOKE ADMIN OPTION FOR) and for
+// the INHERIT/SET options that are set.
+func buildGrantRoleQuery(role, member string, opts MembershipOptions) string {
+	query := fmt.Sprintf("GRANT %s TO %s", quoteIdent(role), quoteIdent(member))
+	var with []string
+	if opts.Admin {
+		with = append(with, "ADMIN OPTION")
+	}
+	if opts.Inherit != nil {
+		with = append(with, "INHERIT "+strings.ToUpper(strconv.FormatBool(*opts.Inherit)))
+	}
+	if opts.Set != nil {
+		with = append(with, "SET "+strings.ToUpper(strconv.FormatBool(*opts.Set)))
+	}
+	if len(with) > 0 {
+		query += " WITH " + strings.Join(with, ", ")
+	}
+	return query
+}
+
+// GrantRole grants membership in a role to another role. On an existing grant,
+// PostgreSQL 16+ updates the options given in opts.
+func (c *Client) GrantRole(ctx context.Context, role, member string, opts MembershipOptions) error {
+	if _, err := c.db.ExecContext(ctx, buildGrantRoleQuery(role, member, opts)); err != nil {
+		return fmt.Errorf("failed to grant role %q to %q: %w", role, member, err)
+	}
+	return nil
+}
+
+// RevokeAdminOption removes the ADMIN option from member's membership in role.
+func (c *Client) RevokeAdminOption(ctx context.Context, role, member string) error {
+	query := fmt.Sprintf("REVOKE ADMIN OPTION FOR %s FROM %s", quoteIdent(role), quoteIdent(member))
+	if _, err := c.db.ExecContext(ctx, query); err != nil {
+		return fmt.Errorf("failed to revoke admin option for role %q from %q: %w", role, member, err)
 	}
 	return nil
 }
@@ -219,9 +287,58 @@ func (c *Client) RevokeRole(ctx context.Context, role, member string) error {
 	query := fmt.Sprintf("REVOKE %s FROM %s", quoteIdent(role), quoteIdent(member))
 	_, err := c.db.ExecContext(ctx, query)
 	if err != nil {
-		return fmt.Errorf("failed to revoke role: %w", err)
+		return fmt.Errorf("failed to revoke role %q from %q: %w", role, member, err)
 	}
 	return nil
+}
+
+// ListMemberships returns the roles member belongs to, keyed by role name.
+// serverVersion selects the query: on PostgreSQL 16+ only grants recorded with
+// the bootstrap superuser (or the current user) as grantor are returned, since
+// those are the grants that GRANT/REVOKE issued by pgop operate on.
+func (c *Client) ListMemberships(ctx context.Context, member string, serverVersion int) (map[string]MembershipState, error) {
+	var query string
+	if serverVersion >= MinMembershipOptionsVersion {
+		query = fmt.Sprintf(`SELECT r.rolname, m.admin_option, m.inherit_option, m.set_option
+FROM pg_auth_members m
+JOIN pg_roles r ON r.oid = m.roleid
+JOIN pg_roles u ON u.oid = m.member
+WHERE u.rolname = $1
+  AND m.grantor IN (%d, (SELECT oid FROM pg_roles WHERE rolname = current_user))`, bootstrapSuperuserOID)
+	} else {
+		query = `SELECT r.rolname, m.admin_option, NULL::boolean, NULL::boolean
+FROM pg_auth_members m
+JOIN pg_roles r ON r.oid = m.roleid
+JOIN pg_roles u ON u.oid = m.member
+WHERE u.rolname = $1`
+	}
+	rows, err := c.db.QueryContext(ctx, query, member)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list memberships of %q: %w", member, err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	out := map[string]MembershipState{}
+	for rows.Next() {
+		var name string
+		var admin bool
+		var inherit, set sql.NullBool
+		if err := rows.Scan(&name, &admin, &inherit, &set); err != nil {
+			return nil, fmt.Errorf("failed to scan membership: %w", err)
+		}
+		st := MembershipState{Admin: admin}
+		if inherit.Valid {
+			st.Inherit = &inherit.Bool
+		}
+		if set.Valid {
+			st.Set = &set.Bool
+		}
+		out[name] = st
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to list memberships of %q: %w", member, err)
+	}
+	return out, nil
 }
 
 // CreateDatabase creates a new database

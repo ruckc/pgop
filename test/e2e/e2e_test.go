@@ -577,6 +577,119 @@ spec:
 				g.Expect(out).To(Equal("0"))
 			}, time.Minute, time.Second).Should(Succeed())
 		})
+
+		It("should grant, update and revoke role memberships", func() {
+			manifest := `
+apiVersion: pgop.ruck.io/v1alpha1
+kind: Role
+metadata:
+  name: mparent
+spec:
+  clusterRef:
+    name: example-cluster
+  login: false
+---
+apiVersion: pgop.ruck.io/v1alpha1
+kind: Role
+metadata:
+  name: mmanual
+spec:
+  clusterRef:
+    name: example-cluster
+  login: false
+---
+apiVersion: pgop.ruck.io/v1alpha1
+kind: Role
+metadata:
+  name: mapp
+spec:
+  clusterRef:
+    name: example-cluster
+  memberships:
+    - role: mparent
+      inherit: false
+      set: true
+`
+			By("Applying parent, manual and member Roles")
+			cmd := exec.Command("kubectl", "apply", "-n", namespace, "-f", "-")
+			cmd.Stdin = strings.NewReader(manifest)
+			_, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to apply membership manifests")
+
+			psql := func(query string) (string, error) {
+				cmd := exec.Command("kubectl", "exec", "-n", namespace, "example-cluster-0", "-c", "postgresql", "--",
+					"sh", "-c", `psql -U "$POSTGRES_USER" -d postgres -v ON_ERROR_STOP=1 -tAc "$0"`, query)
+				out, err := utils.Run(cmd)
+				return strings.TrimSpace(out), err
+			}
+			// membership returns "admin,inherit,set" for role -> mapp, or "" when not a member.
+			membership := func(role string) (string, error) {
+				return psql("SELECT concat_ws(',', admin_option, inherit_option, set_option) FROM pg_auth_members " +
+					"WHERE roleid = '" + role + "'::regrole AND member = 'mapp'::regrole")
+			}
+			expectMembership := func(role, want string) {
+				Eventually(func(g Gomega) {
+					out, err := membership(role)
+					g.Expect(err).NotTo(HaveOccurred())
+					g.Expect(out).To(Equal(want))
+				}, 2*time.Minute, time.Second).Should(Succeed())
+			}
+			patchMemberships := func(memberships string) {
+				_, err := utils.Run(exec.Command("kubectl", "patch", "role.pgop.ruck.io", "mapp", "-n", namespace,
+					"--type=merge", "-p", `{"spec":{"memberships":`+memberships+`}}`))
+				Expect(err).NotTo(HaveOccurred())
+			}
+
+			By("Verifying the Roles become Ready")
+			for _, res := range []string{"role.pgop.ruck.io/mparent", "role.pgop.ruck.io/mmanual", "role.pgop.ruck.io/mapp"} {
+				Eventually(func(g Gomega) {
+					out, err := utils.Run(exec.Command("kubectl", "get", res, "-n", namespace,
+						"-o", "jsonpath={.status.ready}"))
+					g.Expect(err).NotTo(HaveOccurred())
+					g.Expect(out).To(Equal("true"), res+" not ready")
+				}, 2*time.Minute, time.Second).Should(Succeed())
+			}
+
+			By("Verifying the membership was granted with INHERIT FALSE, SET TRUE")
+			expectMembership("mparent", "f,f,t")
+			out, err := utils.Run(exec.Command("kubectl", "get", "role.pgop.ruck.io", "mapp", "-n", namespace,
+				"-o", "jsonpath={.status.managedMemberships}"))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(out).To(Equal(`["mparent"]`))
+
+			By("Granting a membership manually, outside pgop")
+			_, err = psql("GRANT mmanual TO mapp")
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Changing the membership options")
+			patchMemberships(`[{"role":"mparent","inherit":true,"set":false,"admin":true}]`)
+			expectMembership("mparent", "t,t,f")
+
+			By("Removing the ADMIN option")
+			patchMemberships(`[{"role":"mparent","inherit":true,"set":false}]`)
+			expectMembership("mparent", "f,t,f")
+
+			By("Removing the membership from the spec and verifying it is revoked")
+			patchMemberships(`null`)
+			expectMembership("mparent", "")
+			Eventually(func(g Gomega) {
+				out, err := utils.Run(exec.Command("kubectl", "get", "role.pgop.ruck.io", "mapp", "-n", namespace,
+					"-o", "jsonpath={.status.managedMemberships}"))
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(out).To(BeEmpty())
+			}, time.Minute, time.Second).Should(Succeed())
+
+			By("Verifying the manual grant was left untouched")
+			out, err = membership("mmanual")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(out).NotTo(BeEmpty(), "manual membership was revoked")
+
+			By("Deleting the Roles")
+			for _, res := range []string{"role.pgop.ruck.io/mapp", "role.pgop.ruck.io/mmanual", "role.pgop.ruck.io/mparent"} {
+				_, err = utils.Run(exec.Command("kubectl", "delete", "-n", namespace, "--wait=true", "--timeout=2m", res))
+				Expect(err).NotTo(HaveOccurred())
+			}
+		})
 	})
 
 	RegisterBackupTests()

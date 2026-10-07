@@ -194,6 +194,89 @@ var _ = Describe("Role Controller", func() {
 		})
 	})
 
+	Context("When a Role declares memberships", func() {
+		newMembershipRole := func(spec postgresv1alpha1.RoleSpec) *postgresv1alpha1.Role {
+			spec.ClusterRef = postgresv1alpha1.ClusterReference{Name: nonexistentCluster}
+			return &postgresv1alpha1.Role{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      fmt.Sprintf("membership-role-%d", time.Now().UnixNano()),
+					Namespace: RoleNamespace,
+				},
+				Spec: spec,
+			}
+		}
+
+		It("should round-trip memberships and default revokeRemovedMemberships to true", func() {
+			ctx := context.Background()
+			role := newMembershipRole(postgresv1alpha1.RoleSpec{
+				Memberships: []postgresv1alpha1.RoleMembership{
+					{Role: memParent, Inherit: new(false), Set: new(true)},
+					{Role: "admins", Admin: true},
+				},
+			})
+			Expect(k8sClient.Create(ctx, role)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, role) }()
+
+			got := &postgresv1alpha1.Role{}
+			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(role), got)).To(Succeed())
+			Expect(got.Spec.Memberships).To(Equal(role.Spec.Memberships))
+			Expect(got.Spec.RevokeRemovedMemberships).To(Equal(new(true)))
+			Expect(got.Spec.ShouldRevokeRemovedMemberships()).To(BeTrue())
+		})
+
+		It("should still accept the deprecated memberOf field alongside other memberships", func() {
+			ctx := context.Background()
+			role := newMembershipRole(postgresv1alpha1.RoleSpec{
+				MemberOf:                 []string{memLegacy},
+				Memberships:              []postgresv1alpha1.RoleMembership{{Role: memParent}},
+				RevokeRemovedMemberships: new(false),
+			})
+			Expect(k8sClient.Create(ctx, role)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, role) }()
+
+			got := &postgresv1alpha1.Role{}
+			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(role), got)).To(Succeed())
+			Expect(got.Spec.MemberOf).To(Equal([]string{memLegacy})) //nolint:staticcheck // exercising the deprecated field
+			Expect(got.Spec.ShouldRevokeRemovedMemberships()).To(BeFalse())
+		})
+
+		It("should reject a role listed in both memberOf and memberships", func() {
+			role := newMembershipRole(postgresv1alpha1.RoleSpec{
+				MemberOf:    []string{memLegacy, memParent},
+				Memberships: []postgresv1alpha1.RoleMembership{{Role: memParent}},
+			})
+			err := k8sClient.Create(context.Background(), role)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("must not be listed in both memberOf and memberships"))
+		})
+
+		It("should reject an update that adds a duplicate across the two fields", func() {
+			ctx := context.Background()
+			role := newMembershipRole(postgresv1alpha1.RoleSpec{MemberOf: []string{memParent}})
+			Expect(k8sClient.Create(ctx, role)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, role) }()
+
+			role.Spec.Memberships = []postgresv1alpha1.RoleMembership{{Role: memParent, Admin: true}}
+			err := k8sClient.Update(ctx, role)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("must not be listed in both memberOf and memberships"))
+		})
+
+		It("should reject the same role twice in memberships", func() {
+			role := newMembershipRole(postgresv1alpha1.RoleSpec{
+				Memberships: []postgresv1alpha1.RoleMembership{{Role: memParent}, {Role: memParent, Admin: true}},
+			})
+			Expect(k8sClient.Create(context.Background(), role)).NotTo(Succeed())
+		})
+
+		It("should reject an empty membership role", func() {
+			role := newMembershipRole(postgresv1alpha1.RoleSpec{
+				Memberships: []postgresv1alpha1.RoleMembership{{Role: ""}},
+			})
+			Expect(k8sClient.Create(context.Background(), role)).NotTo(Succeed())
+		})
+	})
+
 	Context("When a Role references a non-existent Cluster", func() {
 		It("should update status to not ready", func() {
 			ctx := context.Background()

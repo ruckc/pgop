@@ -93,10 +93,62 @@ spec:
                 description: login allows the role to log in (connect to the database)
                 type: boolean
               memberOf:
-                description: memberOf lists roles this role should be a member of
+                description: |-
+                  memberOf lists PostgreSQL roles this role should be a member of, granted
+                  with PostgreSQL's default options.
+
+                  Deprecated: use memberships instead. memberOf will be removed in a future
+                  API version. Each entry is treated as a memberships entry with only role
+                  set, and a role must not appear in both fields.
                 items:
+                  maxLength: 63
                   type: string
+                maxItems: 256
                 type: array
+              memberships:
+                description: |-
+                  memberships lists PostgreSQL roles this role should be a member of, with
+                  per-grant options. Memberships that pgop granted and that are later
+                  removed from the spec are revoked (see revokeRemovedMemberships);
+                  memberships granted outside pgop are never revoked.
+                items:
+                  description: RoleMembership declares that this role is a member
+                    of another PostgreSQL role.
+                  properties:
+                    admin:
+                      description: |-
+                        admin sets the grant's ADMIN option: whether the member may grant
+                        membership in the role to others. Defaults to false; a grant that has
+                        the ADMIN option while admin is false has it revoked.
+                      type: boolean
+                    inherit:
+                      description: |-
+                        inherit sets the grant's INHERIT option: whether the member automatically
+                        uses the privileges of the role. When unset, PostgreSQL's default applies
+                        for a new grant (the member's own inherit attribute) and an existing grant
+                        is left unchanged. Requires PostgreSQL 16 or later.
+                      type: boolean
+                    role:
+                      description: |-
+                        role is the PostgreSQL name of the role to be a member of (a raw
+                        PostgreSQL role name, not a Role resource name).
+                      maxLength: 63
+                      minLength: 1
+                      type: string
+                    set:
+                      description: |-
+                        set sets the grant's SET option: whether the member may SET ROLE to the
+                        role. When unset, PostgreSQL's default applies for a new grant (true) and
+                        an existing grant is left unchanged. Requires PostgreSQL 16 or later.
+                      type: boolean
+                  required:
+                  - role
+                  type: object
+                maxItems: 256
+                type: array
+                x-kubernetes-list-map-keys:
+                - role
+                x-kubernetes-list-type: map
               passwordSecretRef:
                 description: |-
                   passwordSecretRef references a Secret containing the password for this role.
@@ -114,6 +166,19 @@ spec:
                 type: object
               replication:
                 description: replication allows the role to initiate replication connections
+                type: boolean
+              revokeRemovedMemberships:
+                default: true
+                description: |-
+                  revokeRemovedMemberships controls whether memberships that pgop granted
+                  (tracked in status.managedMemberships) are revoked once they are removed
+                  from memberOf/memberships. Set it to false to keep the legacy grant-only
+                  behavior; memberships removed while it is false are no longer tracked and
+                  are never revoked later.
+
+                  This is a transitional opt-out: it will be removed together with the
+                  deprecated memberOf field, after which removed memberships are always
+                  revoked.
                 type: boolean
               roleName:
                 description: |-
@@ -142,6 +207,9 @@ spec:
             - message: roleName is immutable
               rule: has(oldSelf.roleName) == has(self.roleName) && (!has(self.roleName)
                 || self.roleName == oldSelf.roleName)
+            - message: a role must not be listed in both memberOf and memberships
+              rule: '!has(self.memberOf) || !has(self.memberships) || self.memberOf.all(r,
+                !self.memberships.exists(m, m.role == r))'
           status:
             description: status defines the observed state of Role
             properties:
@@ -205,6 +273,15 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              managedMemberships:
+                description: |-
+                  managedMemberships lists the PostgreSQL roles whose membership pgop has
+                  granted to this role. Only these are revoked when they are removed from
+                  the spec.
+                items:
+                  type: string
+                type: array
+                x-kubernetes-list-type: set
               ready:
                 description: ready indicates if the role has been created in the database
                 type: boolean
