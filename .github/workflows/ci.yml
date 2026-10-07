@@ -90,6 +90,20 @@ jobs:
           go mod tidy
           make test-e2e
 
+  check-conflict-markers:
+    name: Check conflict markers
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.3
+
+      - name: Fail on merge-conflict markers
+        run: |
+          if git grep -nE '^(<<<<<<< |>>>>>>> )' -- . ':!*.md'; then
+            echo "Unresolved merge-conflict markers found" >&2
+            exit 1
+          fi
+
   lint-helm:
     name: Lint Helm Chart
     runs-on: ubuntu-latest
@@ -105,7 +119,7 @@ jobs:
 
   prepare-release:
     name: Prepare Release
-    needs: [lint, test, test-e2e, lint-helm]
+    needs: [lint, test, test-e2e, lint-helm, check-conflict-markers]
     # Only run on main or manual dispatch, and skip if this push is itself a release merge
     if: |
       (github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch') &&
@@ -314,12 +328,18 @@ jobs:
             HIGHER="v${HIGHER}"
             CHART_VERSION="${HIGHER#v}"
 
+            # Start from main's copy so no conflict markers survive the stamp.
+            git checkout --ours -- charts/pgop/Chart.yaml
             echo "${HIGHER}" > VERSION
             sed -i "s/^version:.*/version: ${CHART_VERSION}/" charts/pgop/Chart.yaml
             sed -i "s/^appVersion:.*/appVersion: \"${HIGHER}\"/" charts/pgop/Chart.yaml
             cp config/crd/bases/*.yaml charts/pgop/crds/
             git add VERSION charts/pgop/Chart.yaml charts/pgop/crds/
 
+            if git grep -nE '^(<<<<<<<|=======$|>>>>>>>)' -- VERSION charts/ ':!charts/pgop/templates'; then
+              echo "Conflict markers remain after auto-resolution" >&2
+              exit 1
+            fi
             if git diff --name-only --diff-filter=U | grep -q .; then
               echo "Unresolved merge conflicts outside the version stamp:" >&2
               git diff --name-only --diff-filter=U >&2
