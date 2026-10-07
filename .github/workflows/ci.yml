@@ -119,7 +119,7 @@ jobs:
 
   prepare-release:
     name: Prepare Release
-    needs: [lint, test, test-e2e, lint-helm]
+    needs: [lint, test, test-e2e, lint-helm, check-conflict-markers]
     # Only run on main or manual dispatch, and skip if this push is itself a release merge
     if: |
       (github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch') &&
