@@ -11,6 +11,17 @@ on:
         required: false
         type: string
 
+# Serialize runs that can cut a release (pushes to main and manual dispatches)
+# so release branches are never cut from different main commits in parallel.
+# In-progress releases are never cancelled; a newer pending run supersedes an
+# older pending one, whose commits are picked up by the next release. Pull
+# request runs get a unique group (run_id) and are not serialized. The group
+# name must differ from the release job's own "release" group to avoid a
+# deadlock.
+concurrency:
+  group: ${{ github.event_name != 'pull_request' && format('{0}-main', github.workflow) || format('{0}-{1}', github.workflow, github.run_id) }}
+  cancel-in-progress: false
+
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
@@ -116,6 +127,9 @@ jobs:
 
       - name: Lint chart
         run: helm lint charts/pgop --strict
+
+      - name: Test release merge script
+        run: hack/test-release-merge.sh
 
   prepare-release:
     name: Prepare Release
@@ -315,38 +329,9 @@ jobs:
           git fetch origin main
           git checkout main
 
-          # The release branch only ever bumps the version stamp on top of the
-          # main it was cut from. When several releases are in flight, main can
-          # advance to a newer version before this merge runs, so VERSION /
-          # Chart.yaml / the vendored CRDs conflict. Auto-resolve those files by
-          # taking the HIGHER of the two versions so main never regresses, and
-          # fail loudly on any other (unexpected) conflict.
-          if ! git merge --no-ff "origin/${BRANCH}" -m "chore: release ${VERSION}"; then
-            MAIN_VERSION=$(git show HEAD:VERSION 2>/dev/null | tr -d '[:space:]')
-            MAIN_VERSION="${MAIN_VERSION:-v0.0.0}"
-            HIGHER=$(printf '%s\n%s\n' "${MAIN_VERSION#v}" "${VERSION#v}" | sort -V | tail -1)
-            HIGHER="v${HIGHER}"
-            CHART_VERSION="${HIGHER#v}"
-
-            # Start from main's copy so no conflict markers survive the stamp.
-            git checkout --ours -- charts/pgop/Chart.yaml
-            echo "${HIGHER}" > VERSION
-            sed -i "s/^version:.*/version: ${CHART_VERSION}/" charts/pgop/Chart.yaml
-            sed -i "s/^appVersion:.*/appVersion: \"${HIGHER}\"/" charts/pgop/Chart.yaml
-            cp config/crd/bases/*.yaml charts/pgop/crds/
-            git add VERSION charts/pgop/Chart.yaml charts/pgop/crds/
-
-            if git grep -nE '^(<<<<<<<|=======$|>>>>>>>)' -- VERSION charts/ ':!charts/pgop/templates'; then
-              echo "Conflict markers remain after auto-resolution" >&2
-              exit 1
-            fi
-            if git diff --name-only --diff-filter=U | grep -q .; then
-              echo "Unresolved merge conflicts outside the version stamp:" >&2
-              git diff --name-only --diff-filter=U >&2
-              exit 1
-            fi
-            git commit --no-edit
-          fi
+          # Merges the release branch and auto-resolves VERSION / Chart.yaml /
+          # CRD conflicts (higher version wins). See hack/release-merge.sh.
+          hack/release-merge.sh "${VERSION}" "origin/${BRANCH}"
           git push origin main
 
       - name: Delete release branch
