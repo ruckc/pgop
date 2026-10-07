@@ -56,7 +56,7 @@ type RetentionSpec struct {
 	// disabled prevents the operator from deleting old backups.
 	// Set to true when using write-only credentials to avoid ransomware exposure.
 	// +kubebuilder:default=true
-	Disabled bool `json:"disabled,omitempty"`
+	Disabled *bool `json:"disabled,omitempty"`
 
 	// keepLast retains the most recent N backups (requires disabled=false)
 	// +optional

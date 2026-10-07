@@ -88,8 +88,9 @@ func (r *DatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 				log.Info("Cluster not found during deletion, skipping PG cleanup")
 			}
 
+			base := database.DeepCopy()
 			controllerutil.RemoveFinalizer(database, databaseFinalizer)
-			if err := r.Update(ctx, database); err != nil {
+			if err := r.Patch(ctx, database, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})); err != nil {
 				return ctrl.Result{}, err
 			}
 		}
@@ -119,8 +120,9 @@ func (r *DatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 
 	// Add finalizer if not present
 	if !controllerutil.ContainsFinalizer(database, databaseFinalizer) {
+		base := database.DeepCopy()
 		controllerutil.AddFinalizer(database, databaseFinalizer)
-		if err := r.Update(ctx, database); err != nil {
+		if err := r.Patch(ctx, database, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})); err != nil {
 			return ctrl.Result{}, err
 		}
 	}

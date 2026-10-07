@@ -24,6 +24,8 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -73,10 +75,10 @@ var _ = Describe("Role Controller", func() {
 					ClusterRef: postgresv1alpha1.ClusterReference{
 						Name: clusterName,
 					},
-					Login:           true,
+					Login:           new(true),
 					Superuser:       false,
 					CreateDB:        true,
-					ConnectionLimit: 10,
+					ConnectionLimit: new(int32(10)),
 				},
 			}
 			Expect(k8sClient.Create(ctx, role)).To(Succeed())
@@ -90,9 +92,9 @@ var _ = Describe("Role Controller", func() {
 			By("Verifying the Role was created")
 			err := k8sClient.Get(ctx, types.NamespacedName{Name: roleName, Namespace: RoleNamespace}, role)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(role.Spec.Login).To(BeTrue())
+			Expect(role.Spec.IsLogin()).To(BeTrue())
 			Expect(role.Spec.CreateDB).To(BeTrue())
-			Expect(role.Spec.ConnectionLimit).To(Equal(int32(10)))
+			Expect(role.Spec.GetConnectionLimit()).To(Equal(int32(10)))
 
 			By("Verifying the cluster reference")
 			Expect(role.Spec.ClusterRef.Name).To(Equal(clusterName))
@@ -131,7 +133,7 @@ var _ = Describe("Role Controller", func() {
 					ClusterRef: postgresv1alpha1.ClusterReference{
 						Name: clusterName,
 					},
-					Login: true,
+					Login: new(true),
 				},
 			}
 			Expect(k8sClient.Create(ctx, role)).To(Succeed())
@@ -158,6 +160,40 @@ var _ = Describe("Role Controller", func() {
 		})
 	})
 
+	Context("When a Role sets defaulted attributes to false/zero", func() {
+		It("should preserve them across the finalizer patch", func() {
+			ctx := context.Background()
+			roleName := fmt.Sprintf("group-role-%d", time.Now().UnixNano())
+			role := &postgresv1alpha1.Role{
+				ObjectMeta: metav1.ObjectMeta{Name: roleName, Namespace: RoleNamespace},
+				Spec: postgresv1alpha1.RoleSpec{
+					ClusterRef:      postgresv1alpha1.ClusterReference{Name: nonexistentCluster},
+					Login:           new(false),
+					Inherit:         new(false),
+					ConnectionLimit: new(int32(0)),
+				},
+			}
+			Expect(k8sClient.Create(ctx, role)).To(Succeed())
+			defer func() {
+				role.Finalizers = nil
+				_ = k8sClient.Update(ctx, role)
+				_ = k8sClient.Delete(ctx, role)
+			}()
+
+			By("Patching the finalizer the way the controller does")
+			base := role.DeepCopy()
+			controllerutil.AddFinalizer(role, roleFinalizer)
+			Expect(k8sClient.Patch(ctx, role, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{}))).To(Succeed())
+
+			got := &postgresv1alpha1.Role{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: roleName, Namespace: RoleNamespace}, got)).To(Succeed())
+			Expect(got.Spec.IsLogin()).To(BeFalse())
+			Expect(got.Spec.IsInherit()).To(BeFalse())
+			Expect(got.Spec.GetConnectionLimit()).To(Equal(int32(0)))
+			Expect(got.Finalizers).To(ContainElement(roleFinalizer))
+		})
+	})
+
 	Context("When a Role references a non-existent Cluster", func() {
 		It("should update status to not ready", func() {
 			ctx := context.Background()
@@ -173,7 +209,7 @@ var _ = Describe("Role Controller", func() {
 					ClusterRef: postgresv1alpha1.ClusterReference{
 						Name: nonexistentCluster,
 					},
-					Login: true,
+					Login: new(true),
 				},
 			}
 			Expect(k8sClient.Create(ctx, role)).To(Succeed())

@@ -90,8 +90,9 @@ func (r *RoleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 			}
 
 			// Secret will be garbage collected due to owner reference
+			base := role.DeepCopy()
 			controllerutil.RemoveFinalizer(role, roleFinalizer)
-			if err := r.Update(ctx, role); err != nil {
+			if err := r.Patch(ctx, role, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})); err != nil {
 				return ctrl.Result{}, err
 			}
 		}
@@ -121,29 +122,34 @@ func (r *RoleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 
 	// Add finalizer if not present
 	if !controllerutil.ContainsFinalizer(role, roleFinalizer) {
+		base := role.DeepCopy()
 		controllerutil.AddFinalizer(role, roleFinalizer)
-		if err := r.Update(ctx, role); err != nil {
+		if err := r.Patch(ctx, role, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
 
 	// Reconcile credentials secret and get password
-	password, secretName, err := r.reconcileCredentialsSecret(ctx, role, cluster)
-	if err != nil {
-		log.Error(err, "Failed to reconcile credentials secret")
-		return r.updateStatus(ctx, role, false, "", err)
+	// NOLOGIN (group) roles get no password and no credentials Secret.
+	var password, secretName string
+	if role.Spec.IsLogin() {
+		password, secretName, err = r.reconcileCredentialsSecret(ctx, role, cluster)
+		if err != nil {
+			log.Error(err, "Failed to reconcile credentials secret")
+			return r.updateStatus(ctx, role, false, "", err)
+		}
 	}
 
 	// Create or update the role
 	opts := postgres.RoleOptions{
-		Login:           role.Spec.Login,
+		Login:           role.Spec.IsLogin(),
 		Superuser:       role.Spec.Superuser,
 		CreateDB:        role.Spec.CreateDB,
 		CreateRole:      role.Spec.CreateRole,
-		Inherit:         role.Spec.Inherit,
+		Inherit:         role.Spec.IsInherit(),
 		Replication:     role.Spec.Replication,
 		BypassRLS:       role.Spec.BypassRLS,
-		ConnectionLimit: role.Spec.ConnectionLimit,
+		ConnectionLimit: role.Spec.GetConnectionLimit(),
 		Password:        password,
 	}
 

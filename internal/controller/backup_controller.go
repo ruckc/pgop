@@ -75,8 +75,9 @@ func (r *BackupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 
 	if backup.DeletionTimestamp != nil {
 		if controllerutil.ContainsFinalizer(backup, backupFinalizer) {
+			base := backup.DeepCopy()
 			controllerutil.RemoveFinalizer(backup, backupFinalizer)
-			if err := r.Update(ctx, backup); err != nil {
+			if err := r.Patch(ctx, backup, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})); err != nil {
 				return ctrl.Result{}, err
 			}
 		}
@@ -84,8 +85,9 @@ func (r *BackupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	}
 
 	if !controllerutil.ContainsFinalizer(backup, backupFinalizer) {
+		base := backup.DeepCopy()
 		controllerutil.AddFinalizer(backup, backupFinalizer)
-		if err := r.Update(ctx, backup); err != nil {
+		if err := r.Patch(ctx, backup, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})); err != nil {
 			return ctrl.Result{}, err
 		}
 	}

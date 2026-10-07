@@ -31,3 +31,4 @@ go.work
 *.log
 coverage/
 *.out
+coverage-dump
