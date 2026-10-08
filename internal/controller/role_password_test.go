@@ -1,0 +1,392 @@
+/*
+Copyright 2026.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controller
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	postgresv1alpha1 "github.com/ruckc/pgop/api/v1alpha1"
+	"github.com/ruckc/pgop/internal/postgres"
+)
+
+const (
+	testCurrentPassword = "current-password"
+	testRefPassword     = "from-the-ref"
+	testPasswordKey     = "pass"
+)
+
+// Pure password selection and rotation scheduling (issue #25).
+var _ = Describe("Role password selection", func() {
+	now := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
+
+	newRole := func() *postgresv1alpha1.Role {
+		return &postgresv1alpha1.Role{ObjectMeta: metav1.ObjectMeta{Name: "app", UID: "uid-1"}}
+	}
+	withRotation := func(role *postgresv1alpha1.Role, every time.Duration, rotatedAt *time.Time) *postgresv1alpha1.Role {
+		role.Spec.PasswordRotation = &postgresv1alpha1.PasswordRotationSpec{Every: metav1.Duration{Duration: every}}
+		if rotatedAt != nil {
+			role.Status.PasswordRotatedAt = new(metav1.NewTime(*rotatedAt))
+		}
+		return role
+	}
+
+	It("uses the referenced password", func() {
+		dp, err := choosePassword(newRole(), true, testRefPassword, testCurrentPassword, now)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(dp).To(Equal(desiredPassword{value: testRefPassword, fromRef: true}))
+	})
+
+	It("re-applies the referenced password on a rotate-password request", func() {
+		role := newRole()
+		role.Annotations = map[string]string{AnnotationRotatePassword: "1"}
+		dp, err := choosePassword(role, true, testRefPassword, testCurrentPassword, now)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(dp).To(Equal(desiredPassword{value: testRefPassword, fromRef: true, force: true, rotationRequest: "1"}))
+	})
+
+	It("generates a password when there is none", func() {
+		dp, err := choosePassword(newRole(), false, "", "", now)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(dp.value).To(HaveLen(rolePasswordLength))
+		Expect(dp.generated).To(BeTrue())
+		Expect(dp.rotated).To(BeFalse())
+	})
+
+	It("keeps the current password without rotation", func() {
+		dp, err := choosePassword(newRole(), false, "", testCurrentPassword, now)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(dp).To(Equal(desiredPassword{value: testCurrentPassword}))
+	})
+
+	It("keeps the current password and starts the schedule when no rotation time is known", func() {
+		role := withRotation(newRole(), time.Hour, nil)
+		dp, err := choosePassword(role, false, "", testCurrentPassword, now)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(dp).To(Equal(desiredPassword{value: testCurrentPassword}))
+		recordPassword(role, dp, now)
+		Expect(role.Status.PasswordRotatedAt.Time).To(Equal(now))
+		Expect(nextRotationIn(role, now)).To(Equal(time.Hour))
+	})
+
+	It("keeps the current password until rotation is due and requeues for it", func() {
+		rotatedAt := now.Add(-20 * time.Hour)
+		role := withRotation(newRole(), 24*time.Hour, &rotatedAt)
+		dp, err := choosePassword(role, false, "", testCurrentPassword, now)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(dp).To(Equal(desiredPassword{value: testCurrentPassword}))
+		Expect(nextRotationIn(role, now)).To(Equal(4 * time.Hour))
+	})
+
+	It("rotates once the interval has elapsed", func() {
+		rotatedAt := now.Add(-24 * time.Hour)
+		role := withRotation(newRole(), 24*time.Hour, &rotatedAt)
+		dp, err := choosePassword(role, false, "", testCurrentPassword, now)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(dp.value).NotTo(Equal(testCurrentPassword))
+		Expect(dp.generated).To(BeTrue())
+		Expect(dp.rotated).To(BeTrue())
+
+		recordPassword(role, dp, now)
+		Expect(role.Status.PasswordRotatedAt.Time).To(Equal(now))
+		Expect(nextRotationIn(role, now)).To(Equal(24 * time.Hour))
+	})
+
+	It("never rotates more often than the minimum interval", func() {
+		rotatedAt := now.Add(-30 * time.Minute)
+		role := withRotation(newRole(), time.Minute, &rotatedAt)
+		Expect(scheduledRotationDue(role, now)).To(BeFalse())
+		Expect(nextRotationIn(role, now)).To(Equal(30 * time.Minute))
+	})
+
+	It("rotates once per new rotate-password annotation value", func() {
+		role := newRole()
+		role.Annotations = map[string]string{AnnotationRotatePassword: "incident-42"}
+		dp, err := choosePassword(role, false, "", testCurrentPassword, now)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(dp.rotated).To(BeTrue())
+		Expect(dp.rotationRequest).To(Equal("incident-42"))
+
+		recordPassword(role, dp, now)
+		Expect(role.Status.PasswordRotationRequest).To(Equal("incident-42"))
+		dp, err = choosePassword(role, false, "", dp.value, now)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(dp.rotated).To(BeFalse())
+	})
+
+	It("records the rotate-password request that came with the initial password", func() {
+		role := newRole()
+		role.Annotations = map[string]string{AnnotationRotatePassword: "x"}
+		dp, err := choosePassword(role, false, "", "", now)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(dp.rotated).To(BeFalse())
+		recordPassword(role, dp, now)
+		Expect(role.Status.PasswordRotationRequest).To(Equal("x"))
+	})
+
+	It("clears the rotation time while the password comes from a Secret", func() {
+		rotatedAt := now.Add(-time.Hour)
+		role := newRole()
+		role.Status.PasswordRotatedAt = new(metav1.NewTime(rotatedAt))
+		recordPassword(role, desiredPassword{value: testRefPassword, fromRef: true}, now)
+		Expect(role.Status.PasswordRotatedAt).To(BeNil())
+		Expect(nextRotationIn(role, now)).To(BeZero())
+	})
+
+	It("records a salted fingerprint, not the password", func() {
+		role := newRole()
+		recordPassword(role, desiredPassword{value: testRefPassword, fromRef: true}, now)
+		Expect(role.Status.PasswordHash).To(HaveLen(64))
+		Expect(role.Status.PasswordHash).NotTo(ContainSubstring(testRefPassword))
+		Expect(role.Status.PasswordHash).To(Equal(passwordFingerprint(role, testRefPassword)))
+
+		other := newRole()
+		other.UID = "uid-2"
+		Expect(passwordFingerprint(other, testRefPassword)).NotTo(Equal(role.Status.PasswordHash))
+		Expect(passwordFingerprint(role, "different")).NotTo(Equal(role.Status.PasswordHash))
+	})
+})
+
+var _ = Describe("Role password Secrets", func() {
+	const ns = "default"
+
+	var (
+		ctx    context.Context
+		suffix string
+	)
+
+	BeforeEach(func() {
+		ctx = context.Background()
+		suffix = fmt.Sprintf("%d", time.Now().UnixNano())
+	})
+
+	cleanup := func(obj client.Object) {
+		DeferCleanup(func() {
+			obj.SetFinalizers(nil)
+			_ = k8sClient.Update(ctx, obj)
+			_ = k8sClient.Delete(ctx, obj)
+		})
+	}
+	newRole := func(name string) *postgresv1alpha1.Role {
+		return &postgresv1alpha1.Role{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec:       postgresv1alpha1.RoleSpec{ClusterRef: postgresv1alpha1.ClusterReference{Name: nonexistentCluster}},
+		}
+	}
+	createSecret := func(name string, data map[string][]byte) *corev1.Secret {
+		s := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}, Data: data}
+		Expect(k8sClient.Create(ctx, s)).To(Succeed())
+		cleanup(s)
+		return s
+	}
+	getSecret := func(name string) *corev1.Secret {
+		s := &corev1.Secret{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, s)).To(Succeed())
+		return s
+	}
+	rr := func() *RoleReconciler { return &RoleReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()} }
+
+	Context("API validation", func() {
+		It("accepts a rotation interval of at least 1h", func() {
+			role := newRole("rot-ok-" + suffix)
+			role.Spec.PasswordRotation = &postgresv1alpha1.PasswordRotationSpec{Every: metav1.Duration{Duration: 720 * time.Hour}}
+			Expect(k8sClient.Create(ctx, role)).To(Succeed())
+			cleanup(role)
+		})
+
+		It("rejects a rotation interval below 1h", func() {
+			role := newRole("rot-short-" + suffix)
+			role.Spec.PasswordRotation = &postgresv1alpha1.PasswordRotationSpec{Every: metav1.Duration{Duration: 30 * time.Minute}}
+			err := k8sClient.Create(ctx, role)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("must be at least 1h"))
+		})
+
+		It("rejects passwordRotation together with passwordSecretRef", func() {
+			role := newRole("rot-ref-" + suffix)
+			role.Spec.PasswordRotation = &postgresv1alpha1.PasswordRotationSpec{Every: metav1.Duration{Duration: 24 * time.Hour}}
+			role.Spec.PasswordSecretRef = &postgresv1alpha1.SecretKeySelector{Name: "pw", Key: "password"}
+			err := k8sClient.Create(ctx, role)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("cannot be combined with passwordSecretRef"))
+		})
+	})
+
+	Context("passwordSecretRef", func() {
+		It("reads the referenced key and reports a missing Secret or key", func() {
+			role := newRole("ref-" + suffix)
+			role.Spec.PasswordSecretRef = &postgresv1alpha1.SecretKeySelector{Name: "pw-" + suffix, Key: testPasswordKey}
+
+			_, err := rr().readPasswordSecretRef(ctx, role)
+			ce, ok := errors.AsType[*conditionError](err)
+			Expect(ok).To(BeTrue())
+			Expect(ce.reason).To(Equal(ReasonPasswordSecretNotFound))
+
+			createSecret("pw-"+suffix, map[string][]byte{"unrelated-key": []byte("x")})
+			_, err = rr().readPasswordSecretRef(ctx, role)
+			ce, ok = errors.AsType[*conditionError](err)
+			Expect(ok).To(BeTrue())
+			Expect(ce.reason).To(Equal(ReasonPasswordSecretNotFound))
+
+			s := getSecret("pw-" + suffix)
+			s.Data["pass"] = []byte(testRefPassword)
+			Expect(k8sClient.Update(ctx, s)).To(Succeed())
+			pw, err := rr().readPasswordSecretRef(ctx, role)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(pw).To(Equal(testRefPassword))
+		})
+
+		It("sets the Available reason to PasswordSecretNotFound", func() {
+			role := newRole("ref-status-" + suffix)
+			role.Spec.PasswordSecretRef = &postgresv1alpha1.SecretKeySelector{Name: "missing-" + suffix, Key: testPasswordKey}
+			Expect(k8sClient.Create(ctx, role)).To(Succeed())
+			cleanup(role)
+
+			_, err := rr().readPasswordSecretRef(ctx, role)
+			Expect(err).To(HaveOccurred())
+			res, uerr := rr().updateStatus(ctx, role, false, "", err)
+			Expect(uerr).NotTo(HaveOccurred())
+			Expect(res.RequeueAfter).To(BeNumerically(">", 0))
+			cond := meta.FindStatusCondition(role.Status.Conditions, ConditionTypeAvailable)
+			Expect(cond).NotTo(BeNil())
+			Expect(cond.Reason).To(Equal(ReasonPasswordSecretNotFound))
+		})
+
+		It("maps a referenced Secret to the Roles using it", func() {
+			role := newRole("ref-map-" + suffix)
+			role.Spec.PasswordSecretRef = &postgresv1alpha1.SecretKeySelector{Name: "app-pw-" + suffix, Key: testPasswordKey}
+			Expect(k8sClient.Create(ctx, role)).To(Succeed())
+			cleanup(role)
+			plain := newRole("ref-plain-" + suffix)
+			Expect(k8sClient.Create(ctx, plain)).To(Succeed())
+			cleanup(plain)
+
+			reqs := rr().rolesForPasswordSecret(ctx, &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "app-pw-" + suffix, Namespace: ns}})
+			Expect(reqs).To(ConsistOf(reconcileRequest(role)))
+			Expect(rr().rolesForPasswordSecret(ctx, &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "unrelated-" + suffix, Namespace: ns}})).To(BeEmpty())
+		})
+	})
+
+	Context("rotation with a stale cached Role", func() {
+		It("re-reads the Role and does not rotate twice", func() {
+			role := newRole("stale-" + suffix)
+			role.Annotations = map[string]string{AnnotationRotatePassword: "req-1"}
+			Expect(k8sClient.Create(ctx, role)).To(Succeed())
+			cleanup(role)
+			stale := role.DeepCopy()
+
+			By("recording on the server that the request was handled")
+			role.Status.PasswordRotationRequest = "req-1"
+			Expect(k8sClient.Status().Update(ctx, role)).To(Succeed())
+
+			existing := &corev1.Secret{Data: map[string][]byte{SecretKeyPassword: []byte(testCurrentPassword)}}
+
+			withoutReader := stale.DeepCopy()
+			dp, err := rr().resolvePassword(ctx, withoutReader, existing, time.Now())
+			Expect(err).NotTo(HaveOccurred())
+			Expect(dp.rotated).To(BeTrue(), "the stale Role alone asks for a rotation")
+
+			r := rr()
+			r.APIReader = k8sClient
+			dp, err = r.resolvePassword(ctx, stale, existing, time.Now())
+			Expect(err).NotTo(HaveOccurred())
+			Expect(dp).To(Equal(desiredPassword{value: testCurrentPassword}))
+			Expect(stale.Status.PasswordRotationRequest).To(Equal("req-1"))
+			Expect(stale.ResourceVersion).To(Equal(role.ResourceVersion))
+		})
+	})
+
+	Context("credentials Secrets", func() {
+		It("updates the password and uri of the role Secret and the Database Secret follows", func() {
+			cluster := &postgresv1alpha1.Cluster{
+				ObjectMeta: metav1.ObjectMeta{Name: "pw-cluster-" + suffix, Namespace: ns},
+				Spec:       postgresv1alpha1.ClusterSpec{Image: DefaultPostgresImage},
+			}
+			Expect(k8sClient.Create(ctx, cluster)).To(Succeed())
+			cleanup(cluster)
+			role := newRole("pw-owner-" + suffix)
+			role.Spec.ClusterRef.Name = cluster.Name
+			Expect(k8sClient.Create(ctx, role)).To(Succeed())
+			cleanup(role)
+
+			secretName, err := rr().reconcileCredentialsSecret(ctx, role, cluster, nil, "old-password")
+			Expect(err).NotTo(HaveOccurred())
+			s := getSecret(secretName)
+			Expect(isRoleCredentialsSecret(s)).To(BeTrue())
+			Expect(string(s.Data[SecretKeyURI])).To(ContainSubstring(":old-password@"))
+
+			db := &postgresv1alpha1.Database{
+				ObjectMeta: metav1.ObjectMeta{Name: "pw-db-" + suffix, Namespace: ns},
+				Spec: postgresv1alpha1.DatabaseSpec{
+					ClusterRef: postgresv1alpha1.ClusterReference{Name: cluster.Name}, Owner: role.Name},
+			}
+			Expect(k8sClient.Create(ctx, db)).To(Succeed())
+			cleanup(db)
+			otherCluster := db.DeepCopy()
+			otherCluster.ObjectMeta = metav1.ObjectMeta{Name: "pw-db-other-" + suffix, Namespace: ns}
+			otherCluster.Spec.ClusterRef.Name = nonexistentCluster
+			Expect(k8sClient.Create(ctx, otherCluster)).To(Succeed())
+			cleanup(otherCluster)
+
+			dr := &DatabaseReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+			Expect(dr.reconcileCredentialsSecret(ctx, db, role, cluster)).To(Succeed())
+			dbSecretName := db.Name + "-" + role.Name + "-credentials"
+			Expect(string(getSecret(dbSecretName).Data[SecretKeyPassword])).To(Equal("old-password"))
+
+			By("changing the password")
+			_, err = rr().reconcileCredentialsSecret(ctx, role, cluster, s, "new-password")
+			Expect(err).NotTo(HaveOccurred())
+			s = getSecret(secretName)
+			Expect(string(s.Data[SecretKeyPassword])).To(Equal("new-password"))
+			Expect(string(s.Data[SecretKeyUsername])).To(Equal(role.Name))
+			Expect(string(s.Data[SecretKeyURI])).To(ContainSubstring(":new-password@"))
+			Expect(string(s.Data[SecretKeyURI])).NotTo(ContainSubstring("old-password"))
+
+			By("mapping the role Secret to the Databases it owns on the same Cluster")
+			Expect(dr.databasesForRoleSecret(ctx, s)).To(ConsistOf(reconcileRequest(db)))
+			Expect(dr.databasesForRoleSecret(ctx, &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "x", Namespace: ns}})).To(BeEmpty())
+
+			Expect(dr.reconcileCredentialsSecret(ctx, db, role, cluster)).To(Succeed())
+			dbSecret := getSecret(dbSecretName)
+			Expect(string(dbSecret.Data[SecretKeyPassword])).To(Equal("new-password"))
+			Expect(string(dbSecret.Data[SecretKeyURI])).To(ContainSubstring(":new-password@"))
+		})
+
+		It("restores the labels of a role Secret that lost them", func() {
+			cluster := &postgresv1alpha1.Cluster{ObjectMeta: metav1.ObjectMeta{Name: "lbl-" + suffix}}
+			role := newRole("lbl-role-" + suffix)
+			s := &corev1.Secret{Data: map[string][]byte{SecretKeyPassword: []byte("p")}}
+			Expect(convergeRoleSecret(s, role, "p", "h", 5432, clientTLS{SSLMode: postgres.SSLModeDisable})).To(BeTrue())
+			Expect(isRoleCredentialsSecret(s)).To(BeTrue())
+			Expect(convergeRoleSecret(s, role, "p", "h", 5432, clientTLS{SSLMode: postgres.SSLModeDisable})).To(BeFalse())
+			Expect(credentialsSecretName(role, cluster)).To(Equal("lbl-" + suffix + "-" + role.Name + "-credentials"))
+		})
+	})
+})

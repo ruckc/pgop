@@ -109,6 +109,11 @@ type RoleOptions struct {
 	BypassRLS       bool
 	ConnectionLimit int32
 	Password        string
+	// KeepExistingPassword omits PASSWORD from ALTER ROLE when the role
+	// already exists, so an unchanged password is not re-sent (it would
+	// otherwise show up in server logs with log_statement=ddl). A newly
+	// created role always gets Password.
+	KeepExistingPassword bool
 }
 
 // CreateRole creates a new PostgreSQL role with the given options
@@ -120,19 +125,24 @@ func (c *Client) CreateRole(ctx context.Context, name string, opts RoleOptions) 
 		return fmt.Errorf("failed to check role existence: %w", err)
 	}
 
-	var query string
-	if exists {
-		query = c.buildAlterRoleQuery(name, opts)
-	} else {
-		query = c.buildCreateRoleQuery(name, opts)
-	}
-
-	_, err = c.db.ExecContext(ctx, query)
+	_, err = c.db.ExecContext(ctx, c.buildRoleQuery(name, exists, opts))
 	if err != nil {
 		return fmt.Errorf("failed to create/alter role: %w", err)
 	}
 
 	return nil
+}
+
+// buildRoleQuery returns the CREATE ROLE (role absent) or ALTER ROLE (role
+// present) statement for opts.
+func (c *Client) buildRoleQuery(name string, exists bool, opts RoleOptions) string {
+	if !exists {
+		return c.buildCreateRoleQuery(name, opts)
+	}
+	if opts.KeepExistingPassword {
+		opts.Password = ""
+	}
+	return c.buildAlterRoleQuery(name, opts)
 }
 
 func (c *Client) buildCreateRoleQuery(name string, opts RoleOptions) string {
