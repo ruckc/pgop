@@ -35,6 +35,9 @@ const (
 	scramSaltLen = 16
 	// scramPrefix starts every SCRAM-SHA-256 verifier PostgreSQL stores.
 	scramPrefix = "SCRAM-SHA-256$"
+	// zeroWidthSpace is U+200B, the only character in both RFC 3454 table
+	// C.1.2 (non-ASCII space) and table B.1 (commonly mapped to nothing).
+	zeroWidthSpace = 0x200b
 )
 
 // IsPreHashedPassword reports whether PostgreSQL would treat password as an
@@ -69,7 +72,13 @@ func saslPrep(password string) string {
 	if ascii {
 		return password
 	}
-	prepped, err := stringprep.SASLprep.Prepare(password)
+	// RFC 4013 maps non-ASCII spaces (RFC 3454 C.1.2) to SPACE before
+	// removing "commonly mapped to nothing" characters (B.1), and so does
+	// pg_saslprep. stringprep applies B.1 first, which matters only for
+	// U+200B ZERO WIDTH SPACE, the one character in both tables: map it to
+	// SPACE first so the verifier matches the one libpq clients derive.
+	mapped := strings.ReplaceAll(password, string(rune(zeroWidthSpace)), " ")
+	prepped, err := stringprep.SASLprep.Prepare(mapped)
 	if err != nil || prepped == "" {
 		return password
 	}

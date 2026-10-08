@@ -293,10 +293,17 @@ until a rotation is due or requested.
   SCRAM-SHA-256 verifier (random salt, 4096 iterations, SASLprep like
   PostgreSQL) and sends `PASSWORD 'SCRAM-SHA-256$...'`, which PostgreSQL stores
   as-is whatever `password_encryption` is set to. The plaintext therefore
-  never appears in server logs, even when a statement fails and is logged
-  (`log_min_error_statement`) or with `log_statement=ddl`; at most the
-  verifier does. Clients authenticate with `scram-sha-256` (or `md5`/`password`
-  `pg_hba.conf` methods, which also accept SCRAM verifiers).
+  never appears in server logs. Clients authenticate with `scram-sha-256` (or
+  `md5`/`password` `pg_hba.conf` methods, which also accept SCRAM verifiers).
+
+!!! warning "Server logs still contain the verifier"
+    With `log_statement=ddl` (or `all`), and for a failing statement with the
+    default `log_min_error_statement=error`, the `CREATE ROLE`/`ALTER ROLE`
+    statement is logged **with the SCRAM verifier**. A verifier is not the
+    password, but it is sensitive: it can be attacked offline (only 4096
+    PBKDF2 iterations, PostgreSQL's default), and its ServerKey lets whoever
+    holds it impersonate the server to clients. Treat PostgreSQL logs that may
+    contain role DDL as secret, like `pg_authid`.
 - `ALTER ROLE ... PASSWORD` is only sent when the password changed. The
   operator tells by a salted SHA-256 fingerprint in the
   `pgop.ruck.io/password-fingerprint` annotation of the credentials Secret,
@@ -313,7 +320,11 @@ until a rotation is due or requested.
 !!! note
     Editing `password` in the operator-managed credentials Secret directly sets
     that password in PostgreSQL on the next reconcile, unless
-    `passwordSecretRef` is set, in which case the referenced value wins.
+    `passwordSecretRef` is set, in which case the referenced value wins. An
+    edited password gets the same checks as a `passwordSecretRef` value (UTF-8,
+    no NUL byte, not pre-hashed); one that fails them is not set and the Role
+    reports `Available=False` with reason `PasswordSecretInvalid` until the
+    Secret is fixed.
 
 ### Security: who can read a `passwordSecretRef` Secret
 

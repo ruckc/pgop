@@ -206,21 +206,40 @@ func (r *RoleReconciler) readPasswordSecretRef(ctx context.Context, role *postgr
 		return "", &conditionError{reason: ReasonPasswordSecretNotFound,
 			err: fmt.Errorf("password Secret %q has no (or an empty) key %q", ref.Name, ref.Key)}
 	}
-	// The messages never include the value.
-	var problem string
-	switch {
-	case !utf8.Valid(pw):
-		problem = "is not valid UTF-8"
-	case bytes.IndexByte(pw, 0) >= 0:
-		problem = "contains a NUL byte"
-	case postgres.IsPreHashedPassword(string(pw)):
-		problem = "looks like a pre-hashed password (a SCRAM-SHA-256 verifier or MD5 hash); set the plaintext password"
-	}
-	if problem != "" {
+	if problem := passwordProblem(pw); problem != "" {
 		return "", &conditionError{reason: ReasonPasswordSecretInvalid,
 			err: fmt.Errorf("the value of key %q in password Secret %q %s", ref.Key, ref.Name, problem)}
 	}
 	return string(pw), nil
+}
+
+// passwordProblem returns why pw cannot be used as a password, or "". The
+// result never includes the value.
+func passwordProblem(pw []byte) string {
+	switch {
+	case !utf8.Valid(pw):
+		return "is not valid UTF-8"
+	case bytes.IndexByte(pw, 0) >= 0:
+		return "contains a NUL byte"
+	case postgres.IsPreHashedPassword(string(pw)):
+		return "looks like a pre-hashed password (a SCRAM-SHA-256 verifier or MD5 hash); set the plaintext password"
+	}
+	return ""
+}
+
+// checkEditedPassword rejects a password that was edited into the
+// credentials Secret by hand (it is about to be set in PostgreSQL but was
+// neither generated nor taken from passwordSecretRef) when it is unusable,
+// the same way passwordSecretRef values are checked.
+func checkEditedPassword(dp desiredPassword, secret *corev1.Secret) error {
+	if dp.generated || dp.fromRef || dp.applied || secret == nil {
+		return nil
+	}
+	if problem := passwordProblem([]byte(dp.value)); problem != "" {
+		return &conditionError{reason: ReasonPasswordSecretInvalid,
+			err: fmt.Errorf("the %q key of credentials Secret %q %s", SecretKeyPassword, secret.Name, problem)}
+	}
+	return nil
 }
 
 // resolvePassword returns the password the Role should have and the
@@ -228,6 +247,16 @@ func (r *RoleReconciler) readPasswordSecretRef(ctx context.Context, role *postgr
 // read from the cache, or nil when it does not exist yet; the returned Secret
 // is a fresh read of it when the cached one could be stale.
 func (r *RoleReconciler) resolvePassword(ctx context.Context, role *postgresv1alpha1.Role, existing *corev1.Secret, now time.Time) (desiredPassword, *corev1.Secret, error) {
+	dp, secret, err := r.resolvePasswordFresh(ctx, role, existing, now)
+	if err == nil {
+		err = checkEditedPassword(dp, secret)
+	}
+	return dp, secret, err
+}
+
+// resolvePasswordFresh is resolvePassword without the check of hand-edited
+// passwords.
+func (r *RoleReconciler) resolvePasswordFresh(ctx context.Context, role *postgresv1alpha1.Role, existing *corev1.Secret, now time.Time) (desiredPassword, *corev1.Secret, error) {
 	var refPassword string
 	fromRef := role.Spec.PasswordSecretRef != nil
 	if fromRef {

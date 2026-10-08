@@ -23,6 +23,8 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+
+	"github.com/xdg-go/stringprep"
 )
 
 // parseVerifier splits a SCRAM-SHA-256 verifier into salt, StoredKey and
@@ -107,6 +109,8 @@ func TestSASLPrep(t *testing.T) {
 		{"ctrl\x01ascii", "ctrl\x01ascii"},                                   // ASCII is used unchanged, like pg_saslprep
 		{"no" + string(rune(0x00a0)) + "break", "no break"},                  // non-ASCII space maps to space
 		{"soft" + string(rune(0x00ad)) + "hyphen", "softhyphen"},             // mapped to nothing
+		{"a" + string(rune(0x200b)) + "b", "a b"},                            // ZERO WIDTH SPACE is a non-ASCII space for pg_saslprep
+		{"a" + string(rune(0x200c)) + "b", "ab"},                             // ZERO WIDTH NON-JOINER is mapped to nothing
 		{string(rune(0x2163)), "IV"},                                         // NFKC (ROMAN NUMERAL FOUR)
 		{"bad\x07" + string(rune(0x00e9)), "bad\x07" + string(rune(0x00e9))}, // prohibited: used unchanged
 	}
@@ -114,6 +118,22 @@ func TestSASLPrep(t *testing.T) {
 		if got := saslPrep(tt.in); got != tt.want {
 			t.Errorf("saslPrep(%q) = %q, want %q", tt.in, got, tt.want)
 		}
+	}
+}
+
+// TestSASLPrepTableOverlap guards the U+200B special case in saslPrep: it is
+// the only character that RFC 3454 lists both as a non-ASCII space (C.1.2,
+// mapped to SPACE by pg_saslprep) and as commonly mapped to nothing (B.1,
+// which stringprep applies first).
+func TestSASLPrepTableOverlap(t *testing.T) {
+	var both []rune
+	for r := rune(0); r <= 0x10FFFF; r++ {
+		if _, inB1 := stringprep.TableB1.Map(r); inB1 && stringprep.TableC1_2.Contains(r) {
+			both = append(both, r)
+		}
+	}
+	if len(both) != 1 || both[0] != zeroWidthSpace {
+		t.Errorf("characters in both B.1 and C.1.2 = %U, want only U+200B", both)
 	}
 }
 

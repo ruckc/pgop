@@ -25,6 +25,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -193,7 +194,35 @@ var _ = Describe("Role password selection", func() {
 		By("trusting the annotation over status.passwordHash when both exist")
 		Expect(passwordApplied(role, secret(map[string]string{AnnotationPasswordFingerprint: "x"}), testCurrentPassword)).To(BeFalse())
 	})
+
+	It("checks a password edited into the credentials Secret before setting it", func() {
+		s := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "creds"}}
+		hashed := "md5" + "0123456789abcdef0123456789abcdef"
+		err := checkEditedPassword(desiredPassword{value: hashed}, s)
+		ce, ok := errors.AsType[*conditionError](err)
+		Expect(ok).To(BeTrue())
+		Expect(ce.reason).To(Equal(ReasonPasswordSecretInvalid))
+		Expect(err.Error()).NotTo(ContainSubstring(hashed))
+		Expect(checkEditedPassword(desiredPassword{value: "nul\x00"}, s)).To(HaveOccurred())
+		Expect(checkEditedPassword(desiredPassword{value: `it's \ fine`}, s)).To(Succeed())
+
+		By("not checking a password that is already set, generated, from passwordSecretRef, or without a Secret")
+		Expect(checkEditedPassword(desiredPassword{value: hashed, applied: true}, s)).To(Succeed())
+		Expect(checkEditedPassword(desiredPassword{value: hashed, generated: true}, s)).To(Succeed())
+		Expect(checkEditedPassword(desiredPassword{value: hashed, fromRef: true}, s)).To(Succeed())
+		Expect(checkEditedPassword(desiredPassword{value: hashed}, nil)).To(Succeed())
+	})
 })
+
+// missingSecretsClient is a client whose cache has no Secrets yet.
+type missingSecretsClient struct{ client.Client }
+
+func (c missingSecretsClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if _, ok := obj.(*corev1.Secret); ok {
+		return apierrors.NewNotFound(corev1.Resource("secrets"), key.Name)
+	}
+	return c.Client.Get(ctx, key, obj, opts...)
+}
 
 var _ = Describe("Role password Secrets", func() {
 	const ns = "default"
@@ -422,6 +451,70 @@ var _ = Describe("Role password Secrets", func() {
 		})
 	})
 
+	Context("credentials Secret written from a stale cache", func() {
+		var (
+			cluster *postgresv1alpha1.Cluster
+			role    *postgresv1alpha1.Role
+		)
+		BeforeEach(func() {
+			cluster = &postgresv1alpha1.Cluster{
+				ObjectMeta: metav1.ObjectMeta{Name: "stale-cl-" + suffix, Namespace: ns},
+				Spec:       postgresv1alpha1.ClusterSpec{Image: DefaultPostgresImage},
+			}
+			Expect(k8sClient.Create(ctx, cluster)).To(Succeed())
+			cleanup(cluster)
+			role = newRole("stale-w-" + suffix)
+			role.Spec.ClusterRef.Name = cluster.Name
+			Expect(k8sClient.Create(ctx, role)).To(Succeed())
+			cleanup(role)
+		})
+
+		It("does not overwrite a rotated password with the stale one on a conflict", func() {
+			By("a Secret the cache still shows with the old password")
+			const rotated = "rotated-password"
+			stale := createSecret(credentialsSecretName(role, cluster), map[string][]byte{
+				SecretKeyPassword: []byte(testCurrentPassword)})
+			stale.Annotations = map[string]string{AnnotationPasswordFingerprint: passwordFingerprint(role, testCurrentPassword)}
+			Expect(k8sClient.Update(ctx, stale)).To(Succeed())
+			stale = stale.DeepCopy()
+
+			By("the previous reconcile having rotated it on the server")
+			current := getSecret(stale.Name)
+			current.Data[SecretKeyPassword] = []byte(rotated)
+			current.Annotations[AnnotationPasswordFingerprint] = passwordFingerprint(role, rotated)
+			Expect(k8sClient.Update(ctx, current)).To(Succeed())
+
+			By("converging the stale Secret (its labels are missing, so it is updated and conflicts)")
+			r := rr()
+			r.APIReader = k8sClient
+			_, err := r.reconcileCredentialsSecret(ctx, role, cluster, stale, testCurrentPassword, false)
+			Expect(err).To(MatchError(errCredentialsSecretChanged))
+			s := getSecret(stale.Name)
+			Expect(string(s.Data[SecretKeyPassword])).To(Equal(rotated))
+			Expect(s.Annotations).To(HaveKeyWithValue(AnnotationPasswordFingerprint, passwordFingerprint(role, rotated)))
+
+			By("still writing a password this reconcile set in PostgreSQL")
+			_, err = r.reconcileCredentialsSecret(ctx, role, cluster, stale, "newer-password", true)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(string(getSecret(stale.Name).Data[SecretKeyPassword])).To(Equal("newer-password"))
+		})
+
+		It("looks a Secret missing from the cache up uncached before generating a password", func() {
+			createSecret(credentialsSecretName(role, cluster), map[string][]byte{SecretKeyPassword: []byte(testCurrentPassword)})
+
+			r := &RoleReconciler{Client: missingSecretsClient{k8sClient}, Scheme: k8sClient.Scheme()}
+			s, err := r.getCredentialsSecret(ctx, role, cluster)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(s).To(BeNil(), "the cache alone reports the Secret missing")
+
+			r.APIReader = k8sClient
+			s, err = r.getCredentialsSecret(ctx, role, cluster)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(s).NotTo(BeNil())
+			Expect(string(s.Data[SecretKeyPassword])).To(Equal(testCurrentPassword))
+		})
+	})
+
 	Context("credentials Secrets", func() {
 		It("updates the password and uri of the role Secret and the Database Secret follows", func() {
 			cluster := &postgresv1alpha1.Cluster{
@@ -435,7 +528,7 @@ var _ = Describe("Role password Secrets", func() {
 			Expect(k8sClient.Create(ctx, role)).To(Succeed())
 			cleanup(role)
 
-			secretName, err := rr().reconcileCredentialsSecret(ctx, role, cluster, nil, "old-password")
+			secretName, err := rr().reconcileCredentialsSecret(ctx, role, cluster, nil, "old-password", true)
 			Expect(err).NotTo(HaveOccurred())
 			s := getSecret(secretName)
 			Expect(isRoleCredentialsSecret(s)).To(BeTrue())
@@ -461,7 +554,7 @@ var _ = Describe("Role password Secrets", func() {
 			Expect(string(getSecret(dbSecretName).Data[SecretKeyPassword])).To(Equal("old-password"))
 
 			By("changing the password")
-			_, err = rr().reconcileCredentialsSecret(ctx, role, cluster, s, "new-password")
+			_, err = rr().reconcileCredentialsSecret(ctx, role, cluster, s, "new-password", true)
 			Expect(err).NotTo(HaveOccurred())
 			s = getSecret(secretName)
 			Expect(string(s.Data[SecretKeyPassword])).To(Equal("new-password"))

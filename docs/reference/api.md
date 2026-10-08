@@ -168,7 +168,10 @@ The role credentials Secret carries a `pgop.ruck.io/password-fingerprint`
 annotation (salted SHA-256 of the password last set in PostgreSQL) that the
 operator uses to send the password only when it changed. Passwords are sent to
 PostgreSQL as client-side computed SCRAM-SHA-256 verifiers, never in
-plaintext.
+plaintext; server logs of role DDL (`log_statement=ddl`, failing statements)
+still contain the verifier and must be treated as secret. A password edited by
+hand into the credentials Secret gets the same checks as a
+`passwordSecretRef` value (`PasswordSecretInvalid` otherwise).
 
 **Security:** the operator reads the Secret named by `passwordSecretRef` with
 its own permissions and copies the key into the role (and database)

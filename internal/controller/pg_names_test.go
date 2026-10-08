@@ -192,7 +192,7 @@ var _ = Describe("PostgreSQL name overrides", func() {
 			cleanup(role)
 
 			r := &RoleReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
-			secretName, err := r.reconcileCredentialsSecret(ctx, role, cluster, nil, "generated")
+			secretName, err := r.reconcileCredentialsSecret(ctx, role, cluster, nil, "generated", true)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(secretName).To(Equal(cluster.Name + "-" + role.Name + "-credentials"))
 
