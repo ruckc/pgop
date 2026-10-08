@@ -111,7 +111,7 @@ with a clear condition rather than guessing a layout and risking data loss.
 
 ### Role
 
-Creates a PostgreSQL user scoped to a `Cluster`. The operator auto-generates a password and writes a `<cluster>-<role>-credentials` Secret used internally by the `Database` controller.
+Creates a PostgreSQL user scoped to a `Cluster`. The operator auto-generates a password (or takes it from `passwordSecretRef`), can rotate it on a schedule (`passwordRotation.every`) or on demand (`pgop.ruck.io/rotate-password` annotation), and writes it to a `<cluster>-<role>-credentials` Secret that the `Database` controller copies into the per-database Secret.
 
 ```yaml
 apiVersion: pgop.ruck.io/v1alpha1

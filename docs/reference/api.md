@@ -133,11 +133,21 @@ spec:
   # Transitional opt-out; removed together with memberOf.
   revokeRemovedMemberships: boolean
 
-  # Optional: use existing password
+  # Optional: take the password from a Secret you manage (same namespace).
+  # Changes to the Secret are applied. Mutually exclusive with passwordRotation.
   passwordSecretRef:
     name: string           # Secret name
     key: string            # Key within secret
+
+  # Optional: rotate the operator-generated password on a schedule.
+  # Mutually exclusive with passwordSecretRef.
+  passwordRotation:
+    every: string          # Go duration, e.g. "720h"; minimum "1h"
 ```
+
+Annotation `pgop.ruck.io/rotate-password: <any new value>` requests an
+immediate rotation (or, with `passwordSecretRef`, re-applies the referenced
+password). Each value is acted on once.
 
 ### RoleStatus
 
@@ -148,6 +158,9 @@ status:
   secretName: string       # Auto-generated credentials secret
   managedMemberships:      # Roles whose membership pgop granted (revoked when removed)
     - string
+  passwordHash: string     # Salted SHA-256 fingerprint of the password set in PostgreSQL
+  passwordRotatedAt: string # When the operator last generated the password (RFC 3339)
+  passwordRotationRequest: string # Last rotate-password annotation value acted on
   conditions:
     - type: string
       status: string
@@ -155,6 +168,11 @@ status:
       message: string
       lastTransitionTime: string
 ```
+
+The `Available` condition is `False` with reason `PasswordSecretNotFound` when
+`passwordSecretRef` names a missing Secret or key (or an empty value), and
+`ReconcileError` for other failures. A rotation emits a `PasswordRotated`
+Event on the Role.
 
 ---
 

@@ -49,7 +49,22 @@ type RoleMembership struct {
 	Admin bool `json:"admin,omitempty"`
 }
 
+// PasswordRotationSpec configures scheduled rotation of an operator-generated
+// role password.
+type PasswordRotationSpec struct {
+	// every is the rotation interval as a Go duration string (for example
+	// "720h" for 30 days). The minimum is 1h. The schedule is measured from
+	// status.passwordRotatedAt.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:Type=string
+	// +kubebuilder:validation:MaxLength=32
+	// +kubebuilder:validation:Pattern=`^([0-9]+(\.[0-9]+)?(ns|us|ms|s|m|h))+$`
+	// +kubebuilder:validation:XValidation:rule="duration(self) >= duration('1h')",message="passwordRotation.every must be at least 1h"
+	Every metav1.Duration `json:"every"`
+}
+
 // RoleSpec defines the desired state of Role
+// +kubebuilder:validation:XValidation:rule="!(has(self.passwordSecretRef) && has(self.passwordRotation))",message="passwordRotation cannot be combined with passwordSecretRef; rotate the referenced Secret instead"
 // +kubebuilder:validation:XValidation:rule="has(oldSelf.roleName) == has(self.roleName) && (!has(self.roleName) || self.roleName == oldSelf.roleName)",message="roleName is immutable"
 // +kubebuilder:validation:XValidation:rule="!has(self.memberOf) || !has(self.memberships) || self.memberOf.all(r, !self.memberships.exists(m, m.role == r))",message="a role must not be listed in both memberOf and memberships"
 type RoleSpec struct {
@@ -140,10 +155,23 @@ type RoleSpec struct {
 	// +optional
 	RevokeRemovedMemberships *bool `json:"revokeRemovedMemberships,omitempty"`
 
-	// passwordSecretRef references a Secret containing the password for this role.
-	// The secret must contain a key with the password value.
+	// passwordSecretRef references a Secret in the Role's namespace whose key
+	// holds the password for this role. When set, the operator uses that value
+	// instead of generating one, copies it into the role credentials Secret
+	// and follows changes to the referenced Secret. The referenced Secret is
+	// never modified or owned by the operator. When the reference is removed,
+	// the current password is kept. Mutually exclusive with passwordRotation.
 	// +optional
 	PasswordSecretRef *SecretKeySelector `json:"passwordSecretRef,omitempty"`
+
+	// passwordRotation enables scheduled rotation of the operator-generated
+	// password. A rotation sets a new password in PostgreSQL and then updates
+	// the role credentials Secret (and the credentials Secrets of Databases
+	// owned by this role). The old password stops working for new connections
+	// immediately; existing sessions stay connected. Mutually exclusive with
+	// passwordSecretRef.
+	// +optional
+	PasswordRotation *PasswordRotationSpec `json:"passwordRotation,omitempty"`
 }
 
 // RoleStatus defines the observed state of Role.
@@ -158,6 +186,23 @@ type RoleStatus struct {
 	// secretName is the name of the Secret containing the role's credentials.
 	// The secret contains 'username' and 'password' keys.
 	SecretName string `json:"secretName,omitempty"`
+
+	// passwordHash is a salted SHA-256 fingerprint of the password last set in
+	// PostgreSQL. The operator only sends a new password to PostgreSQL when the
+	// desired password's fingerprint differs. It is not the password.
+	// +optional
+	PasswordHash string `json:"passwordHash,omitempty"`
+
+	// passwordRotatedAt is when the operator last generated the role's
+	// password (initially or by rotation). The rotation schedule is measured
+	// from it. Unset while the password comes from passwordSecretRef.
+	// +optional
+	PasswordRotatedAt *metav1.Time `json:"passwordRotatedAt,omitempty"`
+
+	// passwordRotationRequest is the last value of the
+	// pgop.ruck.io/rotate-password annotation that the operator acted on.
+	// +optional
+	PasswordRotationRequest string `json:"passwordRotationRequest,omitempty"`
 
 	// managedMemberships lists the PostgreSQL roles whose membership pgop has
 	// granted to this role. Only these are revoked when they are removed from

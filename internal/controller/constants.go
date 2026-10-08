@@ -26,6 +26,11 @@ const (
 	LabelValuePgop    = "pgop"
 
 	AppNamePostgresql = "postgresql"
+	// AppNamePostgresqlRole is the app.kubernetes.io/name of role credentials
+	// Secrets.
+	AppNamePostgresqlRole = "postgresql-role"
+	// LabelCluster names the Cluster a role credentials Secret belongs to.
+	LabelCluster = "pgop.ruck.io/cluster"
 
 	SecretKeyUsername = "username"
 	SecretKeyPassword = "password"
