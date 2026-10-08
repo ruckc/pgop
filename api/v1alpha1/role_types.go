@@ -161,6 +161,12 @@ type RoleSpec struct {
 	// and follows changes to the referenced Secret. The referenced Secret is
 	// never modified or owned by the operator. When the reference is removed,
 	// the current password is kept. Mutually exclusive with passwordRotation.
+	// The value must be the plaintext password: valid UTF-8, without NUL
+	// bytes, and not a SCRAM-SHA-256 or MD5 hash (reason
+	// PasswordSecretInvalid otherwise).
+	// Security: the operator reads the referenced Secret with its own
+	// permissions, so whoever can create or update Roles in a namespace can
+	// read any Secret in it through the credentials Secret.
 	// +optional
 	PasswordSecretRef *SecretKeySelector `json:"passwordSecretRef,omitempty"`
 
@@ -187,9 +193,13 @@ type RoleStatus struct {
 	// The secret contains 'username' and 'password' keys.
 	SecretName string `json:"secretName,omitempty"`
 
-	// passwordHash is a salted SHA-256 fingerprint of the password last set in
-	// PostgreSQL. The operator only sends a new password to PostgreSQL when the
-	// desired password's fingerprint differs. It is not the password.
+	// passwordHash is deprecated and no longer written: the operator clears it
+	// on the next reconcile. It held a salted SHA-256 fingerprint of the
+	// password, which anyone able to read the Role could brute-force offline.
+	// The fingerprint now lives in the pgop.ruck.io/password-fingerprint
+	// annotation of the credentials Secret, next to the password itself. The
+	// field is kept only so existing objects stay valid and will be removed in
+	// a future API version.
 	// +optional
 	PasswordHash string `json:"passwordHash,omitempty"`
 

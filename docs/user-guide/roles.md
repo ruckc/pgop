@@ -58,7 +58,7 @@ spec:
 | `roleName` | The effective PostgreSQL role name that was reconciled |
 | `secretName` | Name of the auto-generated credentials secret (`<cluster>-<role>-credentials`) |
 | `managedMemberships` | PostgreSQL roles whose membership pgop granted to this role |
-| `passwordHash` | Salted SHA-256 fingerprint of the password last set in PostgreSQL (not the password) |
+| `passwordHash` | **Deprecated**, no longer written and cleared on the next reconcile (the fingerprint moved to the credentials Secret, see [Password Source](#password-source)) |
 | `passwordRotatedAt` | When the operator last generated the password; the rotation schedule counts from it |
 | `passwordRotationRequest` | Last `pgop.ruck.io/rotate-password` annotation value acted on |
 | `conditions` | Detailed status conditions |
@@ -255,7 +255,10 @@ whichever source it comes from:
    credentials Secrets). The operator never modifies or owns the referenced
    Secret. If the Secret or key is missing (or empty), the Role reports
    `Available=False` with reason `PasswordSecretNotFound` and the operator does
-   **not** fall back to a generated password.
+   **not** fall back to a generated password. A value that is not valid UTF-8,
+   contains a NUL byte, or is already a PostgreSQL password hash (starts with
+   `SCRAM-SHA-256$`, or is `md5` followed by 32 hex digits) is rejected with
+   reason `PasswordSecretInvalid`: put the plaintext password in the Secret.
 2. **Otherwise**: the operator generates a random password when the Role is
    first created and keeps it, unless [rotation](#password-rotation) replaces
    it.
@@ -284,15 +287,85 @@ When `passwordSecretRef` is removed from a Role, the current password is kept
 (it stays in the credentials Secret); the operator does not generate a new one
 until a rotation is due or requested.
 
-The operator sends `ALTER ROLE ... PASSWORD` to PostgreSQL only when the
-password changed (it compares a salted fingerprint stored in
-`status.passwordHash`), so the password does not show up in server logs on
-every reconcile with `log_statement=ddl`. The operator never logs passwords.
+### How the password reaches PostgreSQL
+
+- The operator never sends the plaintext password to PostgreSQL. It computes a
+  SCRAM-SHA-256 verifier (random salt, 4096 iterations, SASLprep like
+  PostgreSQL) and sends `PASSWORD 'SCRAM-SHA-256$...'`, which PostgreSQL stores
+  as-is whatever `password_encryption` is set to. The plaintext therefore
+  never appears in server logs. Clients authenticate with `scram-sha-256` (or
+  `md5`/`password` `pg_hba.conf` methods, which also accept SCRAM verifiers).
+
+!!! warning "Server logs still contain the verifier"
+    With `log_statement=ddl` (or `all`), and for a failing statement with the
+    default `log_min_error_statement=error`, the `CREATE ROLE`/`ALTER ROLE`
+    statement is logged **with the SCRAM verifier**. A verifier is not the
+    password, but it is sensitive: it can be attacked offline (only 4096
+    PBKDF2 iterations, PostgreSQL's default), and its ServerKey lets whoever
+    holds it impersonate the server to clients. Treat PostgreSQL logs that may
+    contain role DDL as secret, like `pg_authid`.
+- `ALTER ROLE ... PASSWORD` is only sent when the password changed. The
+  operator tells by a salted SHA-256 fingerprint in the
+  `pgop.ruck.io/password-fingerprint` annotation of the credentials Secret,
+  next to the password itself, so it reveals nothing to anyone who cannot
+  already read the password. (Earlier versions kept it in
+  `status.passwordHash`, readable by anyone who can read the Role; that field
+  is deprecated and cleared.) Before sending a password because the cached
+  Secret's fingerprint does not match, the operator re-reads the Secret from
+  the API server, so a cache lagging behind a rotation can never roll the
+  password back.
+- Errors from `CREATE ROLE`/`ALTER ROLE` are redacted before they reach
+  conditions, Events or logs. The operator never logs passwords.
 
 !!! note
     Editing `password` in the operator-managed credentials Secret directly sets
     that password in PostgreSQL on the next reconcile, unless
-    `passwordSecretRef` is set, in which case the referenced value wins.
+    `passwordSecretRef` is set, in which case the referenced value wins. An
+    edited password gets the same checks as a `passwordSecretRef` value (UTF-8,
+    no NUL byte, not pre-hashed); one that fails them is not set and the Role
+    reports `Available=False` with reason `PasswordSecretInvalid` until the
+    Secret is fixed.
+
+### Security: who can read a `passwordSecretRef` Secret
+
+The operator reads **any** Secret in the Role's namespace that a Role names in
+`passwordSecretRef`, and copies the named key into the Role's credentials
+Secret (and the Database credentials Secrets), with the operator's own
+permissions. So **anyone who can create or update Roles in a namespace can
+read every Secret in that namespace**, including ones their own RBAC does not
+let them read, such as `<cluster>-credentials` (the operator's superuser
+password) or other apps' Secrets: they point a Role at the Secret and read the
+resulting credentials Secret (or log in with it).
+
+Treat the permission to create/update `roles.pgop.ruck.io` as equivalent to
+`get` on all Secrets of the namespace:
+
+- Grant `create`/`update`/`patch` on `roles.pgop.ruck.io` only to subjects that
+  may already read the namespace's Secrets (typically namespace admins and the
+  CD system). The aggregated `edit` ClusterRole should not be used to hand
+  out Role write access to users who must not see the namespace's Secrets.
+- Keep Secrets that such users must not read (including the Cluster's
+  `<cluster>-credentials`) in a namespace where they cannot create Roles; a
+  Role can only reference Secrets in its own namespace.
+- Audit `passwordSecretRef` values (e.g. with an admission policy that
+  restricts which Secret names a Role may reference) where Role authors are
+  less trusted than Secret readers.
+
+### Upgrade notes
+
+- **`passwordSecretRef` is now honored** (v0.10.0, issue #25). Before,
+  `spec.passwordSecretRef` was accepted but ignored. Roles that
+  already set it switch to the referenced password **immediately** after the
+  upgrade: PostgreSQL and the credentials Secret get that password, and apps
+  using the old generated password fail on their next connection. If the
+  referenced Secret or key is missing, the Role goes `Available=False`
+  (`PasswordSecretNotFound`) and is not ready until it exists; the existing
+  password keeps working meanwhile. Check your Roles before upgrading:
+  `kubectl get roles.pgop.ruck.io -A -o jsonpath='{range .items[?(@.spec.passwordSecretRef)]}{.metadata.namespace}/{.metadata.name}{"\n"}{end}'`
+- **Password fingerprint moved.** `status.passwordHash` is deprecated: the
+  first reconcile after upgrading moves the fingerprint into the
+  `pgop.ruck.io/password-fingerprint` annotation of the credentials Secret and
+  clears the status field. The password is not re-sent for this.
 
 ## Password Rotation
 

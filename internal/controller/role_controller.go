@@ -158,27 +158,26 @@ func (r *RoleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 			log.Error(err, "Failed to get credentials secret")
 			return r.updateStatus(ctx, role, false, "", err)
 		}
-		if dp, err = r.resolvePassword(ctx, role, existingSecret, now); err != nil {
+		if dp, existingSecret, err = r.resolvePassword(ctx, role, existingSecret, now); err != nil {
 			log.Error(err, "Failed to resolve role password")
 			return r.updateStatus(ctx, role, false, "", err)
 		}
 	}
 
-	// Create or update the role. The password is only sent to an existing
-	// role when it differs from the one last applied, so it does not appear
-	// in server logs on every reconcile.
+	// Create or update the role. The password (sent as a SCRAM-SHA-256
+	// verifier, never in plaintext) is only sent to an existing role when it
+	// differs from the one last applied.
 	opts := postgres.RoleOptions{
-		Login:           role.Spec.IsLogin(),
-		Superuser:       role.Spec.Superuser,
-		CreateDB:        role.Spec.CreateDB,
-		CreateRole:      role.Spec.CreateRole,
-		Inherit:         role.Spec.IsInherit(),
-		Replication:     role.Spec.Replication,
-		BypassRLS:       role.Spec.BypassRLS,
-		ConnectionLimit: role.Spec.GetConnectionLimit(),
-		Password:        dp.value,
-		KeepExistingPassword: dp.value != "" && !dp.force &&
-			role.Status.PasswordHash == passwordFingerprint(role, dp.value),
+		Login:                role.Spec.IsLogin(),
+		Superuser:            role.Spec.Superuser,
+		CreateDB:             role.Spec.CreateDB,
+		CreateRole:           role.Spec.CreateRole,
+		Inherit:              role.Spec.IsInherit(),
+		Replication:          role.Spec.Replication,
+		BypassRLS:            role.Spec.BypassRLS,
+		ConnectionLimit:      role.Spec.GetConnectionLimit(),
+		Password:             dp.value,
+		KeepExistingPassword: dp.applied && !dp.force,
 	}
 
 	pgName := role.PostgresName()
@@ -195,7 +194,7 @@ func (r *RoleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// does not know.
 	var secretName string
 	if role.Spec.IsLogin() {
-		if secretName, err = r.reconcileCredentialsSecret(ctx, role, cluster, existingSecret, dp.value); err != nil {
+		if secretName, err = r.reconcileCredentialsSecret(ctx, role, cluster, existingSecret, dp.value, !opts.KeepExistingPassword); err != nil {
 			log.Error(err, "Failed to reconcile credentials secret")
 			return r.updateStatus(ctx, role, false, role.Status.SecretName, err)
 		}
@@ -234,10 +233,17 @@ func credentialsSecretName(role *postgresv1alpha1.Role, cluster *postgresv1alpha
 }
 
 // getCredentialsSecret returns the Role's credentials Secret, or nil when it
-// does not exist yet.
+// does not exist yet. A Secret missing from the cache is looked up uncached
+// before it is reported missing: the cache may not show a Secret created by
+// the previous reconcile yet, and treating it as missing would generate and
+// set a new password that then cannot be stored (the create fails).
 func (r *RoleReconciler) getCredentialsSecret(ctx context.Context, role *postgresv1alpha1.Role, cluster *postgresv1alpha1.Cluster) (*corev1.Secret, error) {
 	secret := &corev1.Secret{}
-	err := r.Get(ctx, types.NamespacedName{Name: credentialsSecretName(role, cluster), Namespace: role.Namespace}, secret)
+	key := types.NamespacedName{Name: credentialsSecretName(role, cluster), Namespace: role.Namespace}
+	err := r.Get(ctx, key, secret)
+	if apierrors.IsNotFound(err) && r.APIReader != nil {
+		err = r.APIReader.Get(ctx, key, secret)
+	}
 	if apierrors.IsNotFound(err) {
 		return nil, nil
 	}
@@ -262,7 +268,7 @@ func roleSecretLabels(role *postgresv1alpha1.Role) map[string]string {
 // so it holds password and the current connection info (host, port, sslmode,
 // ca.crt and a uri built from the same password). existing is the current
 // Secret, or nil. It returns the Secret's name.
-func (r *RoleReconciler) reconcileCredentialsSecret(ctx context.Context, role *postgresv1alpha1.Role, cluster *postgresv1alpha1.Cluster, existing *corev1.Secret, password string) (string, error) {
+func (r *RoleReconciler) reconcileCredentialsSecret(ctx context.Context, role *postgresv1alpha1.Role, cluster *postgresv1alpha1.Cluster, existing *corev1.Secret, password string, passwordSent bool) (string, error) {
 	secretName := credentialsSecretName(role, cluster)
 
 	t, err := clusterClientTLS(ctx, r.Client, cluster)
@@ -279,9 +285,10 @@ func (r *RoleReconciler) reconcileCredentialsSecret(ctx context.Context, role *p
 		applyConnectionInfo(data, host, port, defaultDatabaseName, t)
 		secret := &corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:      secretName,
-				Namespace: role.Namespace,
-				Labels:    roleSecretLabels(role),
+				Name:        secretName,
+				Namespace:   role.Namespace,
+				Labels:      roleSecretLabels(role),
+				Annotations: map[string]string{AnnotationPasswordFingerprint: passwordFingerprint(role, password)},
 			},
 			Type: corev1.SecretTypeOpaque,
 			Data: data,
@@ -295,21 +302,39 @@ func (r *RoleReconciler) reconcileCredentialsSecret(ctx context.Context, role *p
 
 	// The Secret exists: keep its username and converge password, labels and
 	// connection info (host, port, sslmode, uri, ca.crt). On a conflict the
-	// Secret is re-read and the change applied again.
+	// Secret is re-read (uncached when possible) and the change applied again.
+	// passwordSent tells whether this reconcile set password in PostgreSQL.
+	// If it did not, password was taken from the Secret this reconcile read;
+	// should the re-read show a different password (the cached Secret was
+	// stale, e.g. it predates a rotation), writing password would put the
+	// Secret out of step with PostgreSQL for good. Give up instead and let
+	// the next reconcile start from the current Secret.
+	basePassword := string(existing.Data[SecretKeyPassword])
+	var reader client.Reader = r.Client
+	if r.APIReader != nil {
+		reader = r.APIReader
+	}
 	secret := existing.DeepCopy()
 	return secretName, retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		if !passwordSent && string(secret.Data[SecretKeyPassword]) != basePassword {
+			return errCredentialsSecretChanged
+		}
 		if !convergeRoleSecret(secret, role, password, host, port, t) {
 			return nil
 		}
 		err := r.Update(ctx, secret)
 		if apierrors.IsConflict(err) {
-			if getErr := r.Get(ctx, client.ObjectKeyFromObject(secret), secret); getErr != nil {
+			if getErr := reader.Get(ctx, client.ObjectKeyFromObject(secret), secret); getErr != nil {
 				return getErr
 			}
 		}
 		return err
 	})
 }
+
+// errCredentialsSecretChanged reports that the credentials Secret's password
+// changed while the reconcile that read it was running.
+var errCredentialsSecretChanged = errors.New("the credentials Secret's password changed concurrently; retrying from the current Secret")
 
 // convergeRoleSecret sets the password, labels and connection info of an
 // existing role credentials Secret and reports whether anything changed.
@@ -320,6 +345,15 @@ func convergeRoleSecret(secret *corev1.Secret, role *postgresv1alpha1.Role, pass
 	}
 	if string(secret.Data[SecretKeyPassword]) != password {
 		secret.Data[SecretKeyPassword] = []byte(password)
+		changed = true
+	}
+	// Only called once PostgreSQL has the password, so the fingerprint
+	// records what PostgreSQL has.
+	if fp := passwordFingerprint(role, password); secret.Annotations[AnnotationPasswordFingerprint] != fp {
+		if secret.Annotations == nil {
+			secret.Annotations = map[string]string{}
+		}
+		secret.Annotations[AnnotationPasswordFingerprint] = fp
 		changed = true
 	}
 	if secret.Labels == nil {

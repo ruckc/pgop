@@ -19,11 +19,12 @@ package postgres
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
 
-	_ "github.com/lib/pq"
+	"github.com/lib/pq"
 )
 
 const (
@@ -185,7 +186,9 @@ type RoleOptions struct {
 	Replication     bool
 	BypassRLS       bool
 	ConnectionLimit int32
-	Password        string
+	// Password is the role's plaintext password. CreateRole never sends it to
+	// the server: it sends a SCRAM-SHA-256 verifier computed from it.
+	Password string
 	// KeepExistingPassword omits PASSWORD from ALTER ROLE when the role
 	// already exists, so an unchanged password is not re-sent (it would
 	// otherwise show up in server logs with log_statement=ddl). A newly
@@ -193,7 +196,10 @@ type RoleOptions struct {
 	KeepExistingPassword bool
 }
 
-// CreateRole creates a new PostgreSQL role with the given options
+// CreateRole creates a new PostgreSQL role with the given options, or updates
+// an existing one. The password is sent as a client-side computed
+// SCRAM-SHA-256 verifier, so the plaintext never reaches the server or its
+// logs. Errors are redacted: they never contain the password or verifier.
 func (c *Client) CreateRole(ctx context.Context, name string, opts RoleOptions) error {
 	// Check if role exists
 	var exists bool
@@ -202,16 +208,47 @@ func (c *Client) CreateRole(ctx context.Context, name string, opts RoleOptions) 
 		return fmt.Errorf("failed to check role existence: %w", err)
 	}
 
-	_, err = c.db.ExecContext(ctx, c.buildRoleQuery(name, exists, opts))
-	if err != nil {
-		return fmt.Errorf("failed to create/alter role: %w", err)
+	if exists && opts.KeepExistingPassword {
+		opts.Password = ""
+	}
+	plaintext := opts.Password
+	if opts.Password != "" {
+		if opts.Password, err = ScramSHA256Verifier(opts.Password); err != nil {
+			return err
+		}
+	}
+
+	if _, err = c.db.ExecContext(ctx, c.buildRoleQuery(name, exists, opts)); err != nil {
+		return redactedError(fmt.Sprintf("failed to create/alter role %q", name), err, plaintext, opts.Password)
 	}
 
 	return nil
 }
 
+// redactedError returns an error for err, prefixed with msg, that does not
+// wrap err and has every occurrence of the given secrets (and their quoted
+// SQL forms) replaced, so a password can never end up in a condition message
+// or log line. For a server error only its message and SQLSTATE are kept (not
+// its detail, hint or query).
+func redactedError(msg string, err error, secrets ...string) error {
+	text := err.Error()
+	if pqErr, ok := errors.AsType[*pq.Error](err); ok {
+		text = fmt.Sprintf("%s (SQLSTATE %s)", pqErr.Message, pqErr.Code)
+	}
+	for _, s := range secrets {
+		if s == "" {
+			continue
+		}
+		for _, form := range []string{quoteLiteral(s), escapeString(s), s} {
+			text = strings.ReplaceAll(text, form, "[REDACTED]")
+		}
+	}
+	return fmt.Errorf("%s: %s", msg, text)
+}
+
 // buildRoleQuery returns the CREATE ROLE (role absent) or ALTER ROLE (role
-// present) statement for opts.
+// present) statement for opts. opts.Password is emitted as given (CreateRole
+// passes a SCRAM verifier).
 func (c *Client) buildRoleQuery(name string, exists bool, opts RoleOptions) string {
 	if !exists {
 		return c.buildCreateRoleQuery(name, opts)
@@ -286,7 +323,7 @@ func (c *Client) buildRoleOptions(opts RoleOptions) []string {
 	parts = append(parts, fmt.Sprintf("CONNECTION LIMIT %d", opts.ConnectionLimit))
 
 	if opts.Password != "" {
-		parts = append(parts, fmt.Sprintf("PASSWORD '%s'", escapeString(opts.Password)))
+		parts = append(parts, "PASSWORD "+quoteLiteral(opts.Password))
 	}
 
 	return parts
@@ -510,7 +547,7 @@ func (c *Client) CreateExtension(ctx context.Context, name, schema, version stri
 		query += fmt.Sprintf(" SCHEMA %s", quoteIdent(schema))
 	}
 	if version != "" {
-		query += fmt.Sprintf(" VERSION '%s'", escapeString(version))
+		query += " VERSION " + quoteLiteral(version)
 	}
 
 	_, err := c.db.ExecContext(ctx, query)
@@ -572,7 +609,20 @@ func quoteIdent(s string) string {
 	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
 }
 
-// escapeString escapes a string for use in SQL
+// quoteLiteral quotes s as a SQL string literal that is correct whatever
+// standard_conforming_strings is set to: single quotes are doubled and, when
+// s contains a backslash, backslashes are doubled and the literal is written
+// as an escape string (E'...').
+func quoteLiteral(s string) string {
+	s = strings.ReplaceAll(s, `'`, `''`)
+	if strings.Contains(s, `\`) {
+		return `E'` + strings.ReplaceAll(s, `\`, `\\`) + `'`
+	}
+	return `'` + s + `'`
+}
+
+// escapeString doubles single quotes. It is not safe for building SQL (use
+// quoteLiteral); it is only used to redact secrets from error text.
 func escapeString(s string) string {
 	return strings.ReplaceAll(s, "'", "''")
 }

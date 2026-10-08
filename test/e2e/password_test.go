@@ -79,6 +79,19 @@ func RegisterPasswordTests() {
 			return err
 		}
 
+		// psql runs a query as the superuser over the local socket.
+		psql := func(query string) (string, error) {
+			out, err := utils.Run(exec.Command("kubectl", "exec", "-n", namespace, clusterName+"-0", "-c", "postgresql", "--",
+				"sh", "-c", `psql -U "$POSTGRES_USER" -d postgres -tAc "$0"`, query))
+			return strings.TrimSpace(out), err
+		}
+
+		jsonpath := func(g Gomega, resource, path string) string {
+			out, err := utils.Run(exec.Command("kubectl", "get", resource, "-n", namespace, "-o", "jsonpath="+path))
+			g.Expect(err).NotTo(HaveOccurred())
+			return strings.TrimSpace(out)
+		}
+
 		BeforeAll(func() {
 			out, err := utils.Run(exec.Command("kubectl", "get", "pod", clusterName+"-0", "-n", namespace,
 				"-o", "jsonpath={.status.podIP}"))
@@ -92,6 +105,7 @@ func RegisterPasswordTests() {
 			for _, res := range []string{
 				"database.pgop.ruck.io/pw-ref-db", "database.pgop.ruck.io/pw-rot-db",
 				"role.pgop.ruck.io/pw-ref", "role.pgop.ruck.io/pw-rot", "secret/pw-ref-source",
+				"role.pgop.ruck.io/pw-hashed", "secret/pw-hashed-source",
 			} {
 				_, _ = utils.Run(exec.Command("kubectl", "delete", "-n", namespace, "--ignore-not-found",
 					"--wait=true", "--timeout=2m", res))
@@ -99,13 +113,16 @@ func RegisterPasswordTests() {
 		})
 
 		It("uses the password from passwordSecretRef and follows changes to it", func() {
+			// The passwords contain quotes and backslashes to exercise SQL quoting.
+			const firstPassword = `first-pa'ss\word"-1`
+			const secondPassword = `second-pa'ss\word-2`
 			apply(`
 apiVersion: v1
 kind: Secret
 metadata:
   name: pw-ref-source
 stringData:
-  pass: first-password-1
+  pass: 'first-pa''ss\word"-1'
 ---
 apiVersion: pgop.ruck.io/v1alpha1
 kind: Role
@@ -132,29 +149,65 @@ spec:
 			waitReady("role.pgop.ruck.io/pw-ref", "database.pgop.ruck.io/pw-ref-db")
 
 			By("logging in with the referenced password")
-			Expect(login("pw_ref", "first-password-1")).To(Succeed())
+			Expect(login("pw_ref", firstPassword)).To(Succeed())
 			Expect(login("pw_ref", "wrong-password")).NotTo(Succeed())
 			Eventually(func(g Gomega) {
-				g.Expect(secretValue(g, clusterName+"-pw-ref-credentials", "password")).To(Equal("first-password-1"))
-				g.Expect(secretValue(g, "pw-ref-db-pw-ref-credentials", "password")).To(Equal("first-password-1"))
+				g.Expect(secretValue(g, clusterName+"-pw-ref-credentials", "password")).To(Equal(firstPassword))
+				g.Expect(secretValue(g, "pw-ref-db-pw-ref-credentials", "password")).To(Equal(firstPassword))
+			}).Should(Succeed())
+
+			By("verifying PostgreSQL got a SCRAM verifier and the fingerprint is not in the Role status")
+			out, err := psql("SELECT left(rolpassword, 14) FROM pg_authid WHERE rolname = 'pw_ref'")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(out).To(Equal("SCRAM-SHA-256$"))
+			Eventually(func(g Gomega) {
+				g.Expect(jsonpath(g, "role.pgop.ruck.io/pw-ref", "{.status.passwordHash}")).To(BeEmpty())
+				g.Expect(jsonpath(g, "secret/"+clusterName+"-pw-ref-credentials",
+					`{.metadata.annotations.pgop\.ruck\.io/password-fingerprint}`)).To(HaveLen(64))
 			}).Should(Succeed())
 
 			By("changing the referenced Secret")
-			_, err := utils.Run(exec.Command("kubectl", "patch", "secret", "pw-ref-source", "-n", namespace,
-				"--type=merge", "-p", `{"stringData":{"pass":"second-password-2"}}`))
+			_, err = utils.Run(exec.Command("kubectl", "patch", "secret", "pw-ref-source", "-n", namespace,
+				"--type=merge", "-p", `{"stringData":{"pass":"second-pa'ss\\word-2"}}`))
 			Expect(err).NotTo(HaveOccurred())
 
 			By("verifying the new password works, the old one does not, and both Secrets follow")
 			Eventually(func(g Gomega) {
-				g.Expect(login("pw_ref", "second-password-2")).To(Succeed())
+				g.Expect(login("pw_ref", secondPassword)).To(Succeed())
 			}).Should(Succeed())
-			Expect(login("pw_ref", "first-password-1")).NotTo(Succeed())
+			Expect(login("pw_ref", firstPassword)).NotTo(Succeed())
 			Eventually(func(g Gomega) {
-				g.Expect(secretValue(g, clusterName+"-pw-ref-credentials", "password")).To(Equal("second-password-2"))
-				g.Expect(secretValue(g, clusterName+"-pw-ref-credentials", "uri")).To(ContainSubstring(":second-password-2@"))
-				g.Expect(secretValue(g, "pw-ref-db-pw-ref-credentials", "password")).To(Equal("second-password-2"))
-				g.Expect(secretValue(g, "pw-ref-db-pw-ref-credentials", "uri")).To(ContainSubstring(":second-password-2@"))
+				g.Expect(secretValue(g, clusterName+"-pw-ref-credentials", "password")).To(Equal(secondPassword))
+				g.Expect(secretValue(g, "pw-ref-db-pw-ref-credentials", "password")).To(Equal(secondPassword))
 			}).Should(Succeed())
+		})
+
+		It("rejects a pre-hashed password in passwordSecretRef", func() {
+			apply(`
+apiVersion: v1
+kind: Secret
+metadata:
+  name: pw-hashed-source
+stringData:
+  pass: md50123456789abcdef0123456789abcdef
+---
+apiVersion: pgop.ruck.io/v1alpha1
+kind: Role
+metadata:
+  name: pw-hashed
+spec:
+  clusterRef:
+    name: example-cluster
+  roleName: pw_hashed
+  passwordSecretRef:
+    name: pw-hashed-source
+    key: pass
+`)
+			Eventually(func(g Gomega) {
+				g.Expect(jsonpath(g, "role.pgop.ruck.io/pw-hashed",
+					`{.status.conditions[?(@.type=="Available")].reason}`)).To(Equal("PasswordSecretInvalid"))
+			}).Should(Succeed())
+			Expect(psql("SELECT count(*) FROM pg_roles WHERE rolname = 'pw_hashed'")).To(Equal("0"))
 		})
 
 		It("rotates a generated password on request and the Database Secret follows", func() {
