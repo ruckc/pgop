@@ -98,6 +98,83 @@ func (c *Client) ReloadConfig(ctx context.Context) error {
 	return nil
 }
 
+// FileSetting is a row of pg_file_settings: an entry of a configuration file
+// as the server would read it now. Error is empty when the entry is valid.
+type FileSetting struct {
+	SourceFile string
+	Name       string
+	Setting    string
+	Error      string
+}
+
+// Setting is the part of a pg_settings row needed to follow configuration
+// changes.
+type Setting struct {
+	Name           string
+	Context        string
+	Source         string
+	SourceFile     string
+	PendingRestart bool
+}
+
+// ConfigFile returns the path of the main configuration file the server was
+// started with (SHOW config_file).
+func (c *Client) ConfigFile(ctx context.Context) (string, error) {
+	var path string
+	if err := c.db.QueryRowContext(ctx, "SHOW config_file").Scan(&path); err != nil {
+		return "", fmt.Errorf("failed to read config_file: %w", err)
+	}
+	return path, nil
+}
+
+// FileSettings returns the contents of pg_file_settings: what the server
+// would load from its configuration files on a reload. Requires a superuser
+// (or pg_read_all_settings).
+func (c *Client) FileSettings(ctx context.Context) ([]FileSetting, error) {
+	rows, err := c.db.QueryContext(ctx,
+		"SELECT sourcefile, name, setting, error FROM pg_file_settings ORDER BY sourcefile, sourceline")
+	if err != nil {
+		return nil, fmt.Errorf("failed to read pg_file_settings: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []FileSetting
+	for rows.Next() {
+		var file, name, setting, errMsg sql.NullString
+		if err := rows.Scan(&file, &name, &setting, &errMsg); err != nil {
+			return nil, fmt.Errorf("failed to scan pg_file_settings: %w", err)
+		}
+		out = append(out, FileSetting{SourceFile: file.String, Name: name.String, Setting: setting.String, Error: errMsg.String})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to read pg_file_settings: %w", err)
+	}
+	return out, nil
+}
+
+// Settings returns pg_settings as seen by this session.
+func (c *Client) Settings(ctx context.Context) ([]Setting, error) {
+	rows, err := c.db.QueryContext(ctx,
+		"SELECT name, context, source, sourcefile, pending_restart FROM pg_settings ORDER BY name")
+	if err != nil {
+		return nil, fmt.Errorf("failed to read pg_settings: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []Setting
+	for rows.Next() {
+		var s Setting
+		var source, file sql.NullString
+		if err := rows.Scan(&s.Name, &s.Context, &source, &file, &s.PendingRestart); err != nil {
+			return nil, fmt.Errorf("failed to scan pg_settings: %w", err)
+		}
+		s.Source, s.SourceFile = source.String, file.String
+		out = append(out, s)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to read pg_settings: %w", err)
+	}
+	return out, nil
+}
+
 // RoleOptions defines PostgreSQL role attributes
 type RoleOptions struct {
 	Login           bool

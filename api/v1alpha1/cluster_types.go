@@ -69,6 +69,67 @@ type ClusterSpec struct {
 	// exactly as before TLS support existed.
 	// +optional
 	TLS *ClusterTLSSpec `json:"tls,omitempty"`
+
+	// parameters are PostgreSQL server configuration parameters (GUCs), for
+	// example shared_buffers, work_mem or shared_preload_libraries. The
+	// operator renders them into a configuration file in the ConfigMap
+	// "<cluster>-config", which the server loads with
+	// "-c config_file=..." and which includes the data directory's own
+	// postgresql.conf first, so the image defaults still apply.
+	//
+	// Changing a parameter only updates the ConfigMap; once it is visible in
+	// the pod the operator reloads the server (pg_reload_conf()). Parameters
+	// that only take effect on a restart (pg_settings.pending_restart) are
+	// listed in status.pendingRestart and the pod is restarted once.
+	// Progress is reported by the ParametersApplied condition.
+	//
+	// Values are passed as strings and always quoted; values with line
+	// breaks are reported as InvalidParameter. Keys must be PostgreSQL
+	// parameter names. Parameters the operator manages itself
+	// (listen_addresses, port, file locations, include directives, the
+	// settings controlled by spec.tls, and WAL archiving) are rejected; see
+	// ReservedParameters. Note that ALTER SYSTEM (postgresql.auto.conf)
+	// still overrides these values; the condition reports it when it does.
+	//
+	// Leaving parameters empty keeps the image's default configuration and
+	// does not change the pod; adding the first parameter (or removing the
+	// last one) restarts the pod once.
+	// +optional
+	// +kubebuilder:validation:MaxProperties=256
+	// +kubebuilder:validation:XValidation:rule="self.all(k, k.matches('^[a-zA-Z_][a-zA-Z0-9_.]*$'))",message="parameter names must match ^[a-zA-Z_][a-zA-Z0-9_.]*$"
+	// +kubebuilder:validation:XValidation:rule="!self.exists(k, k.lowerAscii() in ['archive_command', 'archive_library', 'archive_mode', 'config_file', 'data_directory', 'external_pid_file', 'hba_file', 'ident_file', 'include', 'include_dir', 'include_if_exists', 'listen_addresses', 'port', 'restore_command', 'ssl', 'ssl_cert_file', 'ssl_key_file', 'ssl_min_protocol_version', 'unix_socket_directories'])",message="parameters must not set operator-managed parameters (archive_command, archive_library, archive_mode, config_file, data_directory, external_pid_file, hba_file, ident_file, include, include_dir, include_if_exists, listen_addresses, port, restore_command, ssl, ssl_cert_file, ssl_key_file, ssl_min_protocol_version, unix_socket_directories)"
+	Parameters map[string]string `json:"parameters,omitempty"`
+}
+
+// ReservedParameters are the PostgreSQL parameters spec.parameters must not
+// set because the operator manages them: the listen address, port and file
+// locations; include directives (which would read arbitrary files); the TLS
+// settings controlled by spec.tls; and WAL archiving / restore_command, which
+// are reserved for operator-managed physical backups.
+//
+// This is the single list to change when relaxing a reservation. The CEL rule
+// on ClusterSpec.Parameters must list exactly these names (lower case); a
+// test checks that the generated CRD and this list agree.
+var ReservedParameters = []string{
+	"archive_command",
+	"archive_library",
+	"archive_mode",
+	"config_file",
+	"data_directory",
+	"external_pid_file",
+	"hba_file",
+	"ident_file",
+	"include",
+	"include_dir",
+	"include_if_exists",
+	"listen_addresses",
+	"port",
+	"restore_command",
+	"ssl",
+	"ssl_cert_file",
+	"ssl_key_file",
+	"ssl_min_protocol_version",
+	"unix_socket_directories",
 }
 
 // TLSProtocolVersion is a minimum TLS protocol version accepted by the server.
@@ -185,6 +246,20 @@ type ClusterStatus struct {
 	// active.
 	// +optional
 	TLSSecretHash string `json:"tlsSecretHash,omitempty"`
+
+	// parametersHash identifies the generated configuration (spec.parameters)
+	// the server was last asked to reload. Empty while spec.parameters is
+	// empty.
+	// +optional
+	ParametersHash string `json:"parametersHash,omitempty"`
+
+	// pendingRestart lists the parameters the server reports as changed but
+	// not yet in effect until a restart (pg_settings.pending_restart). The
+	// operator restarts the pod once when one of them comes from
+	// spec.parameters.
+	// +optional
+	// +listType=atomic
+	PendingRestart []string `json:"pendingRestart,omitempty"`
 
 	// conditions represent the current state of the Cluster resource.
 	// +listType=map

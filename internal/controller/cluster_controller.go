@@ -73,6 +73,10 @@ type ClusterReconciler struct {
 	// to a real PostgreSQL connection. Tests override it.
 	ReloadServerConfig func(ctx context.Context, cfg postgres.ConnectionConfig) error
 
+	// ConnectParameterServer connects to PostgreSQL to apply spec.parameters.
+	// Optional; defaults to a real PostgreSQL connection. Tests override it.
+	ConnectParameterServer func(ctx context.Context, cfg postgres.ConnectionConfig) (ParameterServer, error)
+
 	// Now returns the current time. Optional; tests override it to exercise
 	// certificate renewal and CA rotation.
 	Now func() time.Time
@@ -184,11 +188,18 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		cluster.Status.TLSSecretHash = ""
 	}
 
-	// The pg_hba ConfigMap must exist before a pod that mounts it starts.
+	// The pg_hba and configuration ConfigMaps must exist before a pod that
+	// mounts them starts.
 	if err := r.reconcileHBAConfigMap(ctx, cluster); err != nil {
 		log.Error(err, "Failed to reconcile pg_hba ConfigMap")
 		return r.updateStatus(ctx, cluster, false, err)
 	}
+	if layout, err := resolvePostgresLayout(cluster); err == nil {
+		if err := r.reconcileConfigMap(ctx, cluster, layout); err != nil {
+			log.Error(err, "Failed to reconcile configuration ConfigMap")
+			return r.updateStatus(ctx, cluster, false, err)
+		}
+	} // else reconcileStatefulSet reports the layout error
 
 	// Reconcile StatefulSet
 	if err := r.reconcileStatefulSet(ctx, cluster, secret); err != nil {
@@ -200,6 +211,10 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// the StatefulSet stopped referencing them.
 	if err := r.cleanupHBAConfigMap(ctx, cluster); err != nil {
 		log.Error(err, "Failed to clean up pg_hba ConfigMap")
+		return r.updateStatus(ctx, cluster, false, err)
+	}
+	if err := r.cleanupConfigMap(ctx, cluster); err != nil {
+		log.Error(err, "Failed to clean up configuration ConfigMap")
 		return r.updateStatus(ctx, cluster, false, err)
 	}
 	if err := r.cleanupTLSResources(ctx, cluster); err != nil {
@@ -219,6 +234,10 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		tlsPending = r.reconcileTLSState(ctx, cluster, material, ready)
 	}
 
+	// Apply spec.parameters once the TLS state (and so how the operator
+	// connects) is known. Never fails the reconcile.
+	parametersRecheck := r.reconcileParameters(ctx, cluster, ready)
+
 	// Converge the client-facing connection info last, once the TLS state of
 	// this reconcile is known.
 	var caPEM []byte
@@ -236,6 +255,9 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 	if tlsPending {
 		result.RequeueAfter = shorterRequeue(result.RequeueAfter, 10*time.Second)
+	}
+	if parametersRecheck > 0 {
+		result.RequeueAfter = shorterRequeue(result.RequeueAfter, parametersRecheck)
 	}
 	if !tlsRecheckAt.IsZero() {
 		// Self-managed certificates: come back when they are due for renewal.
@@ -675,11 +697,15 @@ func (r *ClusterReconciler) reconcileStatefulSet(ctx context.Context, cluster *p
 
 	container := buildPostgresContainer(secret, image, port, cluster.Spec.Resources, layout)
 
-	// TLS (spec.tls): extra volumes, mounts and server args. All empty when
-	// TLS is disabled, so StatefulSets of non-TLS Clusters are unchanged.
+	// TLS (spec.tls) and the generated configuration file (spec.parameters):
+	// extra volumes, mounts and server args. All empty when neither is used,
+	// so StatefulSets of such Clusters are unchanged.
 	volumes, tlsMounts := postgresTLSVolumes(cluster)
+	configVolumes, configMounts := postgresConfigVolumes(cluster)
+	volumes = append(volumes, configVolumes...)
 	container.VolumeMounts = append(container.VolumeMounts, tlsMounts...)
-	container.Args = postgresTLSArgs(cluster.Spec.TLS)
+	container.VolumeMounts = append(container.VolumeMounts, configMounts...)
+	container.Args = postgresServerArgs(cluster)
 
 	sts := &appsv1.StatefulSet{}
 	err = r.Get(ctx, types.NamespacedName{Name: stsName, Namespace: cluster.Namespace}, sts)

@@ -38,6 +38,9 @@ spec:
   # tls:
   #   issuerRef: {name: my-ca-issuer}   # or: cert-manager issues the certificate
   #   secretName: example-cluster-tls   # or: your own tls.crt/tls.key/ca.crt Secret
+  # parameters:              # optional postgresql.conf settings
+  #   shared_buffers: 128MB
+  #   shared_preload_libraries: pg_stat_statements
   resources:
     requests:
       memory: "256Mi"
@@ -69,6 +72,16 @@ rejects non-TLS TCP connections (`requireTLS`, default `true`), the operator
 connects with `sslmode=verify-full`, and the credentials Secrets gain `sslmode`,
 `ca.crt` and `uri`. Without `spec.tls` nothing changes. See
 [Clusters → TLS](docs/user-guide/clusters.md#tls).
+
+#### Server parameters
+
+`spec.parameters` sets PostgreSQL configuration parameters (`work_mem`,
+`shared_buffers`, `shared_preload_libraries`, ...). The operator writes them to
+a ConfigMap-backed configuration file, reloads the server when they change and
+restarts the pod only when a parameter needs it (`status.pendingRestart`,
+condition `ParametersApplied`). Parameters the operator manages (`port`,
+`listen_addresses`, file locations, TLS and WAL-archiving settings) are
+rejected. See [Clusters → Parameters](docs/user-guide/clusters.md#parameters).
 
 #### Data directory layout
 

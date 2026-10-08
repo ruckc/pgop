@@ -53,6 +53,7 @@ spec:
 | `tls.issuerRef.group` | string | `cert-manager.io` | Issuer API group (for external issuers) |
 | `tls.requireTLS` | bool | `true` | Reject non-TLS TCP connections |
 | `tls.minProtocolVersion` | string | `TLSv1.2` | `TLSv1.2` or `TLSv1.3` |
+| `parameters` | map[string]string | - | PostgreSQL configuration parameters. See [Parameters](#parameters) |
 
 ## Status
 
@@ -62,7 +63,113 @@ spec:
 | `endpoint` | Service endpoint (hostname:port) |
 | `secretName` | Name of the credentials secret |
 | `tlsSecretHash` | Hash of the certificate the server was last confirmed to present (TLS only) |
-| `conditions` | Detailed status conditions (`Available`, `ExistingVolume`, `TLSReady`) |
+| `parametersHash` | Hash of the generated configuration file the server was last asked to reload (`parameters` only) |
+| `pendingRestart` | Parameters the server reports as needing a restart (`pg_settings.pending_restart`) |
+| `conditions` | Detailed status conditions (`Available`, `ExistingVolume`, `TLSReady`, `ParametersApplied`) |
+
+## Parameters
+
+`spec.parameters` sets PostgreSQL server configuration parameters (GUCs):
+
+```yaml
+apiVersion: pgop.ruck.io/v1alpha1
+kind: Cluster
+metadata:
+  name: production-db
+spec:
+  parameters:
+    shared_buffers: 1GB
+    work_mem: 16MB
+    max_connections: "200"
+    shared_preload_libraries: pg_stat_statements
+    pg_stat_statements.track: all
+```
+
+Values are strings; quote numbers in YAML (`"200"`). Keys are PostgreSQL
+parameter names (including `extension.setting` names), matched
+case-insensitively like PostgreSQL does.
+
+### How parameters are applied
+
+- The operator renders the parameters into `postgresql.conf` in the ConfigMap
+  `<cluster>-config`, owned by the Cluster, and starts the server with
+  `-c config_file=/etc/pgop/config/postgresql.conf`. That file first includes
+  the data directory's own `postgresql.conf` (`include_if_exists`), so the
+  image and `initdb` defaults still apply and `spec.parameters` overrides them.
+- Changing a parameter only changes the ConfigMap, not the pod template. The
+  kubelet updates the mounted file within about a minute; the operator waits
+  for the server to see the new file (`pg_file_settings`) and then runs
+  `pg_reload_conf()`.
+- If a changed parameter only takes effect on a restart
+  (`pg_settings.pending_restart`, for example `shared_buffers`,
+  `max_connections` or `shared_preload_libraries`), the parameters are listed
+  in `status.pendingRestart` and the operator restarts the pod once, through
+  the pod template annotation `pgop.ruck.io/parameters-restart`. With a single
+  replica this means a short outage.
+- The `ParametersApplied` condition reports progress:
+
+  | Reason | Meaning |
+  |--------|---------|
+  | `Applied` (`True`) | Every parameter is in effect. |
+  | `WaitingForServer` | The pod is not ready, a rollout is in progress, or the operator cannot connect. |
+  | `WaitingForSync` | The server does not see the current file yet (kubelet sync delay), or has not restarted onto it. |
+  | `Reloading` | `pg_reload_conf()` was run; the result is being checked. |
+  | `PendingRestart` | A parameter needs a restart; the pod is being restarted. |
+  | `InvalidParameter` | The server rejects a name or value (the message says which). Nothing is reloaded or restarted until it is fixed. |
+  | `OverriddenByAlterSystem` | `ALTER SYSTEM` overrides a parameter (see below). |
+
+  The condition never affects `Available`/`ready`: a cluster stays usable
+  while parameters are being applied or are invalid.
+
+Leaving `parameters` unset (or empty) keeps the image's configuration and does
+not change the pod at all, so upgrading the operator does not restart existing
+Clusters. Adding the first parameter, or removing the last one, changes the
+pod template and restarts the pod once.
+
+### Reserved parameters
+
+Parameters the operator manages are rejected when the Cluster is created or
+updated:
+
+| Parameters | Why |
+|------------|-----|
+| `listen_addresses`, `port`, `unix_socket_directories` | Service, probes and the operator's own connections depend on them (use `spec.port`) |
+| `config_file`, `data_directory`, `hba_file`, `ident_file`, `external_pid_file` | File locations set up by the operator and the image |
+| `include`, `include_dir`, `include_if_exists` | Would read arbitrary files |
+| `ssl`, `ssl_cert_file`, `ssl_key_file`, `ssl_min_protocol_version` | Controlled by [`spec.tls`](#tls) |
+| `archive_mode`, `archive_command`, `archive_library`, `restore_command` | Reserved for operator-managed WAL archiving (physical backups) |
+
+Other TLS settings such as `ssl_ciphers` or `ssl_max_protocol_version` can be
+set. Values containing line breaks are reported as `InvalidParameter`.
+
+### ALTER SYSTEM
+
+`ALTER SYSTEM` writes `postgresql.auto.conf` in the data directory, which
+PostgreSQL reads after the main configuration file, so it overrides
+`spec.parameters`. The operator checks for this every few minutes and sets
+`ParametersApplied=False` with reason `OverriddenByAlterSystem` (and a Warning
+event) naming the affected parameters. Run `ALTER SYSTEM RESET <name>` and
+`SELECT pg_reload_conf()` to hand the parameter back to `spec.parameters`.
+Per-database and per-role settings (`ALTER DATABASE ... SET`,
+`ALTER ROLE ... SET`) are not tracked.
+
+### Extensions and libraries
+
+The operator does not install libraries. `shared_preload_libraries` must name
+libraries present in the image: `pg_stat_statements` and the other contrib
+modules ship with the official image, others (for example `pgaudit`) need a
+custom image. Until the restart that loads a library completes, a Database
+whose `CREATE EXTENSION` needs it keeps retrying.
+
+### Recovering from a bad value
+
+A value the server cannot start with (for example a misspelled
+`shared_preload_libraries` entry) makes the pod crash-loop after the restart.
+Fix the value in `spec.parameters`: only the ConfigMap changes, and the next
+container restart reads the corrected file, so no manual pod deletion is
+needed. (If you instead remove *all* parameters, the pod template changes and
+a StatefulSet stuck on a crash-looping pod may need `kubectl delete pod` to
+roll forward.)
 
 ## Storage Retention
 
