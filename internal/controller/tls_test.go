@@ -666,7 +666,8 @@ var _ = Describe("Cluster TLS", func() {
 			cleanup(role)
 
 			rr := &RoleReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
-			pw, secretName, err := rr.reconcileCredentialsSecret(ctx, role, cluster)
+			const pw = "role-pw"
+			secretName, err := rr.reconcileCredentialsSecret(ctx, role, cluster, nil, pw)
 			Expect(err).NotTo(HaveOccurred())
 			s := getSecret(secretName)
 			Expect(string(s.Data[SecretKeySSLMode])).To(Equal("disable"))
@@ -679,9 +680,8 @@ var _ = Describe("Cluster TLS", func() {
 			meta.SetStatusCondition(&cluster.Status.Conditions, metav1.Condition{
 				Type: ConditionTypeTLSReady, Status: metav1.ConditionTrue, Reason: ReasonTLSActive, Message: "test"})
 
-			pw2, _, err := rr.reconcileCredentialsSecret(ctx, role, cluster)
+			_, err = rr.reconcileCredentialsSecret(ctx, role, cluster, getSecret(secretName), pw)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(pw2).To(Equal(pw))
 			s = getSecret(secretName)
 			Expect(string(s.Data[SecretKeyPassword])).To(Equal(pw))
 			Expect(string(s.Data[SecretKeyPort])).To(Equal("6432"))

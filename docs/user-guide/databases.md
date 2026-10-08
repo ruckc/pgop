@@ -108,7 +108,9 @@ state. With `sslmode=verify-full`, mount `ca.crt` and point `sslrootcert` (or
 
 The credentials mirror the owner Role's password (read from the Role's
 `<cluster>-<owner>-credentials` Secret), with the `database` key set to this
-Database. Because the name is deterministic, a Helm chart can mount it before
+Database. When the owner's password changes (a new `passwordSecretRef` value or
+a [rotation](roles.md#password-rotation)), the operator updates this Secret
+too. Because the name is deterministic, a Helm chart can mount it before
 `status` is populated.
 
 The Secret is only created when `owner` is set and the owner Role has `login`

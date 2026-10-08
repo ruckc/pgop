@@ -34,6 +34,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	postgresv1alpha1 "github.com/ruckc/pgop/api/v1alpha1"
@@ -357,6 +358,11 @@ func (r *DatabaseReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&postgresv1alpha1.Database{}).
 		Owns(&corev1.Secret{}).
 		Watches(&postgresv1alpha1.Role{}, handler.EnqueueRequestsFromMapFunc(r.databasesForOwnerRole)).
+		// The Database Secret copies the owner's password: follow changes to
+		// the role credentials Secret (passwordSecretRef updates, rotations).
+		Watches(&corev1.Secret{},
+			handler.EnqueueRequestsFromMapFunc(r.databasesForRoleSecret),
+			builder.WithPredicates(predicate.NewPredicateFuncs(isRoleCredentialsSecret))).
 		Watches(&postgresv1alpha1.Cluster{},
 			handler.EnqueueRequestsFromMapFunc(r.databasesForCluster),
 			builder.WithPredicates(clusterConnectionChanged)).
@@ -376,6 +382,37 @@ func (r *DatabaseReconciler) databasesForCluster(ctx context.Context, obj client
 	for i := range databases.Items {
 		if databases.Items[i].Spec.ClusterRef.Name == obj.GetName() {
 			requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&databases.Items[i])})
+		}
+	}
+	return requests
+}
+
+// isRoleCredentialsSecret reports whether obj is a role credentials Secret
+// created by the Role controller.
+func isRoleCredentialsSecret(obj client.Object) bool {
+	l := obj.GetLabels()
+	return l[LabelAppName] == AppNamePostgresqlRole && l[LabelAppManagedBy] == LabelValuePgop &&
+		l[LabelAppInstance] != "" && l[LabelCluster] != ""
+}
+
+// databasesForRoleSecret maps a role credentials Secret to the Databases owned
+// by that Role on the same Cluster, so their credentials Secrets pick up a
+// changed password.
+func (r *DatabaseReconciler) databasesForRoleSecret(ctx context.Context, obj client.Object) []reconcile.Request {
+	if !isRoleCredentialsSecret(obj) {
+		return nil
+	}
+	roleName, clusterName := obj.GetLabels()[LabelAppInstance], obj.GetLabels()[LabelCluster]
+	databases := &postgresv1alpha1.DatabaseList{}
+	if err := r.List(ctx, databases, client.InNamespace(obj.GetNamespace())); err != nil {
+		logf.FromContext(ctx).Error(err, "Failed to list Databases for role Secret", "secret", obj.GetName())
+		return nil
+	}
+	var requests []reconcile.Request
+	for i := range databases.Items {
+		db := &databases.Items[i]
+		if db.Spec.Owner == roleName && db.Spec.ClusterRef.Name == clusterName {
+			requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(db)})
 		}
 	}
 	return requests

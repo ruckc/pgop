@@ -20,6 +20,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"time"
 
@@ -29,6 +30,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/events"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -49,12 +52,20 @@ const (
 type RoleReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+	// Recorder emits Kubernetes Events for the Role (password rotations).
+	// Optional: when nil (as in tests) no Events are emitted.
+	Recorder events.EventRecorder
+	// APIReader reads the Role uncached before a password rotation, so a
+	// stale cache cannot cause a second rotation. Optional: when nil the
+	// cached Role is used.
+	APIReader client.Reader
 }
 
 // +kubebuilder:rbac:groups=pgop.ruck.io,resources=roles,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=pgop.ruck.io,resources=roles/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=pgop.ruck.io,resources=roles/finalizers,verbs=update
 // +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 
 func (r *RoleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
@@ -137,18 +148,25 @@ func (r *RoleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		}
 	}
 
-	// Reconcile credentials secret and get password
-	// NOLOGIN (group) roles get no password and no credentials Secret.
-	var password, secretName string
+	// Resolve the password. NOLOGIN (group) roles get no password and no
+	// credentials Secret.
+	now := time.Now()
+	var dp desiredPassword
+	var existingSecret *corev1.Secret
 	if role.Spec.IsLogin() {
-		password, secretName, err = r.reconcileCredentialsSecret(ctx, role, cluster)
-		if err != nil {
-			log.Error(err, "Failed to reconcile credentials secret")
+		if existingSecret, err = r.getCredentialsSecret(ctx, role, cluster); err != nil {
+			log.Error(err, "Failed to get credentials secret")
+			return r.updateStatus(ctx, role, false, "", err)
+		}
+		if dp, err = r.resolvePassword(ctx, role, existingSecret, now); err != nil {
+			log.Error(err, "Failed to resolve role password")
 			return r.updateStatus(ctx, role, false, "", err)
 		}
 	}
 
-	// Create or update the role
+	// Create or update the role. The password is only sent to an existing
+	// role when it differs from the one last applied, so it does not appear
+	// in server logs on every reconcile.
 	opts := postgres.RoleOptions{
 		Login:           role.Spec.IsLogin(),
 		Superuser:       role.Spec.Superuser,
@@ -158,16 +176,41 @@ func (r *RoleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		Replication:     role.Spec.Replication,
 		BypassRLS:       role.Spec.BypassRLS,
 		ConnectionLimit: role.Spec.GetConnectionLimit(),
-		Password:        password,
+		Password:        dp.value,
+		KeepExistingPassword: dp.value != "" && !dp.force &&
+			role.Status.PasswordHash == passwordFingerprint(role, dp.value),
 	}
 
 	pgName := role.PostgresName()
 	if err := pgClient.CreateRole(ctx, pgName, opts); err != nil {
 		log.Error(err, "Failed to create/update role")
-		return r.updateStatus(ctx, role, false, secretName, err)
+		return r.updateStatus(ctx, role, false, role.Status.SecretName, err)
 	}
 	// Record the PostgreSQL name that now exists so deletion drops exactly it.
 	role.Status.RoleName = pgName
+
+	// Write the credentials Secret after PostgreSQL accepted the password: if
+	// the write fails, the next reconcile sets the password again (or, for a
+	// rotation, rotates again) instead of handing out a password PostgreSQL
+	// does not know.
+	var secretName string
+	if role.Spec.IsLogin() {
+		if secretName, err = r.reconcileCredentialsSecret(ctx, role, cluster, existingSecret, dp.value); err != nil {
+			log.Error(err, "Failed to reconcile credentials secret")
+			return r.updateStatus(ctx, role, false, role.Status.SecretName, err)
+		}
+		recordPassword(role, dp, now)
+		if dp.rotated {
+			log.Info("Rotated role password")
+			if r.Recorder != nil {
+				r.Recorder.Eventf(role, nil, corev1.EventTypeNormal, ReasonPasswordRotated, "RotatePassword",
+					"Rotated the password of role %q", pgName)
+			}
+		}
+	} else {
+		role.Status.PasswordHash = ""
+		role.Status.PasswordRotatedAt = nil
+	}
 
 	// Handle role memberships (grant, update options, revoke removed ones)
 	if err := reconcileMemberships(ctx, pgClient, role, pgName); err != nil {
@@ -176,77 +219,123 @@ func (r *RoleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	}
 
 	log.Info("Role reconciled successfully")
-	return r.updateStatus(ctx, role, true, secretName, nil)
+	result, err := r.updateStatus(ctx, role, true, secretName, nil)
+	if err == nil {
+		if next := nextRotationIn(role, time.Now()); next > 0 {
+			result.RequeueAfter = next
+		}
+	}
+	return result, err
 }
 
-func (r *RoleReconciler) reconcileCredentialsSecret(ctx context.Context, role *postgresv1alpha1.Role, cluster *postgresv1alpha1.Cluster) (string, string, error) {
-	secretName := cluster.Name + "-" + role.Name + "-credentials"
+// credentialsSecretName returns the name of the Role's credentials Secret.
+func credentialsSecretName(role *postgresv1alpha1.Role, cluster *postgresv1alpha1.Cluster) string {
+	return cluster.Name + "-" + role.Name + "-credentials"
+}
+
+// getCredentialsSecret returns the Role's credentials Secret, or nil when it
+// does not exist yet.
+func (r *RoleReconciler) getCredentialsSecret(ctx context.Context, role *postgresv1alpha1.Role, cluster *postgresv1alpha1.Cluster) (*corev1.Secret, error) {
+	secret := &corev1.Secret{}
+	err := r.Get(ctx, types.NamespacedName{Name: credentialsSecretName(role, cluster), Namespace: role.Namespace}, secret)
+	if apierrors.IsNotFound(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return secret, nil
+}
+
+// roleSecretLabels are the labels of a role credentials Secret. The Database
+// controller uses them to map the Secret back to the Role.
+func roleSecretLabels(role *postgresv1alpha1.Role) map[string]string {
+	return map[string]string{
+		LabelAppName:      AppNamePostgresqlRole,
+		LabelAppInstance:  role.Name,
+		LabelAppManagedBy: LabelValuePgop,
+		LabelCluster:      role.Spec.ClusterRef.Name,
+	}
+}
+
+// reconcileCredentialsSecret creates or updates the Role's credentials Secret
+// so it holds password and the current connection info (host, port, sslmode,
+// ca.crt and a uri built from the same password). existing is the current
+// Secret, or nil. It returns the Secret's name.
+func (r *RoleReconciler) reconcileCredentialsSecret(ctx context.Context, role *postgresv1alpha1.Role, cluster *postgresv1alpha1.Cluster, existing *corev1.Secret, password string) (string, error) {
+	secretName := credentialsSecretName(role, cluster)
 
 	t, err := clusterClientTLS(ctx, r.Client, cluster)
 	if err != nil {
-		return "", "", err
+		return "", err
 	}
 	host, port := clusterHost(cluster), clusterPort(cluster)
 
-	// Check if secret already exists
-	existingSecret := &corev1.Secret{}
-	err = r.Get(ctx, types.NamespacedName{Name: secretName, Namespace: role.Namespace}, existingSecret)
-	if err == nil {
-		// Secret exists: keep its username/password and converge the
-		// connection info (host, port, sslmode, uri, ca.crt) so existing
-		// Secrets pick up port and TLS changes.
-		if existingSecret.Data == nil {
-			existingSecret.Data = map[string][]byte{}
+	if existing == nil {
+		data := map[string][]byte{
+			SecretKeyUsername: []byte(role.PostgresName()),
+			SecretKeyPassword: []byte(password),
 		}
-		if applyConnectionInfo(existingSecret.Data, host, port, defaultDatabaseName, t) {
-			if err := r.Update(ctx, existingSecret); err != nil {
-				return "", "", err
+		applyConnectionInfo(data, host, port, defaultDatabaseName, t)
+		secret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      secretName,
+				Namespace: role.Namespace,
+				Labels:    roleSecretLabels(role),
+			},
+			Type: corev1.SecretTypeOpaque,
+			Data: data,
+		}
+		// Set owner reference so secret is garbage collected when Role is deleted
+		if err := controllerutil.SetControllerReference(role, secret, r.Scheme); err != nil {
+			return "", err
+		}
+		return secretName, r.Create(ctx, secret)
+	}
+
+	// The Secret exists: keep its username and converge password, labels and
+	// connection info (host, port, sslmode, uri, ca.crt). On a conflict the
+	// Secret is re-read and the change applied again.
+	secret := existing.DeepCopy()
+	return secretName, retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		if !convergeRoleSecret(secret, role, password, host, port, t) {
+			return nil
+		}
+		err := r.Update(ctx, secret)
+		if apierrors.IsConflict(err) {
+			if getErr := r.Get(ctx, client.ObjectKeyFromObject(secret), secret); getErr != nil {
+				return getErr
 			}
 		}
-		return string(existingSecret.Data[SecretKeyPassword]), secretName, nil
-	}
-	if !apierrors.IsNotFound(err) {
-		return "", "", err
-	}
+		return err
+	})
+}
 
-	// Generate a new password
-	password, err := generateRolePassword(32)
-	if err != nil {
-		return "", "", fmt.Errorf("failed to generate password: %w", err)
+// convergeRoleSecret sets the password, labels and connection info of an
+// existing role credentials Secret and reports whether anything changed.
+func convergeRoleSecret(secret *corev1.Secret, role *postgresv1alpha1.Role, password, host string, port int32, t clientTLS) bool {
+	changed := false
+	if secret.Data == nil {
+		secret.Data = map[string][]byte{}
 	}
-
-	data := map[string][]byte{
-		SecretKeyUsername: []byte(role.PostgresName()),
-		SecretKeyPassword: []byte(password),
+	if string(secret.Data[SecretKeyPassword]) != password {
+		secret.Data[SecretKeyPassword] = []byte(password)
+		changed = true
 	}
-	applyConnectionInfo(data, host, port, defaultDatabaseName, t)
-
-	// Create the credentials secret
-	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      secretName,
-			Namespace: role.Namespace,
-			Labels: map[string]string{
-				LabelAppName:           "postgresql-role",
-				LabelAppInstance:       role.Name,
-				LabelAppManagedBy:      LabelValuePgop,
-				"pgop.ruck.io/cluster": role.Spec.ClusterRef.Name,
-			},
-		},
-		Type: corev1.SecretTypeOpaque,
-		Data: data,
+	if secret.Labels == nil {
+		secret.Labels = map[string]string{}
 	}
-
-	// Set owner reference so secret is garbage collected when Role is deleted
-	if err := controllerutil.SetControllerReference(role, secret, r.Scheme); err != nil {
-		return "", "", err
+	for k, v := range roleSecretLabels(role) {
+		if secret.Labels[k] != v {
+			secret.Labels[k] = v
+			changed = true
+		}
 	}
-
-	if err := r.Create(ctx, secret); err != nil {
-		return "", "", err
+	// applyConnectionInfo rebuilds uri from the (possibly new) password.
+	if applyConnectionInfo(secret.Data, host, port, defaultDatabaseName, t) {
+		changed = true
 	}
-
-	return password, secretName, nil
+	return changed
 }
 
 func generateRolePassword(length int) (string, error) {
@@ -287,6 +376,9 @@ func (r *RoleReconciler) updateStatus(ctx context.Context, role *postgresv1alpha
 	} else if reconcileErr != nil {
 		condition.Status = metav1.ConditionFalse
 		condition.Reason = ReasonReconcileError
+		if ce, ok := errors.AsType[*conditionError](reconcileErr); ok {
+			condition.Reason = ce.reason
+		}
 		condition.Message = reconcileErr.Error()
 	} else {
 		condition.Status = metav1.ConditionFalse
@@ -312,6 +404,7 @@ func (r *RoleReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&postgresv1alpha1.Role{}).
 		Owns(&corev1.Secret{}).
+		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.rolesForPasswordSecret)).
 		Watches(&postgresv1alpha1.Cluster{},
 			handler.EnqueueRequestsFromMapFunc(r.rolesForCluster),
 			builder.WithPredicates(clusterConnectionChanged)).

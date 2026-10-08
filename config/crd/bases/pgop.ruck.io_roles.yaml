@@ -149,10 +149,37 @@ spec:
                 x-kubernetes-list-map-keys:
                 - role
                 x-kubernetes-list-type: map
+              passwordRotation:
+                description: |-
+                  passwordRotation enables scheduled rotation of the operator-generated
+                  password. A rotation sets a new password in PostgreSQL and then updates
+                  the role credentials Secret (and the credentials Secrets of Databases
+                  owned by this role). The old password stops working for new connections
+                  immediately; existing sessions stay connected. Mutually exclusive with
+                  passwordSecretRef.
+                properties:
+                  every:
+                    description: |-
+                      every is the rotation interval as a Go duration string (for example
+                      "720h" for 30 days). The minimum is 1h. The schedule is measured from
+                      status.passwordRotatedAt.
+                    maxLength: 32
+                    pattern: ^([0-9]+(\.[0-9]+)?(ns|us|ms|s|m|h))+$
+                    type: string
+                    x-kubernetes-validations:
+                    - message: passwordRotation.every must be at least 1h
+                      rule: duration(self) >= duration('1h')
+                required:
+                - every
+                type: object
               passwordSecretRef:
                 description: |-
-                  passwordSecretRef references a Secret containing the password for this role.
-                  The secret must contain a key with the password value.
+                  passwordSecretRef references a Secret in the Role's namespace whose key
+                  holds the password for this role. When set, the operator uses that value
+                  instead of generating one, copies it into the role credentials Secret
+                  and follows changes to the referenced Secret. The referenced Secret is
+                  never modified or owned by the operator. When the reference is removed,
+                  the current password is kept. Mutually exclusive with passwordRotation.
                 properties:
                   key:
                     description: key is the key in the secret to select
@@ -204,6 +231,9 @@ spec:
             - clusterRef
             type: object
             x-kubernetes-validations:
+            - message: passwordRotation cannot be combined with passwordSecretRef;
+                rotate the referenced Secret instead
+              rule: '!(has(self.passwordSecretRef) && has(self.passwordRotation))'
             - message: roleName is immutable
               rule: has(oldSelf.roleName) == has(self.roleName) && (!has(self.roleName)
                 || self.roleName == oldSelf.roleName)
@@ -282,6 +312,24 @@ spec:
                   type: string
                 type: array
                 x-kubernetes-list-type: set
+              passwordHash:
+                description: |-
+                  passwordHash is a salted SHA-256 fingerprint of the password last set in
+                  PostgreSQL. The operator only sends a new password to PostgreSQL when the
+                  desired password's fingerprint differs. It is not the password.
+                type: string
+              passwordRotatedAt:
+                description: |-
+                  passwordRotatedAt is when the operator last generated the role's
+                  password (initially or by rotation). The rotation schedule is measured
+                  from it. Unset while the password comes from passwordSecretRef.
+                format: date-time
+                type: string
+              passwordRotationRequest:
+                description: |-
+                  passwordRotationRequest is the last value of the
+                  pgop.ruck.io/rotate-password annotation that the operator acted on.
+                type: string
               ready:
                 description: ready indicates if the role has been created in the database
                 type: boolean

@@ -17,6 +17,7 @@ limitations under the License.
 package postgres
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -333,6 +334,35 @@ func TestBuildAlterRoleQuery(t *testing.T) {
 				if !containsString(result, c) {
 					t.Errorf("buildAlterRoleQuery() = %q, should contain %q", result, c)
 				}
+			}
+		})
+	}
+}
+
+func TestBuildRoleQueryPassword(t *testing.T) {
+	client := &Client{}
+	opts := RoleOptions{Login: true, Password: "s3cret", KeepExistingPassword: true}
+
+	tests := []struct {
+		name         string
+		exists       bool
+		opts         RoleOptions
+		wantPrefix   string
+		wantPassword bool
+	}{
+		{"new role always gets the password", false, opts, `CREATE ROLE "app"`, true},
+		{"existing role keeps an unchanged password", true, opts, `ALTER ROLE "app"`, false},
+		{"existing role gets a changed password", true,
+			RoleOptions{Login: true, Password: "s3cret"}, `ALTER ROLE "app"`, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			q := client.buildRoleQuery(testMember, tt.exists, tt.opts)
+			if !strings.HasPrefix(q, tt.wantPrefix) {
+				t.Errorf("buildRoleQuery() = %q, want prefix %q", q, tt.wantPrefix)
+			}
+			if got := strings.Contains(q, "PASSWORD"); got != tt.wantPassword {
+				t.Errorf("buildRoleQuery() = %q, contains PASSWORD = %v, want %v", q, got, tt.wantPassword)
 			}
 		})
 	}
