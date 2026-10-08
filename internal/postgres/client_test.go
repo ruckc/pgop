@@ -17,8 +17,12 @@ limitations under the License.
 package postgres
 
 import (
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/lib/pq"
 )
 
 const (
@@ -85,46 +89,100 @@ func TestQuoteIdent(t *testing.T) {
 	}
 }
 
-func TestEscapeString(t *testing.T) {
+func TestQuoteLiteral(t *testing.T) {
 	tests := []struct {
 		name     string
 		input    string
 		expected string
 	}{
-		{
-			name:     "simple string",
-			input:    "hello",
-			expected: "hello",
-		},
-		{
-			name:     "string with single quote",
-			input:    "it's",
-			expected: "it''s",
-		},
-		{
-			name:     "string with multiple quotes",
-			input:    "it's a 'test'",
-			expected: "it''s a ''test''",
-		},
-		{
-			name:     "empty string",
-			input:    "",
-			expected: "",
-		},
-		{
-			name:     "password with special chars",
-			input:    "p@ss'w0rd!",
-			expected: "p@ss''w0rd!",
-		},
+		{"simple string", "hello", `'hello'`},
+		{"string with single quote", "don't", `'don''t'`},
+		{"string with multiple quotes", "it's a 'test'", `'it''s a ''test'''`},
+		{"empty string", "", `''`},
+		{"password with special chars", "p@ss'w0rd!", `'p@ss''w0rd!'`},
+		// A backslash makes the literal an escape string, so it means the
+		// same whatever standard_conforming_strings is set to.
+		{"backslash", `a\b`, `E'a\\b'`},
+		{"trailing backslash", `abc\`, `E'abc\\'`},
+		{"backslash before a quote", `a\'; DROP ROLE x; --`, `E'a\\''; DROP ROLE x; --'`},
+		{"double quotes are not special", `a"b`, `'a"b'`},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := escapeString(tt.input)
+			result := quoteLiteral(tt.input)
 			if result != tt.expected {
-				t.Errorf("escapeString(%q) = %q, want %q", tt.input, result, tt.expected)
+				t.Errorf("quoteLiteral(%q) = %q, want %q", tt.input, result, tt.expected)
 			}
 		})
+	}
+}
+
+// unquoteLiteral parses a literal produced by quoteLiteral the way
+// PostgreSQL does, for both settings of standard_conforming_strings when the
+// literal is a plain '...' string, so the round trip proves the quoting.
+func unquoteLiteral(t *testing.T, lit string, standardConformingStrings bool) string {
+	t.Helper()
+	escape := strings.HasPrefix(lit, "E'")
+	if escape {
+		lit = lit[1:]
+	}
+	if len(lit) < 2 || lit[0] != '\'' || lit[len(lit)-1] != '\'' {
+		t.Fatalf("not a quoted literal: %q", lit)
+	}
+	body := lit[1 : len(lit)-1]
+	backslashEscapes := escape || !standardConformingStrings
+	var out strings.Builder
+	for i := 0; i < len(body); i++ {
+		switch c := body[i]; {
+		case c == '\'':
+			if i+1 >= len(body) || body[i+1] != '\'' {
+				t.Fatalf("unescaped quote ends the literal early in %q", lit)
+			}
+			out.WriteByte('\'')
+			i++
+		case c == '\\' && backslashEscapes:
+			if i+1 >= len(body) {
+				t.Fatalf("dangling backslash in %q", lit)
+			}
+			out.WriteByte(body[i+1])
+			i++
+		default:
+			out.WriteByte(c)
+		}
+	}
+	return out.String()
+}
+
+func TestQuoteLiteralRoundTrip(t *testing.T) {
+	for _, in := range []string{"", "plain", "it's", `a\b`, `\'`, `'\`, `\\'' --`, `x\'); DROP ROLE postgres; --`} {
+		for _, scs := range []bool{true, false} {
+			if got := unquoteLiteral(t, quoteLiteral(in), scs); got != in {
+				t.Errorf("quoteLiteral(%q) parses back as %q (standard_conforming_strings=%v)", in, got, scs)
+			}
+		}
+	}
+}
+
+func TestRedactedError(t *testing.T) {
+	const pw = `s3cr'et\pw`
+	err := redactedError("failed to create/alter role \"app\"",
+		fmt.Errorf("syntax error at or near PASSWORD %s and %s and %s", quoteLiteral(pw), escapeString(pw), pw), pw)
+	if strings.Contains(err.Error(), "s3cr") {
+		t.Errorf("redactedError leaked the password: %q", err)
+	}
+	if !strings.Contains(err.Error(), "[REDACTED]") || !strings.HasPrefix(err.Error(), "failed to create/alter role \"app\": ") {
+		t.Errorf("unexpected redacted error: %q", err)
+	}
+
+	pqErr := &pq.Error{Code: "22023", Message: "invalid connection limit: -999",
+		Detail: "PASSWORD '" + pw + "'", Hint: pw, InternalQuery: pw}
+	err = redactedError("failed", fmt.Errorf("wrapped: %w", pqErr), pw)
+	if err.Error() != "failed: invalid connection limit: -999 (SQLSTATE 22023)" {
+		t.Errorf("unexpected error for a server error: %q", err)
+	}
+	if _, ok := errors.AsType[*pq.Error](err); ok {
+		t.Error("redactedError must not wrap the original error")
 	}
 }
 
@@ -230,6 +288,25 @@ func TestBuildRoleOptions(t *testing.T) {
 				attrNoBypassRLS,
 				attrConnLimitNeg1,
 				"PASSWORD 'pass''word'",
+			},
+		},
+		{
+			name: "password with backslash and quote",
+			opts: RoleOptions{
+				Login:           true,
+				ConnectionLimit: -1,
+				Password:        `pa\ss'word`,
+			},
+			expected: []string{
+				attrLogin,
+				attrNoSuperuser,
+				attrNoCreateDB,
+				attrNoCreateRole,
+				attrNoInherit,
+				attrNoReplication,
+				attrNoBypassRLS,
+				attrConnLimitNeg1,
+				`PASSWORD E'pa\\ss''word'`,
 			},
 		},
 	}

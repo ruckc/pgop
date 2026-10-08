@@ -158,27 +158,26 @@ func (r *RoleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 			log.Error(err, "Failed to get credentials secret")
 			return r.updateStatus(ctx, role, false, "", err)
 		}
-		if dp, err = r.resolvePassword(ctx, role, existingSecret, now); err != nil {
+		if dp, existingSecret, err = r.resolvePassword(ctx, role, existingSecret, now); err != nil {
 			log.Error(err, "Failed to resolve role password")
 			return r.updateStatus(ctx, role, false, "", err)
 		}
 	}
 
-	// Create or update the role. The password is only sent to an existing
-	// role when it differs from the one last applied, so it does not appear
-	// in server logs on every reconcile.
+	// Create or update the role. The password (sent as a SCRAM-SHA-256
+	// verifier, never in plaintext) is only sent to an existing role when it
+	// differs from the one last applied.
 	opts := postgres.RoleOptions{
-		Login:           role.Spec.IsLogin(),
-		Superuser:       role.Spec.Superuser,
-		CreateDB:        role.Spec.CreateDB,
-		CreateRole:      role.Spec.CreateRole,
-		Inherit:         role.Spec.IsInherit(),
-		Replication:     role.Spec.Replication,
-		BypassRLS:       role.Spec.BypassRLS,
-		ConnectionLimit: role.Spec.GetConnectionLimit(),
-		Password:        dp.value,
-		KeepExistingPassword: dp.value != "" && !dp.force &&
-			role.Status.PasswordHash == passwordFingerprint(role, dp.value),
+		Login:                role.Spec.IsLogin(),
+		Superuser:            role.Spec.Superuser,
+		CreateDB:             role.Spec.CreateDB,
+		CreateRole:           role.Spec.CreateRole,
+		Inherit:              role.Spec.IsInherit(),
+		Replication:          role.Spec.Replication,
+		BypassRLS:            role.Spec.BypassRLS,
+		ConnectionLimit:      role.Spec.GetConnectionLimit(),
+		Password:             dp.value,
+		KeepExistingPassword: dp.applied && !dp.force,
 	}
 
 	pgName := role.PostgresName()
@@ -279,9 +278,10 @@ func (r *RoleReconciler) reconcileCredentialsSecret(ctx context.Context, role *p
 		applyConnectionInfo(data, host, port, defaultDatabaseName, t)
 		secret := &corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:      secretName,
-				Namespace: role.Namespace,
-				Labels:    roleSecretLabels(role),
+				Name:        secretName,
+				Namespace:   role.Namespace,
+				Labels:      roleSecretLabels(role),
+				Annotations: map[string]string{AnnotationPasswordFingerprint: passwordFingerprint(role, password)},
 			},
 			Type: corev1.SecretTypeOpaque,
 			Data: data,
@@ -320,6 +320,15 @@ func convergeRoleSecret(secret *corev1.Secret, role *postgresv1alpha1.Role, pass
 	}
 	if string(secret.Data[SecretKeyPassword]) != password {
 		secret.Data[SecretKeyPassword] = []byte(password)
+		changed = true
+	}
+	// Only called once PostgreSQL has the password, so the fingerprint
+	// records what PostgreSQL has.
+	if fp := passwordFingerprint(role, password); secret.Annotations[AnnotationPasswordFingerprint] != fp {
+		if secret.Annotations == nil {
+			secret.Annotations = map[string]string{}
+		}
+		secret.Annotations[AnnotationPasswordFingerprint] = fp
 		changed = true
 	}
 	if secret.Labels == nil {

@@ -17,11 +17,13 @@ limitations under the License.
 package controller
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"time"
+	"unicode/utf8"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -32,6 +34,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	postgresv1alpha1 "github.com/ruckc/pgop/api/v1alpha1"
+	"github.com/ruckc/pgop/internal/postgres"
 )
 
 const (
@@ -41,9 +44,21 @@ const (
 	// re-applies the referenced password instead.
 	AnnotationRotatePassword = "pgop.ruck.io/rotate-password"
 
+	// AnnotationPasswordFingerprint on a role credentials Secret holds the
+	// salted SHA-256 fingerprint of the password last set in PostgreSQL. It
+	// lives next to the password it fingerprints, so it reveals nothing to
+	// anyone who cannot already read the password. It replaces the
+	// deprecated status.passwordHash, which anyone able to read Roles could
+	// brute-force offline.
+	AnnotationPasswordFingerprint = "pgop.ruck.io/password-fingerprint"
+
 	// ReasonPasswordSecretNotFound: spec.passwordSecretRef names a Secret or
 	// key that does not exist (or holds an empty value).
 	ReasonPasswordSecretNotFound = "PasswordSecretNotFound"
+	// ReasonPasswordSecretInvalid: the value of spec.passwordSecretRef is not
+	// usable as a password (not UTF-8, contains a NUL byte, or is already a
+	// SCRAM-SHA-256 verifier or MD5 hash).
+	ReasonPasswordSecretInvalid = "PasswordSecretInvalid"
 	// ReasonPasswordRotated is the Event reason for a password rotation.
 	ReasonPasswordRotated = "PasswordRotated"
 
@@ -76,21 +91,40 @@ type desiredPassword struct {
 	rotated bool
 	// fromRef is true when value comes from spec.passwordSecretRef.
 	fromRef bool
-	// force sends the password to PostgreSQL even when its fingerprint
-	// matches status.passwordHash (a rotate-password request on a Role that
-	// uses passwordSecretRef).
+	// force sends the password to PostgreSQL even when it is already applied
+	// (a rotate-password request on a Role that uses passwordSecretRef).
 	force bool
+	// applied is true when value is the password last set in PostgreSQL, as
+	// recorded by the credentials Secret's fingerprint annotation.
+	applied bool
 	// rotationRequest is the rotate-password annotation value acted on, or ""
 	// when the annotation holds no new request.
 	rotationRequest string
 }
 
 // passwordFingerprint returns the salted SHA-256 fingerprint of password that
-// is recorded in status.passwordHash. The Role's UID is the salt, so equal
-// passwords of different Roles do not share a fingerprint.
+// is recorded in the AnnotationPasswordFingerprint annotation of the
+// credentials Secret (and was recorded in the deprecated status.passwordHash).
+// The Role's UID is the salt, so equal passwords of different Roles do not
+// share a fingerprint.
 func passwordFingerprint(role *postgresv1alpha1.Role, password string) string {
 	sum := sha256.Sum256([]byte(string(role.UID) + "\x00" + password))
 	return hex.EncodeToString(sum[:])
+}
+
+// passwordApplied reports whether password is the one last set in
+// PostgreSQL, according to the fingerprint annotation of the credentials
+// Secret (nil when it does not exist). A Secret written before the
+// annotation existed falls back to the deprecated status.passwordHash, so
+// upgrading the operator does not re-send every password.
+func passwordApplied(role *postgresv1alpha1.Role, secret *corev1.Secret, password string) bool {
+	if secret == nil || password == "" {
+		return false
+	}
+	if fp, ok := secret.Annotations[AnnotationPasswordFingerprint]; ok {
+		return fp == passwordFingerprint(role, password)
+	}
+	return role.Status.PasswordHash != "" && role.Status.PasswordHash == passwordFingerprint(role, password)
 }
 
 // rotationInterval returns the effective scheduled rotation interval, or 0
@@ -172,20 +206,72 @@ func (r *RoleReconciler) readPasswordSecretRef(ctx context.Context, role *postgr
 		return "", &conditionError{reason: ReasonPasswordSecretNotFound,
 			err: fmt.Errorf("password Secret %q has no (or an empty) key %q", ref.Name, ref.Key)}
 	}
+	// The messages never include the value.
+	var problem string
+	switch {
+	case !utf8.Valid(pw):
+		problem = "is not valid UTF-8"
+	case bytes.IndexByte(pw, 0) >= 0:
+		problem = "contains a NUL byte"
+	case postgres.IsPreHashedPassword(string(pw)):
+		problem = "looks like a pre-hashed password (a SCRAM-SHA-256 verifier or MD5 hash); set the plaintext password"
+	}
+	if problem != "" {
+		return "", &conditionError{reason: ReasonPasswordSecretInvalid,
+			err: fmt.Errorf("the value of key %q in password Secret %q %s", ref.Key, ref.Name, problem)}
+	}
 	return string(pw), nil
 }
 
-// resolvePassword returns the password the Role should have. existing is the
-// role credentials Secret, or nil when it does not exist yet.
-func (r *RoleReconciler) resolvePassword(ctx context.Context, role *postgresv1alpha1.Role, existing *corev1.Secret, now time.Time) (desiredPassword, error) {
+// resolvePassword returns the password the Role should have and the
+// credentials Secret to build on. existing is the role credentials Secret as
+// read from the cache, or nil when it does not exist yet; the returned Secret
+// is a fresh read of it when the cached one could be stale.
+func (r *RoleReconciler) resolvePassword(ctx context.Context, role *postgresv1alpha1.Role, existing *corev1.Secret, now time.Time) (desiredPassword, *corev1.Secret, error) {
 	var refPassword string
 	fromRef := role.Spec.PasswordSecretRef != nil
 	if fromRef {
 		var err error
 		if refPassword, err = r.readPasswordSecretRef(ctx, role); err != nil {
-			return desiredPassword{}, err
+			return desiredPassword{}, existing, err
 		}
 	}
+	dp, err := r.decidePassword(ctx, role, fromRef, refPassword, existing, now)
+	if err != nil || dp.applied || dp.generated || existing == nil || r.APIReader == nil {
+		return dp, existing, err
+	}
+	// The password is about to be sent to PostgreSQL because it does not
+	// match the recorded fingerprint. The cached Secret may lag behind one
+	// this operator just wrote (e.g. a rotation): sending its password would
+	// roll PostgreSQL back to the previous password. Confirm with a fresh
+	// read first.
+	fresh := &corev1.Secret{}
+	if err := r.APIReader.Get(ctx, client.ObjectKeyFromObject(existing), fresh); err != nil {
+		if !apierrors.IsNotFound(err) {
+			return desiredPassword{}, existing, fmt.Errorf("failed to re-read the credentials Secret before setting the password: %w", err)
+		}
+		fresh = nil
+	} else if fresh.ResourceVersion == existing.ResourceVersion {
+		return dp, existing, nil
+	}
+	dp, err = r.decidePassword(ctx, role, fromRef, refPassword, fresh, now)
+	return dp, fresh, err
+}
+
+// decidePassword chooses the password for the credentials Secret existing
+// (nil when there is none) and reports whether it is already applied.
+func (r *RoleReconciler) decidePassword(ctx context.Context, role *postgresv1alpha1.Role, fromRef bool, refPassword string, existing *corev1.Secret, now time.Time) (desiredPassword, error) {
+	dp, err := r.choosePasswordFresh(ctx, role, fromRef, refPassword, existing, now)
+	if err != nil {
+		return dp, err
+	}
+	dp.applied = !dp.generated && passwordApplied(role, existing, dp.value)
+	return dp, nil
+}
+
+// choosePasswordFresh is choosePassword for the credentials Secret existing,
+// re-reading the Role uncached before a rotation replaces a working password.
+func (r *RoleReconciler) choosePasswordFresh(ctx context.Context, role *postgresv1alpha1.Role, fromRef bool, refPassword string, existing *corev1.Secret, now time.Time) (desiredPassword, error) {
 	var current string
 	if existing != nil {
 		current = string(existing.Data[SecretKeyPassword])
@@ -210,9 +296,12 @@ func (r *RoleReconciler) resolvePassword(ctx context.Context, role *postgresv1al
 }
 
 // recordPassword updates the password fields of the Role status once the
-// password is set in PostgreSQL and in the credentials Secret.
+// password is set in PostgreSQL and in the credentials Secret (which now
+// carries its fingerprint).
 func recordPassword(role *postgresv1alpha1.Role, dp desiredPassword, now time.Time) {
-	role.Status.PasswordHash = passwordFingerprint(role, dp.value)
+	// The fingerprint moved to the credentials Secret: clear the deprecated
+	// status field so it no longer exposes one.
+	role.Status.PasswordHash = ""
 	switch {
 	case dp.fromRef:
 		role.Status.PasswordRotatedAt = nil

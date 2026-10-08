@@ -119,6 +119,10 @@ spec:
 
   # Optional: take the password from a Secret you manage (same namespace).
   # Changes to the Secret are applied. Mutually exclusive with passwordRotation.
+  # The value must be the plaintext password (UTF-8, no NUL, not a
+  # SCRAM-SHA-256$/md5 hash). SECURITY: the operator reads any Secret named
+  # here, so whoever can create Roles can read every Secret in the namespace
+  # (see "Security" below).
   passwordSecretRef:
     name: string           # Secret name
     key: string            # Key within secret
@@ -142,7 +146,7 @@ status:
   secretName: string       # Auto-generated credentials secret
   managedMemberships:      # Roles whose membership pgop granted (revoked when removed)
     - string
-  passwordHash: string     # Salted SHA-256 fingerprint of the password set in PostgreSQL
+  passwordHash: string     # DEPRECATED: no longer written, cleared on reconcile
   passwordRotatedAt: string # When the operator last generated the password (RFC 3339)
   passwordRotationRequest: string # Last rotate-password annotation value acted on
   conditions:
@@ -154,9 +158,25 @@ status:
 ```
 
 The `Available` condition is `False` with reason `PasswordSecretNotFound` when
-`passwordSecretRef` names a missing Secret or key (or an empty value), and
-`ReconcileError` for other failures. A rotation emits a `PasswordRotated`
-Event on the Role.
+`passwordSecretRef` names a missing Secret or key (or an empty value),
+`PasswordSecretInvalid` when the value is not valid UTF-8, contains a NUL byte
+or is already a password hash (`SCRAM-SHA-256$...` or `md5` + 32 hex digits),
+and `ReconcileError` for other failures (errors from `CREATE`/`ALTER ROLE` are
+redacted). A rotation emits a `PasswordRotated` Event on the Role.
+
+The role credentials Secret carries a `pgop.ruck.io/password-fingerprint`
+annotation (salted SHA-256 of the password last set in PostgreSQL) that the
+operator uses to send the password only when it changed. Passwords are sent to
+PostgreSQL as client-side computed SCRAM-SHA-256 verifiers, never in
+plaintext.
+
+**Security:** the operator reads the Secret named by `passwordSecretRef` with
+its own permissions and copies the key into the role (and database)
+credentials Secrets. Anyone who can create or update Roles in a namespace can
+therefore read every Secret in it, including `<cluster>-credentials`. Grant
+write access to `roles.pgop.ruck.io` only to subjects that may already read
+the namespace's Secrets. See
+[Roles: who can read a passwordSecretRef Secret](../user-guide/roles.md#security-who-can-read-a-passwordsecretref-secret).
 
 ---
 

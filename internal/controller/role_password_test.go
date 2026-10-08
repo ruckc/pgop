@@ -157,17 +157,41 @@ var _ = Describe("Role password selection", func() {
 		Expect(nextRotationIn(role, now)).To(BeZero())
 	})
 
-	It("records a salted fingerprint, not the password", func() {
+	It("keeps no fingerprint in status and clears the deprecated passwordHash", func() {
 		role := newRole()
+		role.Status.PasswordHash = passwordFingerprint(role, testRefPassword)
 		recordPassword(role, desiredPassword{value: testRefPassword, fromRef: true}, now)
-		Expect(role.Status.PasswordHash).To(HaveLen(64))
-		Expect(role.Status.PasswordHash).NotTo(ContainSubstring(testRefPassword))
-		Expect(role.Status.PasswordHash).To(Equal(passwordFingerprint(role, testRefPassword)))
+		Expect(role.Status.PasswordHash).To(BeEmpty())
+	})
 
+	It("uses a salted fingerprint, not the password", func() {
+		role := newRole()
+		fp := passwordFingerprint(role, testRefPassword)
+		Expect(fp).To(HaveLen(64))
+		Expect(fp).NotTo(ContainSubstring(testRefPassword))
 		other := newRole()
 		other.UID = "uid-2"
-		Expect(passwordFingerprint(other, testRefPassword)).NotTo(Equal(role.Status.PasswordHash))
-		Expect(passwordFingerprint(role, "different")).NotTo(Equal(role.Status.PasswordHash))
+		Expect(passwordFingerprint(other, testRefPassword)).NotTo(Equal(fp))
+		Expect(passwordFingerprint(role, "different")).NotTo(Equal(fp))
+	})
+
+	It("knows the password is applied from the credentials Secret's fingerprint", func() {
+		role := newRole()
+		secret := func(annotations map[string]string) *corev1.Secret {
+			return &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Annotations: annotations}}
+		}
+		fp := passwordFingerprint(role, testCurrentPassword)
+		Expect(passwordApplied(role, nil, testCurrentPassword)).To(BeFalse())
+		Expect(passwordApplied(role, secret(map[string]string{AnnotationPasswordFingerprint: fp}), testCurrentPassword)).To(BeTrue())
+		Expect(passwordApplied(role, secret(map[string]string{AnnotationPasswordFingerprint: fp}), "other")).To(BeFalse())
+		Expect(passwordApplied(role, secret(nil), testCurrentPassword)).To(BeFalse())
+
+		By("falling back to the deprecated status.passwordHash for a Secret written before the annotation")
+		role.Status.PasswordHash = fp
+		Expect(passwordApplied(role, secret(nil), testCurrentPassword)).To(BeTrue())
+		Expect(passwordApplied(role, secret(nil), "other")).To(BeFalse())
+		By("trusting the annotation over status.passwordHash when both exist")
+		Expect(passwordApplied(role, secret(map[string]string{AnnotationPasswordFingerprint: "x"}), testCurrentPassword)).To(BeFalse())
 	})
 })
 
@@ -260,6 +284,36 @@ var _ = Describe("Role password Secrets", func() {
 			Expect(pw).To(Equal(testRefPassword))
 		})
 
+		It("rejects pre-hashed, non-UTF-8 and NUL-containing values without echoing them", func() {
+			role := newRole("ref-invalid-" + suffix)
+			role.Spec.PasswordSecretRef = &postgresv1alpha1.SecretKeySelector{Name: "pw-invalid-" + suffix, Key: testPasswordKey}
+			createSecret("pw-invalid-"+suffix, map[string][]byte{testPasswordKey: []byte("placeholder")})
+
+			for _, bad := range []string{
+				"SCRAM-SHA-256$4096:c2FsdA==$c3RvcmVk:c2VydmVy",
+				"md5" + "0123456789abcdef0123456789abcdef",
+				"bad-\xff-utf8",
+				"nul-\x00-byte",
+			} {
+				s := getSecret("pw-invalid-" + suffix)
+				s.Data[testPasswordKey] = []byte(bad)
+				Expect(k8sClient.Update(ctx, s)).To(Succeed())
+				_, err := rr().readPasswordSecretRef(ctx, role)
+				ce, ok := errors.AsType[*conditionError](err)
+				Expect(ok).To(BeTrue(), "value %q", bad)
+				Expect(ce.reason).To(Equal(ReasonPasswordSecretInvalid))
+				Expect(err.Error()).NotTo(ContainSubstring(bad))
+			}
+
+			By("accepting quotes, backslashes and non-ASCII text")
+			s := getSecret("pw-invalid-" + suffix)
+			s.Data[testPasswordKey] = []byte(`it's a \ "päss"`)
+			Expect(k8sClient.Update(ctx, s)).To(Succeed())
+			pw, err := rr().readPasswordSecretRef(ctx, role)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(pw).To(Equal(`it's a \ "päss"`))
+		})
+
 		It("sets the Available reason to PasswordSecretNotFound", func() {
 			role := newRole("ref-status-" + suffix)
 			role.Spec.PasswordSecretRef = &postgresv1alpha1.SecretKeySelector{Name: "missing-" + suffix, Key: testPasswordKey}
@@ -305,20 +359,66 @@ var _ = Describe("Role password Secrets", func() {
 			role.Status.PasswordRotationRequest = "req-1"
 			Expect(k8sClient.Status().Update(ctx, role)).To(Succeed())
 
-			existing := &corev1.Secret{Data: map[string][]byte{SecretKeyPassword: []byte(testCurrentPassword)}}
+			existing := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
+					AnnotationPasswordFingerprint: passwordFingerprint(role, testCurrentPassword)}},
+				Data: map[string][]byte{SecretKeyPassword: []byte(testCurrentPassword)},
+			}
 
 			withoutReader := stale.DeepCopy()
-			dp, err := rr().resolvePassword(ctx, withoutReader, existing, time.Now())
+			dp, _, err := rr().resolvePassword(ctx, withoutReader, existing, time.Now())
 			Expect(err).NotTo(HaveOccurred())
 			Expect(dp.rotated).To(BeTrue(), "the stale Role alone asks for a rotation")
 
 			r := rr()
 			r.APIReader = k8sClient
-			dp, err = r.resolvePassword(ctx, stale, existing, time.Now())
+			dp, got, err := r.resolvePassword(ctx, stale, existing, time.Now())
 			Expect(err).NotTo(HaveOccurred())
-			Expect(dp).To(Equal(desiredPassword{value: testCurrentPassword}))
+			Expect(dp).To(Equal(desiredPassword{value: testCurrentPassword, applied: true}))
+			Expect(got).To(BeIdenticalTo(existing))
 			Expect(stale.Status.PasswordRotationRequest).To(Equal("req-1"))
 			Expect(stale.ResourceVersion).To(Equal(role.ResourceVersion))
+		})
+	})
+
+	Context("password from a stale cached credentials Secret", func() {
+		It("re-reads the Secret and never sends a password older than the one PostgreSQL has", func() {
+			role := newRole("stale-secret-" + suffix)
+			Expect(k8sClient.Create(ctx, role)).To(Succeed())
+			cleanup(role)
+
+			By("the server already holding the rotated password, as written by the previous reconcile")
+			const rotated = "rotated-password"
+			current := createSecret("stale-secret-creds-"+suffix, map[string][]byte{SecretKeyPassword: []byte(rotated)})
+			current.Annotations = map[string]string{AnnotationPasswordFingerprint: passwordFingerprint(role, rotated)}
+			Expect(k8sClient.Update(ctx, current)).To(Succeed())
+
+			By("the cache still holding the Secret from before the rotation (written before the fingerprint annotation existed)")
+			stale := current.DeepCopy()
+			stale.ResourceVersion = "1"
+			stale.Annotations = nil
+			stale.Data = map[string][]byte{SecretKeyPassword: []byte(testCurrentPassword)}
+
+			dp, _, err := rr().resolvePassword(ctx, role.DeepCopy(), stale, time.Now())
+			Expect(err).NotTo(HaveOccurred())
+			Expect(dp.value).To(Equal(testCurrentPassword))
+			Expect(dp.applied).To(BeFalse(), "without a fresh read the stale password would be sent, rolling the rotation back")
+
+			r := rr()
+			r.APIReader = k8sClient
+			dp, got, err := r.resolvePassword(ctx, role, stale, time.Now())
+			Expect(err).NotTo(HaveOccurred())
+			Expect(dp).To(Equal(desiredPassword{value: rotated, applied: true}))
+			Expect(got.ResourceVersion).To(Equal(current.ResourceVersion))
+			Expect(string(got.Data[SecretKeyPassword])).To(Equal(rotated))
+
+			By("still sending a password that is new according to the fresh Secret")
+			current = getSecret(current.Name)
+			current.Data[SecretKeyPassword] = []byte("edited-by-hand")
+			Expect(k8sClient.Update(ctx, current)).To(Succeed())
+			dp, _, err = r.resolvePassword(ctx, role, stale, time.Now())
+			Expect(err).NotTo(HaveOccurred())
+			Expect(dp).To(Equal(desiredPassword{value: "edited-by-hand"}))
 		})
 	})
 
@@ -340,6 +440,7 @@ var _ = Describe("Role password Secrets", func() {
 			s := getSecret(secretName)
 			Expect(isRoleCredentialsSecret(s)).To(BeTrue())
 			Expect(string(s.Data[SecretKeyURI])).To(ContainSubstring(":old-password@"))
+			Expect(s.Annotations).To(HaveKeyWithValue(AnnotationPasswordFingerprint, passwordFingerprint(role, "old-password")))
 
 			db := &postgresv1alpha1.Database{
 				ObjectMeta: metav1.ObjectMeta{Name: "pw-db-" + suffix, Namespace: ns},
@@ -367,6 +468,7 @@ var _ = Describe("Role password Secrets", func() {
 			Expect(string(s.Data[SecretKeyUsername])).To(Equal(role.Name))
 			Expect(string(s.Data[SecretKeyURI])).To(ContainSubstring(":new-password@"))
 			Expect(string(s.Data[SecretKeyURI])).NotTo(ContainSubstring("old-password"))
+			Expect(s.Annotations).To(HaveKeyWithValue(AnnotationPasswordFingerprint, passwordFingerprint(role, "new-password")))
 
 			By("mapping the role Secret to the Databases it owns on the same Cluster")
 			Expect(dr.databasesForRoleSecret(ctx, s)).To(ConsistOf(reconcileRequest(db)))
@@ -385,6 +487,7 @@ var _ = Describe("Role password Secrets", func() {
 			s := &corev1.Secret{Data: map[string][]byte{SecretKeyPassword: []byte("p")}}
 			Expect(convergeRoleSecret(s, role, "p", "h", 5432, clientTLS{SSLMode: postgres.SSLModeDisable})).To(BeTrue())
 			Expect(isRoleCredentialsSecret(s)).To(BeTrue())
+			Expect(s.Annotations).To(HaveKeyWithValue(AnnotationPasswordFingerprint, passwordFingerprint(role, "p")))
 			Expect(convergeRoleSecret(s, role, "p", "h", 5432, clientTLS{SSLMode: postgres.SSLModeDisable})).To(BeFalse())
 			Expect(credentialsSecretName(role, cluster)).To(Equal("lbl-" + suffix + "-" + role.Name + "-credentials"))
 		})
