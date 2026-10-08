@@ -190,6 +190,7 @@ echo "Downloaded %s"
 	// the target cluster's role set differs from the source.
 	restoreScript := `
 set -e
+echo "pg_restore: host=$PGHOST sslmode=${PGSSLMODE:-prefer}"
 pg_restore -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDATABASE" --no-owner --clean --if-exists /restore/artifact.dump
 echo "Restore complete"
 `
@@ -200,6 +201,7 @@ echo "Restore complete"
 	job.Spec.Template.Spec.SecurityContext = restorePodSecurityContext(70)
 	job.Spec.Template.Spec.Volumes = []corev1.Volume{
 		{Name: restoreVolumeName, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
+		jobTLSVolume(clusterSecretName),
 	}
 	job.Spec.Template.Spec.InitContainers = []corev1.Container{
 		{
@@ -217,16 +219,22 @@ echo "Restore complete"
 			Image:           cluster.Spec.Image,
 			SecurityContext: restoreContainerSecurityContext(true),
 			Command:         []string{shBin, "-c", restoreScript},
-			Env: []corev1.EnvVar{
-				secretEnv("PGUSER", clusterSecretName, "username"),
-				secretEnv("PGPASSWORD", clusterSecretName, "password"),
-				{Name: "PGHOST", Value: pgHost},
-				{Name: "PGPORT", Value: fmt.Sprintf("%d", pgPort)},
+			// PGHOST is the Service FQDN, the name the server certificate is
+			// validated for; sslmode and the CA come from the credentials
+			// Secret (see jobTLSEnv).
+			Env: append([]corev1.EnvVar{
+				secretEnv("PGUSER", clusterSecretName, SecretKeyUsername),
+				secretEnv("PGPASSWORD", clusterSecretName, SecretKeyPassword),
+				{Name: envPGHost, Value: pgHost},
+				{Name: envPGPort, Value: fmt.Sprintf("%d", pgPort)},
 				// Passed via env rather than interpolated into the script so the
 				// name never needs shell quoting.
 				{Name: envPGDatabase, Value: database.PostgresName()},
+			}, jobTLSEnv(clusterSecretName)...),
+			VolumeMounts: []corev1.VolumeMount{
+				{Name: restoreVolumeName, MountPath: restoreVolumeMount},
+				jobTLSVolumeMount(),
 			},
-			VolumeMounts: []corev1.VolumeMount{{Name: restoreVolumeName, MountPath: restoreVolumeMount}},
 		},
 	}
 	return job, nil

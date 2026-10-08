@@ -186,6 +186,9 @@ spec:
         name: rustfs-credentials
 ```
 
+With Cluster TLS on, backup and restore Jobs connect with `sslmode=verify-full`
+and the server CA from the credentials Secret.
+
 ## Getting Started
 
 ### Prerequisites

@@ -141,6 +141,12 @@ var _ = Describe("Restore Controller", func() {
 		Expect(job.Spec.Template.Spec.Containers[0].Command[2]).To(ContainSubstring("pg_restore"))
 		Expect(job.Spec.Template.Spec.Containers[0].Command[2]).To(ContainSubstring(`-d "$PGDATABASE"`))
 		Expect(job.Spec.Template.Spec.Containers[0].Env).To(ContainElement(corev1.EnvVar{Name: envPGDatabase, Value: dbName}))
+		Expect(job.Spec.Template.Spec.Containers[0].Env).To(ContainElement(corev1.EnvVar{
+			Name: envPGHost, Value: fmt.Sprintf("%s.%s.svc.cluster.local", clusterName, RestoreNamespace),
+		}))
+
+		By("Verifying pg_restore uses the sslmode and CA from the credentials Secret")
+		expectJobTLS(job.Spec.Template.Spec, job.Spec.Template.Spec.Containers[0], clusterName+"-credentials")
 	})
 
 	It("should restore into the Database's effective PostgreSQL name", func() {
