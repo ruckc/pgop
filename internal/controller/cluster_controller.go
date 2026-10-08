@@ -21,9 +21,11 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -70,6 +72,27 @@ type ClusterReconciler struct {
 	// ReloadServerConfig runs pg_reload_conf() using cfg. Optional; defaults
 	// to a real PostgreSQL connection. Tests override it.
 	ReloadServerConfig func(ctx context.Context, cfg postgres.ConnectionConfig) error
+
+	// Now returns the current time. Optional; tests override it to exercise
+	// certificate renewal and CA rotation.
+	Now func() time.Time
+
+	// SelfManagedCertPolicy overrides the lifetimes of the self-managed CA and
+	// server certificate. Optional; defaults to defaultSelfManagedCertPolicy.
+	SelfManagedCertPolicy *selfManagedCertPolicy
+
+	// certManagerSeen records that the cert-manager Certificate API exists,
+	// so cleanupTLSResources only looks for Certificates when they can exist
+	// (a lookup of an unknown API triggers API discovery every time).
+	certManagerSeen atomic.Bool
+}
+
+// now returns r.Now() or time.Now().
+func (r *ClusterReconciler) now() time.Time {
+	if r.Now != nil {
+		return r.Now()
+	}
+	return time.Now()
 }
 
 // +kubebuilder:rbac:groups=pgop.ruck.io,resources=clusters,verbs=get;list;watch;create;update;patch;delete
@@ -81,6 +104,7 @@ type ClusterReconciler struct {
 // +kubebuilder:rbac:groups=core,resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
+// +kubebuilder:rbac:groups=cert-manager.io,resources=certificates,verbs=get;list;watch;create;update;patch;delete
 
 func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
@@ -134,31 +158,26 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return r.updateStatus(ctx, cluster, false, err)
 	}
 
-	// Validate the TLS Secret before touching the pod: a Secret that is
-	// missing, incomplete or unusable for verify-full would otherwise roll the
-	// pod into a broken (or unreachable) state. On failure the StatefulSet is
-	// left exactly as it is and TLSReady=False explains why.
+	// Provision (issuerRef, self-managed) and validate the TLS Secret before
+	// touching the pod: a Secret that is missing, incomplete or unusable for
+	// verify-full would otherwise roll the pod into a broken (or unreachable)
+	// state. On failure the StatefulSet is left exactly as it is and
+	// TLSReady=False explains why.
 	var material *tlsMaterial
+	var tlsRecheckAt time.Time
 	if cluster.Spec.TLS != nil {
-		material, err = loadTLSMaterial(ctx, r.Client, cluster)
+		tlsRecheckAt, err = r.provisionTLSSecret(ctx, cluster)
+		if err == nil {
+			if material, err = loadTLSMaterial(ctx, r.Client, cluster, r.now()); err != nil {
+				err = &tlsNotReadyError{Reason: ReasonInvalidTLSSecret, Message: err.Error()}
+			}
+		}
+		if notReady, ok := errors.AsType[*tlsNotReadyError](err); ok {
+			return r.reportTLSNotReady(ctx, cluster, secret, notReady)
+		}
 		if err != nil {
-			log.Info("TLS Secret is not usable; leaving the StatefulSet unchanged", "reason", err.Error())
-			prev := meta.FindStatusCondition(cluster.Status.Conditions, ConditionTypeTLSReady)
-			changed := prev == nil || prev.Reason != ReasonInvalidTLSSecret || prev.Message != err.Error()
-			r.setTLSCondition(cluster, metav1.ConditionFalse, ReasonInvalidTLSSecret, err.Error())
-			cluster.Status.TLSSecretHash = ""
-			if r.Recorder != nil && changed {
-				r.Recorder.Eventf(cluster, nil, corev1.EventTypeWarning, ReasonInvalidTLSSecret, "ValidateTLSSecret", "%s", err.Error())
-			}
-			ready, rerr := r.isStatefulSetReady(ctx, cluster)
-			if rerr != nil {
-				return r.updateStatus(ctx, cluster, false, rerr)
-			}
-			if err := r.convergeSecretConnectionInfo(ctx, cluster, secret, nil); err != nil {
-				return r.updateStatus(ctx, cluster, false, err)
-			}
-			// No requeue needed: the TLS Secret is watched.
-			return r.updateStatus(ctx, cluster, ready, nil)
+			log.Error(err, "Failed to provision the TLS Secret")
+			return r.updateStatus(ctx, cluster, false, err)
 		}
 	} else {
 		meta.RemoveStatusCondition(&cluster.Status.Conditions, ConditionTypeTLSReady)
@@ -177,10 +196,14 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return r.updateStatus(ctx, cluster, false, err)
 	}
 
-	// Remove a no longer needed pg_hba ConfigMap only after the StatefulSet
-	// stopped referencing it.
+	// Remove a no longer needed pg_hba ConfigMap and TLS resources only after
+	// the StatefulSet stopped referencing them.
 	if err := r.cleanupHBAConfigMap(ctx, cluster); err != nil {
 		log.Error(err, "Failed to clean up pg_hba ConfigMap")
+		return r.updateStatus(ctx, cluster, false, err)
+	}
+	if err := r.cleanupTLSResources(ctx, cluster); err != nil {
+		log.Error(err, "Failed to clean up TLS resources")
 		return r.updateStatus(ctx, cluster, false, err)
 	}
 
@@ -208,8 +231,84 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	result, err := r.updateStatus(ctx, cluster, ready, nil)
-	if err == nil && tlsPending && result.RequeueAfter == 0 {
-		result.RequeueAfter = 10 * time.Second
+	if err != nil {
+		return result, err
+	}
+	if tlsPending {
+		result.RequeueAfter = shorterRequeue(result.RequeueAfter, 10*time.Second)
+	}
+	if !tlsRecheckAt.IsZero() {
+		// Self-managed certificates: come back when they are due for renewal.
+		result.RequeueAfter = shorterRequeue(result.RequeueAfter,
+			min(max(tlsRecheckAt.Sub(r.now()), time.Second), maxTLSRecheckInterval))
+	}
+	return result, nil
+}
+
+// maxTLSRecheckInterval caps how long the operator waits before looking at
+// self-managed certificates again, so a renewal is never missed by much.
+const maxTLSRecheckInterval = 12 * time.Hour
+
+// shorterRequeue returns the shorter of two RequeueAfter values, where 0 means
+// no requeue.
+func shorterRequeue(cur, d time.Duration) time.Duration {
+	if cur == 0 || d < cur {
+		return d
+	}
+	return cur
+}
+
+// provisionTLSSecret makes sure the server certificate Secret exists: for
+// issuerRef it reconciles the cert-manager Certificate, for the self-managed
+// CA it issues and renews the certificates. With spec.tls.secretName there is
+// nothing to provision. It returns when self-managed certificates must be
+// looked at again (zero otherwise), and a *tlsNotReadyError when the Secret
+// cannot be provisioned yet.
+func (r *ClusterReconciler) provisionTLSSecret(ctx context.Context, cluster *postgresv1alpha1.Cluster) (time.Time, error) {
+	t := cluster.Spec.TLS
+	switch {
+	case t.SecretName != "":
+		return time.Time{}, nil
+	case t.IssuerRef != nil:
+		err := r.reconcileCertificate(ctx, cluster)
+		notReady, isNotReady := errors.AsType[*tlsNotReadyError](err)
+		if err == nil || (isNotReady && notReady.Reason != ReasonCertManagerUnavailable) {
+			r.certManagerSeen.Store(true)
+		}
+		return time.Time{}, err
+	default:
+		return r.reconcileSelfManagedTLS(ctx, cluster)
+	}
+}
+
+// reportTLSNotReady records that the TLS Secret cannot be used, leaving the
+// StatefulSet untouched, and still converges the credentials Secret.
+func (r *ClusterReconciler) reportTLSNotReady(ctx context.Context, cluster *postgresv1alpha1.Cluster, secret *corev1.Secret, notReady *tlsNotReadyError) (ctrl.Result, error) {
+	logf.FromContext(ctx).Info("TLS Secret is not usable; leaving the StatefulSet unchanged",
+		"reason", notReady.Reason, "message", notReady.Message)
+	prev := meta.FindStatusCondition(cluster.Status.Conditions, ConditionTypeTLSReady)
+	changed := prev == nil || prev.Reason != notReady.Reason || prev.Message != notReady.Message
+	r.setTLSCondition(cluster, metav1.ConditionFalse, notReady.Reason, notReady.Message)
+	cluster.Status.TLSSecretHash = ""
+	if r.Recorder != nil && changed {
+		eventType := corev1.EventTypeWarning
+		if notReady.Reason == ReasonCertificatePending {
+			eventType = corev1.EventTypeNormal
+		}
+		r.Recorder.Eventf(cluster, nil, eventType, notReady.Reason, "ValidateTLSSecret", "%s", notReady.Message)
+	}
+	ready, err := r.isStatefulSetReady(ctx, cluster)
+	if err != nil {
+		return r.updateStatus(ctx, cluster, false, err)
+	}
+	if err := r.convergeSecretConnectionInfo(ctx, cluster, secret, nil); err != nil {
+		return r.updateStatus(ctx, cluster, false, err)
+	}
+	// The TLS Secret is watched; RequeueAfter covers what is not (cert-manager
+	// being installed).
+	result, err := r.updateStatus(ctx, cluster, ready, nil)
+	if err == nil && notReady.RequeueAfter > 0 {
+		result.RequeueAfter = shorterRequeue(result.RequeueAfter, notReady.RequeueAfter)
 	}
 	return result, err
 }
@@ -252,22 +351,64 @@ func (r *ClusterReconciler) reconcileTLSState(ctx context.Context, cluster *post
 
 	if bytes.Equal(presented, material.Leaf.Raw) {
 		r.setTLSCondition(cluster, metav1.ConditionTrue, ReasonTLSActive,
-			fmt.Sprintf("Server presents the certificate from Secret %q", cluster.Spec.TLS.SecretName))
+			fmt.Sprintf("Server presents the certificate from Secret %q", tlsSecretName(cluster)))
 		cluster.Status.TLSSecretHash = material.Hash
 		return false
 	}
 
-	// The server presents a different (older) certificate. Reload over a
-	// connection verified against the current CA. If the CA itself was
-	// replaced, the old certificate cannot be verified and the reload is not
-	// attempted over an unverified connection; the pod must be restarted.
+	// The server presents a different (older) certificate.
+	if !certVerifies(presented, material.CAPEM, host, r.now()) {
+		// It does not chain to the current CA bundle: the CA was replaced
+		// without an overlap (the self-managed CA always overlaps), or the old
+		// certificate expired. The server cannot be reached over verify-full
+		// to reload it, and the operator never falls back to an unverified
+		// connection, so the pod is restarted to load the new certificate.
+		msg := "Server presents a certificate that the current CA does not verify (the CA changed); " +
+			"restarting the PostgreSQL pod to load the new certificate"
+		if err := r.restartForTLS(ctx, cluster, material.Hash); err != nil {
+			msg = fmt.Sprintf("Server presents a certificate that the current CA does not verify (the CA changed) "+
+				"and restarting the pod failed: %v", err)
+		}
+		r.setTLSCondition(cluster, metav1.ConditionFalse, ReasonCertificateReloading, msg)
+		return true
+	}
+
+	// Reload over a connection verified against the current CA bundle.
 	msg := "Server presents an outdated certificate; requested a configuration reload"
 	if err := r.reloadServerConfig(ctx, cluster, material.CAPEM); err != nil {
-		msg = fmt.Sprintf("Server presents an outdated certificate and the reload failed "+
-			"(if the CA changed, restart the pod to load the new certificate): %v", err)
+		msg = fmt.Sprintf("Server presents an outdated certificate and the reload failed: %v", err)
 	}
 	r.setTLSCondition(cluster, metav1.ConditionFalse, ReasonCertificateReloading, msg)
 	return true
+}
+
+// restartForTLS restarts the PostgreSQL pod by setting the tls-restart pod
+// template annotation to hash (the certificate material to load). The pod is
+// restarted at most once per certificate: when the annotation already has
+// this value nothing is done, so a server that keeps presenting an
+// unexpected certificate never causes a restart loop.
+func (r *ClusterReconciler) restartForTLS(ctx context.Context, cluster *postgresv1alpha1.Cluster, hash string) error {
+	sts := &appsv1.StatefulSet{}
+	if err := r.Get(ctx, types.NamespacedName{Name: cluster.Name, Namespace: cluster.Namespace}, sts); err != nil {
+		return err
+	}
+	if sts.Spec.Template.Annotations[AnnotationTLSRestart] == hash {
+		return nil
+	}
+	base := sts.DeepCopy()
+	if sts.Spec.Template.Annotations == nil {
+		sts.Spec.Template.Annotations = map[string]string{}
+	}
+	sts.Spec.Template.Annotations[AnnotationTLSRestart] = hash
+	if err := r.Patch(ctx, sts, client.MergeFrom(base)); err != nil {
+		return err
+	}
+	logf.FromContext(ctx).Info("Restarting the PostgreSQL pod to load a certificate from a new CA")
+	if r.Recorder != nil {
+		r.Recorder.Eventf(cluster, sts, corev1.EventTypeNormal, ReasonCertificateReloading, "RestartForTLS",
+			"Restarting the PostgreSQL pod: the new certificate is from a different CA and cannot be loaded with a reload")
+	}
+	return nil
 }
 
 // reloadServerConfig runs pg_reload_conf() as the operator over a verify-full
@@ -985,20 +1126,30 @@ func generatePassword(length int) (string, error) {
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *ClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	return ctrl.NewControllerManagedBy(mgr).
+	b := ctrl.NewControllerManagedBy(mgr).
 		For(&postgresv1alpha1.Cluster{}).
 		Owns(&appsv1.StatefulSet{}).
 		Owns(&corev1.Service{}).
 		Owns(&corev1.Secret{}).
 		Owns(&corev1.ConfigMap{}).
-		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.clustersForTLSSecret)).
-		Named("cluster").
-		Complete(r)
+		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.clustersForTLSSecret))
+	// Watch cert-manager Certificates only when cert-manager is installed: a
+	// watch on a missing API would keep the controller from starting. Without
+	// it, issuerRef Clusters still converge through the Secret watch and
+	// periodic requeues.
+	if _, err := mgr.GetRESTMapper().RESTMapping(certificateGVK.GroupKind(), certificateGVK.Version); err == nil {
+		r.certManagerSeen.Store(true)
+		b = b.Owns(newCertificateObject())
+	} else {
+		logf.Log.WithName("cluster-controller").Info(
+			"cert-manager Certificate API not found; spec.tls.issuerRef will report CertManagerUnavailable until it is installed")
+	}
+	return b.Named("cluster").Complete(r)
 }
 
 // clustersForTLSSecret maps a Secret to the Clusters in its namespace whose
-// spec.tls.secretName names it, so creating, fixing or rotating the TLS
-// Secret re-validates the certificate and reloads the server.
+// server certificate it holds (see tlsSecretName), so creating, fixing or
+// rotating the TLS Secret re-validates the certificate and reloads the server.
 func (r *ClusterReconciler) clustersForTLSSecret(ctx context.Context, obj client.Object) []reconcile.Request {
 	clusters := &postgresv1alpha1.ClusterList{}
 	if err := r.List(ctx, clusters, client.InNamespace(obj.GetNamespace())); err != nil {
@@ -1007,7 +1158,7 @@ func (r *ClusterReconciler) clustersForTLSSecret(ctx context.Context, obj client
 	}
 	var requests []reconcile.Request
 	for i := range clusters.Items {
-		if t := clusters.Items[i].Spec.TLS; t != nil && t.SecretName == obj.GetName() {
+		if clusters.Items[i].Spec.TLS != nil && tlsSecretName(&clusters.Items[i]) == obj.GetName() {
 			requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&clusters.Items[i])})
 		}
 	}

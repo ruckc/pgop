@@ -35,8 +35,13 @@ spec:
       memory: string
 
   # Server TLS (optional). Unset = no TLS, sslmode=disable (unchanged behaviour).
+  # Set at most one of secretName / issuerRef; neither (tls: {}) = self-managed CA.
   tls:
-    secretName: string          # Required: kubernetes.io/tls-style Secret (tls.crt, tls.key, ca.crt)
+    secretName: string          # Your kubernetes.io/tls-style Secret (tls.crt, tls.key, ca.crt)
+    issuerRef:                  # cert-manager: the operator creates Certificate <cluster>-server
+      name: string              # Required: issuer name
+      kind: string              # Issuer (default) | ClusterIssuer | external issuer kind
+      group: string             # cert-manager.io (default)
     requireTLS: boolean         # Reject non-TLS TCP connections (default: true)
     minProtocolVersion: string  # TLSv1.2 (default) | TLSv1.3
 ```
@@ -65,7 +70,7 @@ Condition types:
 |------|---------|
 | `Available` | `True` (reason `ClusterReady`) once the StatefulSet is ready. |
 | `ExistingVolume` | Set once when the StatefulSet is created. `True` (reason `PreExistingPVC`) if the data PVC already existed, so PostgreSQL started on retained data; `False` (reason `NewVolume`) otherwise. Never recomputed afterwards. |
-| `TLSReady` | Only present while `spec.tls` is set. `True` (reason `TLSActive`) once the server presents the certificate from `spec.tls.secretName`. `False` with reason `InvalidTLSSecret` (Secret missing/incomplete/unusable; the StatefulSet is left unchanged), `WaitingForServer` (pod not ready or not serving TLS yet) or `CertificateReloading` (a rotated certificate is not loaded yet; the operator ran `pg_reload_conf()`). |
+| `TLSReady` | Only present while `spec.tls` is set. `True` (reason `TLSActive`) once the server presents the certificate from its TLS Secret (`spec.tls.secretName`, `<cluster>-server-tls` for `issuerRef`, `<cluster>-server-cert` for the self-managed CA). `False` with reason `InvalidTLSSecret` (Secret missing/incomplete/unusable, or a Secret the operator would manage exists and is not owned by the Cluster; the StatefulSet is left unchanged), `CertManagerUnavailable` (`issuerRef` set but cert-manager is not installed), `CertificatePending` (cert-manager has not issued the certificate yet), `WaitingForServer` (pod not ready or not serving TLS yet) or `CertificateReloading` (a rotated certificate is not loaded yet; the operator ran `pg_reload_conf()`, or restarted the pod because the new CA cannot verify the old certificate). |
 
 ---
 

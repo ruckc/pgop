@@ -179,6 +179,35 @@ spec:
                   server runs without TLS and the operator connects with sslmode=disable,
                   exactly as before TLS support existed.
                 properties:
+                  issuerRef:
+                    description: |-
+                      issuerRef makes the operator create and own a cert-manager Certificate
+                      "<cluster>-server" issued by this issuer. cert-manager writes the
+                      certificate to the Secret "<cluster>-server-tls", which is then used
+                      exactly like secretName. The issuer must populate ca.crt (CA, Vault and
+                      self-signed issuers do). Requires cert-manager; without it the Cluster
+                      reports TLSReady=False with reason CertManagerUnavailable. Mutually
+                      exclusive with secretName.
+                    properties:
+                      group:
+                        default: cert-manager.io
+                        description: |-
+                          group of the issuer. Defaults to cert-manager.io; set it for external
+                          issuers.
+                        type: string
+                      kind:
+                        default: Issuer
+                        description: |-
+                          kind of the issuer: Issuer (namespaced, in the Cluster namespace),
+                          ClusterIssuer, or the kind of an external issuer.
+                        type: string
+                      name:
+                        description: name of the issuer.
+                        minLength: 1
+                        type: string
+                    required:
+                    - name
+                    type: object
                   minProtocolVersion:
                     default: TLSv1.2
                     description: |-
@@ -203,12 +232,15 @@ spec:
                       and ca.crt (the CA that issued tls.crt). cert-manager Certificate
                       resources produce this layout. The certificate must be valid for the
                       Service DNS name <cluster>.<namespace>.svc.cluster.local, which the
-                      operator verifies with sslmode=verify-full.
+                      operator verifies with sslmode=verify-full. Mutually exclusive with
+                      issuerRef.
                     minLength: 1
                     type: string
-                required:
-                - secretName
                 type: object
+                x-kubernetes-validations:
+                - message: secretName and issuerRef are mutually exclusive; set at
+                    most one (neither selects the self-managed CA)
+                  rule: '!(has(self.secretName) && has(self.issuerRef))'
             type: object
           status:
             description: status defines the observed state of Cluster

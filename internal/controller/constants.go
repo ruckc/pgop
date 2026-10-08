@@ -40,13 +40,13 @@ const (
 	// SecretKeyURI is a ready-made postgresql:// connection URI.
 	SecretKeyURI = "uri"
 
-	// Keys of a kubernetes.io/tls Secret referenced by spec.tls.secretName.
+	// Keys of a kubernetes.io/tls Secret holding the server certificate.
 	TLSSecretKeyCert = "tls.crt"
 	TLSSecretKeyKey  = "tls.key"
 	TLSSecretKeyCA   = "ca.crt"
 
 	// ConditionTypeTLSReady reports whether the server is serving TLS with the
-	// certificate from spec.tls.secretName. Only set while spec.tls is set.
+	// certificate from its TLS Secret. Only set while spec.tls is set.
 	ConditionTypeTLSReady = "TLSReady"
 	// ReasonTLSActive: the server presents the expected certificate.
 	ReasonTLSActive = "TLSActive"
@@ -57,8 +57,22 @@ const (
 	// restarts after TLS was enabled.
 	ReasonWaitingForServer = "WaitingForServer"
 	// ReasonCertificateReloading: the server still presents a previous
-	// certificate; the operator asked it to reload (pg_reload_conf()).
+	// certificate; the operator asked it to reload (pg_reload_conf()), or, if
+	// the previous certificate cannot be verified with the new CA, restarted
+	// the pod.
 	ReasonCertificateReloading = "CertificateReloading"
+	// ReasonCertManagerUnavailable: spec.tls.issuerRef is set but the
+	// cert-manager Certificate API is not installed.
+	ReasonCertManagerUnavailable = "CertManagerUnavailable"
+	// ReasonCertificatePending: the cert-manager Certificate has not been
+	// issued yet (or a Certificate of the same name is not owned by the
+	// Cluster).
+	ReasonCertificatePending = "CertificatePending"
+
+	// AnnotationTLSRestart is set on the pod template to restart the pod when
+	// a new TLS certificate cannot be loaded with a reload (its CA changed).
+	// The value is the hash of the certificate material being loaded.
+	AnnotationTLSRestart = "pgop.ruck.io/tls-restart"
 
 	DefaultPostgresImage    = "postgres:18"
 	DefaultOperatorUsername = "pgop_operator"
