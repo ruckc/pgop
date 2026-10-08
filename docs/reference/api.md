@@ -44,9 +44,22 @@ spec:
       group: string             # cert-manager.io (default)
     requireTLS: boolean         # Reject non-TLS TCP connections (default: true)
     minProtocolVersion: string  # TLSv1.2 (default) | TLSv1.3
+
+  # PostgreSQL configuration parameters (optional, at most 256). Rendered into
+  # ConfigMap <cluster>-config and loaded with -c config_file=...; changes are
+  # reloaded, restart-only changes restart the pod once.
+  # Names must match ^[a-zA-Z_][a-zA-Z0-9_.]*$; operator-managed names
+  # (listen_addresses, port, unix_socket_directories, config_file,
+  # data_directory, hba_file, ident_file, external_pid_file, include,
+  # include_dir, include_if_exists, ssl, ssl_cert_file, ssl_key_file,
+  # ssl_min_protocol_version, archive_mode, archive_command, archive_library,
+  # restore_command) are rejected.
+  parameters:
+    <name>: string
 ```
 
-See [Clusters → TLS](../user-guide/clusters.md#tls) for details.
+See [Clusters → TLS](../user-guide/clusters.md#tls) and
+[Clusters → Parameters](../user-guide/clusters.md#parameters) for details.
 
 ### ClusterStatus
 
@@ -56,6 +69,8 @@ status:
   endpoint: string         # Service endpoint (host:port)
   secretName: string       # Credentials secret name
   tlsSecretHash: string    # Hash of the certificate the server was last confirmed to present
+  parametersHash: string   # Hash of the generated config file last reloaded (spec.parameters only)
+  pendingRestart: [string] # Parameters waiting for a restart (pg_settings.pending_restart)
   conditions:
     - type: string
       status: string       # True/False/Unknown
@@ -71,6 +86,7 @@ Condition types:
 | `Available` | `True` (reason `ClusterReady`) once the StatefulSet is ready. |
 | `ExistingVolume` | Set once when the StatefulSet is created. `True` (reason `PreExistingPVC`) if the data PVC already existed, so PostgreSQL started on retained data; `False` (reason `NewVolume`) otherwise. Never recomputed afterwards. |
 | `TLSReady` | Only present while `spec.tls` is set. `True` (reason `TLSActive`) once the server presents the certificate from its TLS Secret (`spec.tls.secretName`, `<cluster>-server-tls` for `issuerRef`, `<cluster>-server-cert` for the self-managed CA). `False` with reason `InvalidTLSSecret` (Secret missing/incomplete/unusable, or a Secret the operator would manage exists and is not owned by the Cluster; the StatefulSet is left unchanged), `CertManagerUnavailable` (`issuerRef` set but cert-manager is not installed), `CertificatePending` (cert-manager has not issued the certificate yet), `WaitingForServer` (pod not ready or not serving TLS yet) or `CertificateReloading` (a rotated certificate is not loaded yet; the operator ran `pg_reload_conf()`, or restarted the pod because the new CA cannot verify the old certificate). |
+| `ParametersApplied` | Only present while `spec.parameters` is set. `True` (reason `Applied`) once every parameter is in effect. `False` with reason `WaitingForServer` (pod not ready, rollout in progress, or no connection), `WaitingForSync` (the server does not see the current configuration file yet), `Reloading` (`pg_reload_conf()` ran; checking the result), `PendingRestart` (a parameter needs a restart; the operator restarts the pod once), `InvalidParameter` (the server rejects a name or value; nothing is reloaded or restarted) or `OverriddenByAlterSystem` (`ALTER SYSTEM` overrides a parameter). Never affects `Available`. |
 
 ---
 

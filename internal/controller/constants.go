@@ -79,6 +79,33 @@ const (
 	// The value is the hash of the certificate material being loaded.
 	AnnotationTLSRestart = "pgop.ruck.io/tls-restart"
 
+	// AnnotationParametersRestart is set on the pod template to restart the
+	// pod when spec.parameters changed a parameter that only takes effect on
+	// a restart. The value is the hash of the configuration being loaded.
+	AnnotationParametersRestart = "pgop.ruck.io/parameters-restart"
+
+	// ConditionTypeParametersApplied reports whether spec.parameters is in
+	// effect on the server. Only set while spec.parameters is not empty.
+	ConditionTypeParametersApplied = "ParametersApplied"
+	// ReasonParametersApplied: every parameter is in effect.
+	ReasonParametersApplied = "Applied"
+	// ReasonWaitingForSync: the server does not see the current generated
+	// configuration file yet (the kubelet updates mounted ConfigMaps with a
+	// delay, or the pod has not restarted onto the file yet).
+	ReasonWaitingForSync = "WaitingForSync"
+	// ReasonParametersReloading: the server was asked to reload its
+	// configuration and the result is being checked.
+	ReasonParametersReloading = "Reloading"
+	// ReasonPendingRestart: a parameter only takes effect on a restart; the
+	// operator restarts the pod.
+	ReasonPendingRestart = "PendingRestart"
+	// ReasonInvalidParameter: the server rejects a parameter name or value.
+	// Nothing is reloaded or restarted until spec.parameters is fixed.
+	ReasonInvalidParameter = "InvalidParameter"
+	// ReasonOverriddenByAlterSystem: a parameter is overridden by ALTER SYSTEM
+	// (postgresql.auto.conf), which takes precedence over spec.parameters.
+	ReasonOverriddenByAlterSystem = "OverriddenByAlterSystem"
+
 	DefaultPostgresImage    = "postgres:18"
 	DefaultOperatorUsername = "pgop_operator"
 
