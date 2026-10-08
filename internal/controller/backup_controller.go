@@ -45,7 +45,7 @@ import (
 const (
 	backupFinalizer = "pgop.ruck.io/backup-finalizer"
 
-	pgbackrestImage = "pgbackrest/pgbackrest:2.54.2"
+	pgbackrestImage = "woblerr/pgbackrest:2.59.3"
 	awsCLIImage     = "amazon/aws-cli:2.27.46"
 
 	appNameBackup     = "pgop-backup"
