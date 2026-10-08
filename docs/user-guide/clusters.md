@@ -441,13 +441,49 @@ Secrets switch back to `sslmode=disable` and lose `ca.crt`. The operator's
 `Certificate` (issuerRef) or self-managed CA and server Secrets are deleted;
 turning the self-managed CA on again generates a new CA.
 
+### Backups and restores
+
+Logical backup Jobs (`pg_dump`, created from the `Backup` CronJobs) and logical
+restore Jobs (`pg_restore`) connect the same way the operator does. They read
+the Cluster credentials Secret when the Job pod starts:
+
+- `PGSSLMODE` comes from the Secret's `sslmode` key: `verify-full` while
+  `TLSReady` is `True`, `prefer` while TLS is pending, and `disable` without
+  `spec.tls`;
+- the Secret's `ca.crt` (the server CA) is mounted at `/etc/pgop/pg-ca/ca.crt`
+  and `PGSSLROOTCERT` points to it;
+- `PGHOST` is the Service name `<cluster>.<namespace>.svc.cluster.local`, which
+  is the name `verify-full` checks against the certificate.
+
+None of this is written into the CronJob, so turning TLS on or off, renewing
+the certificate or rotating the CA needs no CronJob change: the next Job
+simply uses the current settings. Each Job logs the `sslmode` it used
+(`pg_dump: host=… sslmode=verify-full`).
+
+The operator also keeps the backup CronJobs in step with what it generates.
+CronJobs created by an older pgop version are updated when the operator
+starts, and changes to the Cluster spec (for example its image or port) are
+applied to its backup CronJobs. `spec.suspend` is left as you set it.
+
+Physical (pgBackRest) backups and restores do not use libpq over the network,
+so `spec.tls` does not change them:
+
+- `pgbackrest restore` writes the data directory directly and opens no
+  database connection.
+- The backup Job reaches the database host through pgBackRest's own remote
+  protocol (`--pg1-host`), not through PostgreSQL. pgop does not run a
+  pgBackRest server in the Cluster pod, so this channel, and pgBackRest TLS
+  for it, is not set up by pgop.
+
+The S3 repository connection verifies the endpoint's certificate by default
+(pgBackRest `repo1-s3-verify-tls`).
+
 ### Limitations
 
-- **Logical backups** (`pg_dump` Jobs) connect with libpq's default
-  `sslmode=prefer`, so they keep working with `requireTLS` (encrypted, but the
-  server certificate is not verified).
-- **Physical (pgBackRest) backups** do not use TLS yet; this is planned as a
-  follow-up.
+- While TLS is enabled but not yet confirmed (for example during the restart
+  onto TLS), backup and restore Jobs use `sslmode=prefer`. The connection is
+  encrypted but the server certificate is not verified, just as for the
+  operator's own connections.
 - An operator running outside the cluster (`make run`) cannot reach the
   Service DNS name, so `TLSReady` stays `False` (`WaitingForServer`).
 - The self-managed CA's lifetimes (10 year CA, 90 day server certificate)

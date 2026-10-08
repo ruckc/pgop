@@ -18,7 +18,11 @@ package controller
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"maps"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -27,9 +31,13 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	postgresv1alpha1 "github.com/ruckc/pgop/api/v1alpha1"
 )
@@ -46,6 +54,10 @@ const (
 	backupVolumeName  = "backup"
 	backupVolumeMount = "/backup"
 	labelBackupType   = "pgop.ruck.io/backup-type"
+
+	// annotationSpecHash records the hash of the operator-generated CronJob
+	// spec (see applyCronJob).
+	annotationSpecHash = "pgop.ruck.io/spec-hash"
 )
 
 // BackupReconciler reconciles Backup objects
@@ -154,15 +166,6 @@ func (r *BackupReconciler) reconcileLogicalCronJob(
 ) error {
 	cronName := fmt.Sprintf("%s-%s", backup.Name, string(runType))
 
-	existing := &batchv1.CronJob{}
-	err := r.Get(ctx, types.NamespacedName{Name: cronName, Namespace: backup.Namespace}, existing)
-	if err == nil {
-		return nil
-	}
-	if !apierrors.IsNotFound(err) {
-		return err
-	}
-
 	dumpFlag := "--schema-only"
 	if runType == postgresv1alpha1.BackupRunTypeData {
 		dumpFlag = "--data-only"
@@ -185,6 +188,7 @@ func (r *BackupReconciler) reconcileLogicalCronJob(
 
 	dumpScript := fmt.Sprintf(`
 set -e
+echo "pg_dump: host=$PGHOST sslmode=${PGSSLMODE:-prefer}"
 FILENAME=$(date +%%Y%%m%%dT%%H%%M%%S).dump
 pg_dump -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDATABASE" %s -Fc -f /backup/$FILENAME
 echo "dump_file=$FILENAME" > /backup/metadata
@@ -239,6 +243,7 @@ echo "Uploaded to $DEST"
 										EmptyDir: &corev1.EmptyDirVolumeSource{},
 									},
 								},
+								jobTLSVolume(clusterSecretName),
 							},
 							InitContainers: []corev1.Container{
 								{
@@ -252,31 +257,17 @@ echo "Uploaded to $DEST"
 										ReadOnlyRootFilesystem: func() *bool { b := true; return &b }(),
 									},
 									Command: []string{shBin, "-c", dumpScript},
-									Env: []corev1.EnvVar{
+									Env: append([]corev1.EnvVar{
+										secretEnv("PGUSER", clusterSecretName, SecretKeyUsername),
+										secretEnv("PGPASSWORD", clusterSecretName, SecretKeyPassword),
 										{
-											Name: "PGUSER",
-											ValueFrom: &corev1.EnvVarSource{
-												SecretKeyRef: &corev1.SecretKeySelector{
-													LocalObjectReference: corev1.LocalObjectReference{Name: clusterSecretName},
-													Key:                  "username",
-												},
-											},
-										},
-										{
-											Name: "PGPASSWORD",
-											ValueFrom: &corev1.EnvVarSource{
-												SecretKeyRef: &corev1.SecretKeySelector{
-													LocalObjectReference: corev1.LocalObjectReference{Name: clusterSecretName},
-													Key:                  "password",
-												},
-											},
-										},
-										{
-											Name:  "PGHOST",
+											// The Service FQDN: the name the server
+											// certificate is validated for (verify-full).
+											Name:  envPGHost,
 											Value: fmt.Sprintf("%s.%s.svc.cluster.local", cluster.Name, backup.Namespace),
 										},
 										{
-											Name:  "PGPORT",
+											Name:  envPGPort,
 											Value: fmt.Sprintf("%d", pgPort),
 										},
 										{
@@ -285,9 +276,10 @@ echo "Uploaded to $DEST"
 											Name:  envPGDatabase,
 											Value: database.PostgresName(),
 										},
-									},
+									}, jobTLSEnv(clusterSecretName)...),
 									VolumeMounts: []corev1.VolumeMount{
 										{Name: backupVolumeName, MountPath: backupVolumeMount},
+										jobTLSVolumeMount(),
 									},
 								},
 							},
@@ -319,7 +311,7 @@ echo "Uploaded to $DEST"
 		return err
 	}
 
-	return r.Create(ctx, cronjob)
+	return r.applyCronJob(ctx, cronjob)
 }
 
 // reconcilePhysicalBackup injects pgBackRest CronJobs for the cluster.
@@ -409,14 +401,6 @@ func (r *BackupReconciler) reconcilePhysicalCronJob(
 	schedule string,
 ) error {
 	cronName := fmt.Sprintf("%s-%s", backup.Name, string(runType))
-	existing := &batchv1.CronJob{}
-	err := r.Get(ctx, types.NamespacedName{Name: cronName, Namespace: backup.Namespace}, existing)
-	if err == nil {
-		return nil
-	}
-	if !apierrors.IsNotFound(err) {
-		return err
-	}
 
 	backupType := "full"
 	if runType == postgresv1alpha1.BackupRunTypeIncremental {
@@ -531,7 +515,59 @@ func (r *BackupReconciler) reconcilePhysicalCronJob(
 		return err
 	}
 
-	return r.Create(ctx, cronjob)
+	return r.applyCronJob(ctx, cronjob)
+}
+
+// applyCronJob creates the CronJob, or converges an existing one onto the
+// desired spec. A hash of the desired spec is kept in an annotation, so the
+// CronJob is only rewritten when what the operator generates changes (for
+// example after an operator upgrade, or a Cluster image/port change), never
+// because of API-server defaulting. spec.suspend is left as the user set it.
+func (r *BackupReconciler) applyCronJob(ctx context.Context, desired *batchv1.CronJob) error {
+	hash, err := cronJobSpecHash(desired)
+	if err != nil {
+		return err
+	}
+	if desired.Annotations == nil {
+		desired.Annotations = map[string]string{}
+	}
+	desired.Annotations[annotationSpecHash] = hash
+
+	existing := &batchv1.CronJob{}
+	err = r.Get(ctx, types.NamespacedName{Name: desired.Name, Namespace: desired.Namespace}, existing)
+	if apierrors.IsNotFound(err) {
+		return r.Create(ctx, desired)
+	}
+	if err != nil {
+		return err
+	}
+	if existing.Annotations[annotationSpecHash] == hash {
+		return nil
+	}
+
+	suspend := existing.Spec.Suspend
+	existing.Spec = desired.Spec
+	existing.Spec.Suspend = suspend
+	if existing.Labels == nil {
+		existing.Labels = map[string]string{}
+	}
+	maps.Copy(existing.Labels, desired.Labels)
+	if existing.Annotations == nil {
+		existing.Annotations = map[string]string{}
+	}
+	existing.Annotations[annotationSpecHash] = hash
+	logf.FromContext(ctx).Info("Updating backup CronJob", "cronjob", existing.Name)
+	return r.Update(ctx, existing)
+}
+
+// cronJobSpecHash hashes the operator-generated CronJob spec.
+func cronJobSpecHash(cj *batchv1.CronJob) (string, error) {
+	b, err := json.Marshal(cj.Spec)
+	if err != nil {
+		return "", fmt.Errorf("failed to hash CronJob spec: %w", err)
+	}
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:16]), nil
 }
 
 func (r *BackupReconciler) buildPgbackrestConfig(backup *postgresv1alpha1.Backup, pgDataPath string) string {
@@ -632,6 +668,46 @@ func (r *BackupReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&postgresv1alpha1.Backup{}).
 		Owns(&batchv1.CronJob{}).
 		Owns(&corev1.ConfigMap{}).
+		// Spec changes (image, port, ...) of a Cluster flow into its backup
+		// CronJobs. TLS state needs no watch: Jobs read it from the
+		// credentials Secret at run time (see job_tls.go).
+		Watches(&postgresv1alpha1.Cluster{},
+			handler.EnqueueRequestsFromMapFunc(r.backupsForCluster),
+			builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Named("backup").
 		Complete(r)
+}
+
+// backupsForCluster maps a Cluster to the Backups that back it up: physical
+// Backups through clusterRef, logical Backups through their Database.
+func (r *BackupReconciler) backupsForCluster(ctx context.Context, obj client.Object) []reconcile.Request {
+	backups := &postgresv1alpha1.BackupList{}
+	if err := r.List(ctx, backups, client.InNamespace(obj.GetNamespace())); err != nil {
+		logf.FromContext(ctx).Error(err, "Failed to list Backups for Cluster", "cluster", obj.GetName())
+		return nil
+	}
+	var requests []reconcile.Request
+	for i := range backups.Items {
+		b := &backups.Items[i]
+		if backupCluster(ctx, r, b) == obj.GetName() {
+			requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(b)})
+		}
+	}
+	return requests
+}
+
+// backupCluster returns the name of the Cluster a Backup reads from, or ""
+// when it cannot be resolved.
+func backupCluster(ctx context.Context, c client.Reader, b *postgresv1alpha1.Backup) string {
+	switch {
+	case b.Spec.Type == postgresv1alpha1.BackupTypePhysical && b.Spec.ClusterRef != nil:
+		return b.Spec.ClusterRef.Name
+	case b.Spec.Type == postgresv1alpha1.BackupTypeLogical && b.Spec.DatabaseRef != nil:
+		db := &postgresv1alpha1.Database{}
+		if err := c.Get(ctx, types.NamespacedName{Name: b.Spec.DatabaseRef.Name, Namespace: b.Namespace}, db); err != nil {
+			return ""
+		}
+		return db.Spec.ClusterRef.Name
+	}
+	return ""
 }

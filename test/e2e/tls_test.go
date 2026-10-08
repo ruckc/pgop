@@ -31,6 +31,11 @@ import (
 	"github.com/ruckc/pgop/test/utils"
 )
 
+// tlsRustfsNamespace holds the RustFS used by the TLS backup specs. It is
+// separate from rustfsNamespace, which the backup specs delete when they
+// finish.
+const tlsRustfsNamespace = "rustfs-tls"
+
 // RegisterTLSTests adds server TLS (spec.tls, issue #22 phase 1) specs into
 // the caller's Describe/Context block. Must be called inside a Describe/Context
 // that has already deployed the controller into `namespace`. cert-manager is
@@ -82,6 +87,7 @@ func RegisterTLSTests() {
 
 		AfterAll(func() {
 			for _, res := range []string{
+				"restore.pgop.ruck.io/tls-restore", "backuprun.pgop.ruck.io/tls-restore-src", "backup.pgop.ruck.io/tls-backup",
 				"database.pgop.ruck.io/" + dbName, "role.pgop.ruck.io/" + roleName, "cluster/" + clusterName,
 				"certificate/" + tlsSecret, "issuer/tls-ca-issuer", "certificate/tls-ca", "issuer/tls-selfsigned",
 			} {
@@ -89,6 +95,7 @@ func RegisterTLSTests() {
 			}
 			_, _ = utils.Run(exec.Command("kubectl", "delete", "pvc", "-n", namespace, "--ignore-not-found",
 				"data-"+clusterName+"-0"))
+			_, _ = utils.Run(exec.Command("kubectl", "delete", "ns", tlsRustfsNamespace, "--ignore-not-found", "--wait=false"))
 		})
 
 		It("issues a server certificate with cert-manager", func() {
@@ -232,6 +239,118 @@ spec:
 				"SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()")
 			Expect(err).NotTo(HaveOccurred())
 			Expect(out).To(Equal("t"))
+		})
+
+		It("backs up and restores a Database with pg_dump/pg_restore over verify-full", func() {
+			setupRustFS(tlsRustfsNamespace)
+			applyRustFSCredentials()
+
+			password := secretValue(clusterName+"-credentials", "password")
+			psqlDB := func(query string) (string, error) {
+				conn := fmt.Sprintf("host=%s hostaddr=127.0.0.1 user=pgop_operator dbname=%s sslmode=verify-full sslrootcert=/etc/pgop/tls/ca.crt",
+					fqdn, dbName)
+				out, err := utils.Run(exec.Command("kubectl", "exec", "-n", namespace, clusterName+"-0", "-c", "postgresql", "--",
+					"env", "PGPASSWORD="+password, "psql", conn, "-v", "ON_ERROR_STOP=1", "-tAc", query))
+				return strings.TrimSpace(out), err
+			}
+			_, err := psqlDB("CREATE TABLE tls_backup_check (v int); INSERT INTO tls_backup_check VALUES (42)")
+			Expect(err).NotTo(HaveOccurred())
+
+			apply(fmt.Sprintf(`
+apiVersion: pgop.ruck.io/v1alpha1
+kind: Backup
+metadata:
+  name: tls-backup
+spec:
+  type: logical
+  databaseRef:
+    name: %s
+  schedule: "0 3 * * *"
+  retention:
+    disabled: true
+  destination:
+    type: s3
+    s3:
+      bucket: pgop-backups
+      prefix: tls
+      region: us-east-1
+      endpoint: http://rustfs.%s.svc.cluster.local:9000
+      credentialsSecretRef:
+        name: rustfs-credentials
+`, dbName, tlsRustfsNamespace))
+
+			By("taking the sslmode and CA for pg_dump from the credentials Secret")
+			Eventually(func(g Gomega) {
+				out, err := utils.Run(exec.Command("kubectl", "get", "cronjob", "tls-backup-data", "-n", namespace, "-o",
+					`jsonpath={.spec.jobTemplate.spec.template.spec.initContainers[0].env[?(@.name=="PGSSLMODE")].valueFrom.secretKeyRef.key}`))
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(out).To(Equal("sslmode"))
+			}).Should(Succeed())
+
+			By("running a data backup Job against the requireTLS server")
+			_, err = utils.Run(exec.Command("kubectl", "create", "job", "tls-backup-manual",
+				"--from=cronjob/tls-backup-data", "-n", namespace))
+			Expect(err).NotTo(HaveOccurred())
+			Eventually(func(g Gomega) {
+				out, err := utils.Run(exec.Command("kubectl", "get", "job", "tls-backup-manual", "-n", namespace,
+					"-o", "jsonpath={.status.succeeded}"))
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(out).To(Equal("1"), "TLS backup job did not succeed")
+			}).Should(Succeed())
+
+			By("confirming pg_dump connected with sslmode=verify-full")
+			out, err := utils.Run(exec.Command("kubectl", "logs", "job/tls-backup-manual", "-n", namespace, "-c", "pg-dump"))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(out).To(ContainSubstring("sslmode=verify-full"))
+
+			out, err = utils.Run(exec.Command("kubectl", "logs", "job/tls-backup-manual", "-n", namespace, "-c", "s3-upload"))
+			Expect(err).NotTo(HaveOccurred())
+			location := parseUploadedLocation(out)
+			Expect(location).To(HavePrefix("s3://pgop-backups/tls/data/"))
+
+			By("restoring the dump with pg_restore over verify-full")
+			_, err = psqlDB("DELETE FROM tls_backup_check")
+			Expect(err).NotTo(HaveOccurred())
+			apply(`
+apiVersion: pgop.ruck.io/v1alpha1
+kind: BackupRun
+metadata:
+  name: tls-restore-src
+spec:
+  backupRef:
+    name: tls-backup
+  type: data
+`)
+			_, err = utils.Run(exec.Command("kubectl", "patch", "backuprun.pgop.ruck.io", "tls-restore-src",
+				"-n", namespace, "--subresource=status", "--type=merge",
+				"-p", fmt.Sprintf(`{"status":{"location":%q}}`, location)))
+			Expect(err).NotTo(HaveOccurred())
+			apply(fmt.Sprintf(`
+apiVersion: pgop.ruck.io/v1alpha1
+kind: Restore
+metadata:
+  name: tls-restore
+spec:
+  type: logical
+  backupRunRef:
+    name: tls-restore-src
+  clusterRef:
+    name: %s
+  databaseRef:
+    name: %s
+`, clusterName, dbName))
+			Eventually(func(g Gomega) {
+				out, err := utils.Run(exec.Command("kubectl", "get", "restore.pgop.ruck.io", "tls-restore",
+					"-n", namespace, "-o", "jsonpath={.status.phase}"))
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(out).To(Equal("Succeeded"), "TLS restore did not succeed")
+			}).Should(Succeed())
+
+			out, err = utils.Run(exec.Command("kubectl", "logs", "job/tls-restore-restore", "-n", namespace, "-c", "pg-restore"))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(out).To(ContainSubstring("sslmode=verify-full"))
+
+			Expect(psqlDB("SELECT v FROM tls_backup_check")).To(Equal("42"))
 		})
 
 		It("reverts to plaintext when spec.tls is removed", func() {

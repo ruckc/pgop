@@ -42,6 +42,11 @@ The restore runs `pg_restore --no-owner --clean --if-exists`, so it recreates
 objects into an existing database and tolerates a differing role set on the
 target cluster.
 
+When the target Cluster has TLS enabled, `pg_restore` connects with the
+`sslmode` and `ca.crt` from the target Cluster's credentials Secret
+(`verify-full` once `TLSReady` is `True`). See
+[Clusters → Backups and restores](clusters.md#backups-and-restores).
+
 ## Physical restore (pgBackRest)
 
 A physical restore runs `pgbackrest restore` against the repository configured

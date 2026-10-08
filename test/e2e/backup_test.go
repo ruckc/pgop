@@ -40,37 +40,9 @@ const rustfsNamespace = "rustfs"
 func RegisterBackupTests() {
 	Context("Backup — logical pg_dump via RustFS", Ordered, func() {
 		BeforeAll(func() {
-			By("creating rustfs namespace")
-			cmd := exec.Command("kubectl", "create", "ns", rustfsNamespace)
-			_, _ = utils.Run(cmd) // ignore error if already exists
+			setupRustFS(rustfsNamespace)
 
-			By("deploying RustFS as S3-compatible storage")
-			deployRustFS()
-
-			By("waiting for RustFS to be ready")
-			Eventually(func(g Gomega) {
-				cmd := exec.Command("kubectl", "rollout", "status", "deployment/rustfs",
-					"-n", rustfsNamespace, "--timeout=2m")
-				_, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred())
-			}, 3*time.Minute, 5*time.Second).Should(Succeed())
-
-			By("creating S3 bucket in RustFS")
-			createRustFSBucket()
-
-			By("creating RustFS credentials secret in manager namespace")
-			cmd = exec.Command("kubectl", "create", "secret", "generic", "rustfs-credentials",
-				"--from-literal=AWS_ACCESS_KEY_ID=minioadmin",
-				"--from-literal=AWS_SECRET_ACCESS_KEY=minioadmin",
-				"-n", namespace,
-				"--dry-run=client", "-o", "yaml",
-			)
-			out, err := utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred())
-			applyCmd := exec.Command("kubectl", "apply", "-f", "-")
-			applyCmd.Stdin = newStringReader(out)
-			_, err = utils.Run(applyCmd)
-			Expect(err).NotTo(HaveOccurred())
+			applyRustFSCredentials()
 		})
 
 		AfterAll(func() {
@@ -304,8 +276,46 @@ func parseUploadedLocation(logs string) string {
 	return ""
 }
 
-// deployRustFS deploys RustFS (S3-compatible object storage) into the rustfs namespace.
-func deployRustFS() {
+// applyRustFSCredentials creates (or updates) the rustfs-credentials Secret
+// used by Backups in the manager namespace.
+func applyRustFSCredentials() {
+	By("creating RustFS credentials secret in manager namespace")
+	cmd := exec.Command("kubectl", "create", "secret", "generic", "rustfs-credentials",
+		"--from-literal=AWS_ACCESS_KEY_ID=minioadmin",
+		"--from-literal=AWS_SECRET_ACCESS_KEY=minioadmin",
+		"-n", namespace,
+		"--dry-run=client", "-o", "yaml",
+	)
+	out, err := utils.Run(cmd)
+	Expect(err).NotTo(HaveOccurred())
+	applyCmd := exec.Command("kubectl", "apply", "-f", "-")
+	applyCmd.Stdin = newStringReader(out)
+	_, err = utils.Run(applyCmd)
+	Expect(err).NotTo(HaveOccurred())
+}
+
+// setupRustFS creates ns and deploys RustFS with a pgop-backups bucket into it.
+func setupRustFS(ns string) {
+	By("creating the " + ns + " namespace")
+	_, _ = utils.Run(exec.Command("kubectl", "create", "ns", ns)) // ignore error if already exists
+
+	By("deploying RustFS as S3-compatible storage")
+	deployRustFS(ns)
+
+	By("waiting for RustFS to be ready")
+	Eventually(func(g Gomega) {
+		cmd := exec.Command("kubectl", "rollout", "status", "deployment/rustfs",
+			"-n", ns, "--timeout=2m")
+		_, err := utils.Run(cmd)
+		g.Expect(err).NotTo(HaveOccurred())
+	}, 3*time.Minute, 5*time.Second).Should(Succeed())
+
+	By("creating S3 bucket in RustFS")
+	createRustFSBucket(ns)
+}
+
+// deployRustFS deploys RustFS (S3-compatible object storage) into ns.
+func deployRustFS(ns string) {
 	rustfsYAML := fmt.Sprintf(`
 apiVersion: v1
 kind: ServiceAccount
@@ -377,7 +387,7 @@ spec:
     - name: s3
       port: 9000
       targetPort: 9000
-`, rustfsNamespace, rustfsNamespace, rustfsNamespace)
+`, ns, ns, ns)
 
 	cmd := exec.Command("kubectl", "apply", "-f", "-")
 	cmd.Stdin = newStringReader(rustfsYAML)
@@ -385,8 +395,8 @@ spec:
 	Expect(err).NotTo(HaveOccurred(), "Failed to deploy RustFS")
 }
 
-// createRustFSBucket creates the pgop-backups bucket in RustFS using a Job.
-func createRustFSBucket() {
+// createRustFSBucket creates the pgop-backups bucket in the RustFS in ns using a Job.
+func createRustFSBucket(ns string) {
 	bucketJobYAML := fmt.Sprintf(`
 apiVersion: batch/v1
 kind: Job
@@ -423,7 +433,7 @@ spec:
               value: us-east-1
             - name: AWS_ENDPOINT_URL
               value: http://rustfs:9000
-`, rustfsNamespace)
+`, ns)
 
 	cmd := exec.Command("kubectl", "apply", "-f", "-")
 	cmd.Stdin = newStringReader(bucketJobYAML)
@@ -431,7 +441,7 @@ spec:
 	Expect(err).NotTo(HaveOccurred(), "Failed to create bucket job")
 
 	Eventually(func(g Gomega) {
-		cmd := exec.Command("kubectl", "get", "job", "create-bucket", "-n", rustfsNamespace,
+		cmd := exec.Command("kubectl", "get", "job", "create-bucket", "-n", ns,
 			"-o", "jsonpath={.status.succeeded}")
 		out, err := utils.Run(cmd)
 		g.Expect(err).NotTo(HaveOccurred())
