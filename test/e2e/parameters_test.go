@@ -42,7 +42,7 @@ func RegisterParametersTests() {
 
 		const (
 			pg18Cluster = "params"
-			pg16Cluster = "params-pg16"
+			initCluster = "params-init"
 		)
 
 		kubectl := func(args ...string) (string, error) {
@@ -92,7 +92,7 @@ func RegisterParametersTests() {
 		}
 
 		AfterAll(func() {
-			for _, c := range []string{pg18Cluster, pg16Cluster} {
+			for _, c := range []string{pg18Cluster, initCluster} {
 				_, _ = kubectl("delete", "cluster", c, "--ignore-not-found", "--wait=false")
 			}
 		})
@@ -213,26 +213,32 @@ spec:
 			}).Should(Succeed())
 		})
 
-		It("initializes a PostgreSQL 16 Cluster with restart-only parameters", func() {
+		// A PostgreSQL <=17 Cluster cannot run on Kind's local-path volumes
+		// (initdb must chmod the volume root, which the provisioner does not
+		// hand to fsGroup), so first-time initialization with restart-only
+		// parameters is covered on PostgreSQL 18.
+		It("initializes a Cluster with restart-only parameters without a restart", func() {
 			Expect(apply(fmt.Sprintf(`
 apiVersion: pgop.ruck.io/v1alpha1
 kind: Cluster
 metadata:
   name: %s
 spec:
-  image: postgres:16
   storage:
     retainPolicy: Delete
   parameters:
     shared_preload_libraries: pg_stat_statements
     max_connections: "150"
-`, pg16Cluster))).To(Succeed())
-			waitApplied(pg16Cluster, map[string]string{
+`, initCluster))).To(Succeed())
+			waitApplied(initCluster, map[string]string{
 				"shared_preload_libraries": "pg_stat_statements",
 				"max_connections":          "150",
 			})
-			Expect(psql(Default, pg16Cluster, "SHOW config_file")).To(Equal("/etc/pgop/config/postgresql.conf"))
-			Expect(psql(Default, pg16Cluster, "SHOW data_directory")).To(Equal("/var/lib/postgresql/data"))
+			Expect(psql(Default, initCluster, "SHOW config_file")).To(Equal("/etc/pgop/config/postgresql.conf"))
+			Expect(get(Default, "statefulset", initCluster, "-o",
+				`jsonpath={.spec.template.metadata.annotations.pgop\.ruck\.io/parameters-restart}`)).To(BeEmpty())
+			Expect(get(Default, "pod", initCluster+"-0", "-o",
+				"jsonpath={.status.containerStatuses[0].restartCount}")).To(Equal("0"))
 		})
 	})
 }
