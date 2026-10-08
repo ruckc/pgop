@@ -395,10 +395,7 @@ func (r *ClusterReconciler) reconcileSelfManagedTLS(ctx context.Context, cluster
 		return time.Time{}, err
 	}
 
-	now := time.Now()
-	if r.Now != nil {
-		now = r.Now()
-	}
+	now := r.now()
 	policy := defaultSelfManagedCertPolicy
 	if r.SelfManagedCertPolicy != nil {
 		policy = *r.SelfManagedCertPolicy

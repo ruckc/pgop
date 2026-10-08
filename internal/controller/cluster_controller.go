@@ -172,8 +172,7 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 				err = &tlsNotReadyError{Reason: ReasonInvalidTLSSecret, Message: err.Error()}
 			}
 		}
-		var notReady *tlsNotReadyError
-		if errors.As(err, &notReady) {
+		if notReady, ok := errors.AsType[*tlsNotReadyError](err); ok {
 			return r.reportTLSNotReady(ctx, cluster, secret, notReady)
 		}
 		if err != nil {
@@ -272,8 +271,8 @@ func (r *ClusterReconciler) provisionTLSSecret(ctx context.Context, cluster *pos
 		return time.Time{}, nil
 	case t.IssuerRef != nil:
 		err := r.reconcileCertificate(ctx, cluster)
-		var notReady *tlsNotReadyError
-		if err == nil || (errors.As(err, &notReady) && notReady.Reason != ReasonCertManagerUnavailable) {
+		notReady, isNotReady := errors.AsType[*tlsNotReadyError](err)
+		if err == nil || (isNotReady && notReady.Reason != ReasonCertManagerUnavailable) {
 			r.certManagerSeen.Store(true)
 		}
 		return time.Time{}, err
