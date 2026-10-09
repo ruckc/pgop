@@ -177,7 +177,10 @@ spec:
 			Eventually(func(g Gomega) {
 				g.Expect(query(g, `SELECT has_parameter_privilege('grant_param', 'log_statement', 'SET')`)).To(Equal("t"))
 				g.Expect(query(g, `SELECT has_parameter_privilege('grant_param', 'myapp.tenant_id', 'SET WITH GRANT OPTION')`)).To(Equal("t"))
-				g.Expect(query(g, `SET ROLE grant_param; SET log_statement = 'all'; SHOW log_statement`)).To(Equal("all"))
+				// psql prints the SET command tags first; SHOW's value is the last line.
+				out := query(g, `SET ROLE grant_param; SET log_statement = 'all'; SHOW log_statement`)
+				lines := strings.Split(out, "\n")
+				g.Expect(strings.TrimSpace(lines[len(lines)-1])).To(Equal("all"))
 			}).Should(Succeed())
 
 			By("removing a parameter grant")
