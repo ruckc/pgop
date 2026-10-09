@@ -25,6 +25,8 @@ import (
 	. "github.com/onsi/gomega"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -207,38 +209,192 @@ var _ = Describe("Restore Controller", func() {
 		Expect(restore.Status.Phase).To(Equal(postgresv1alpha1.RestorePhaseFailed))
 	})
 
-	It("should create a physical restore Job with a PITR target", func() {
-		runName := newBackupRun(suffix, true)
+	It("should stop the Cluster, restore its data volume and start it again", func() {
 		clusterName := "cluster-" + suffix
 		newCluster(clusterName)
+		backup := &postgresv1alpha1.Backup{
+			ObjectMeta: metav1.ObjectMeta{Name: "pbackup-" + suffix, Namespace: RestoreNamespace},
+			Spec:       physicalBackupSpec(clusterName),
+		}
+		Expect(k8sClient.Create(ctx, backup)).To(Succeed())
+		run := &postgresv1alpha1.BackupRun{
+			ObjectMeta: metav1.ObjectMeta{Name: "prun-" + suffix, Namespace: RestoreNamespace},
+			Spec: postgresv1alpha1.BackupRunSpec{
+				BackupRef: postgresv1alpha1.ClusterReference{Name: backup.Name},
+				Type:      postgresv1alpha1.BackupRunTypeFull,
+			},
+		}
+		Expect(k8sClient.Create(ctx, run)).To(Succeed())
+		run.Status.Location = "s3://bucket/pg/" + clusterName + "/backup/main/20260101-020000F"
+		Expect(k8sClient.Status().Update(ctx, run)).To(Succeed())
 
+		pvcLabels := map[string]string{LabelAppName: AppNamePostgresql, LabelAppInstance: clusterName}
+		for _, ordinal := range []int{0, 1} {
+			pvc := &corev1.PersistentVolumeClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      fmt.Sprintf("data-%s-%d", clusterName, ordinal),
+					Namespace: RestoreNamespace,
+					Labels:    pvcLabels,
+				},
+				Spec: corev1.PersistentVolumeClaimSpec{
+					AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+					Resources: corev1.VolumeResourceRequirements{
+						Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("1Gi")},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, pvc)).To(Succeed())
+		}
+
+		restore := &postgresv1alpha1.Restore{
+			ObjectMeta: metav1.ObjectMeta{Name: "restore-" + suffix, Namespace: RestoreNamespace},
+			Spec: postgresv1alpha1.RestoreSpec{
+				Type:         postgresv1alpha1.BackupTypePhysical,
+				BackupRunRef: postgresv1alpha1.ClusterReference{Name: run.Name},
+				ClusterRef:   postgresv1alpha1.ClusterReference{Name: clusterName},
+			},
+		}
+		Expect(k8sClient.Create(ctx, restore)).To(Succeed())
+		req := reconcile.Request{NamespacedName: types.NamespacedName{Name: restore.Name, Namespace: RestoreNamespace}}
+		cluster := &postgresv1alpha1.Cluster{}
+		getCluster := func() *postgresv1alpha1.Cluster {
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: clusterName, Namespace: RestoreNamespace}, cluster)).To(Succeed())
+			return cluster
+		}
+
+		By("stopping the Cluster")
+		_, err := reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(getCluster().Annotations).To(HaveKeyWithValue(AnnotationRestoreInProgress, restore.Name))
+		Expect(k8sClient.Get(ctx, req.NamespacedName, restore)).To(Succeed())
+		Expect(restore.Status.Phase).To(Equal(postgresv1alpha1.RestorePhaseRunning))
+		Expect(restore.Finalizers).To(ContainElement(restoreFinalizer))
+
+		By("restoring once no pod runs (envtest has no StatefulSet)")
+		_, err = reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(k8sClient.Get(ctx, req.NamespacedName, restore)).To(Succeed())
+		Expect(restore.Status.JobName).NotTo(BeEmpty())
+		job := &batchv1.Job{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: restore.Status.JobName, Namespace: RestoreNamespace}, job)).To(Succeed())
+		c := job.Spec.Template.Spec.Containers[0]
+		Expect(c.Image).To(Equal(DefaultPgbackrestImage))
+		Expect(c.Command[2]).To(ContainSubstring(`exec /usr/bin/pgbackrest restore "$@"`))
+		Expect(c.Command[4:]).To(Equal(physicalRestoreArgs(restore, "20260101-020000F")))
+		Expect(c.Command).To(ContainElement("--set=20260101-020000F"))
+		Expect(c.VolumeMounts).To(ContainElement(corev1.VolumeMount{Name: dataVolumeName, MountPath: "/var/lib/postgresql"}))
+		Expect(job.Spec.Template.Spec.Volumes[0].PersistentVolumeClaim.ClaimName).To(Equal("data-" + clusterName + "-0"))
+		Expect(*job.Spec.Template.Spec.SecurityContext.RunAsUser).To(Equal(int64(999)))
+		standby := &corev1.PersistentVolumeClaim{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "data-" + clusterName + "-1", Namespace: RestoreNamespace},
+			standby)).To(Succeed())
+		Expect(standby.DeletionTimestamp).NotTo(BeNil(), "the standby volume is deleted")
+
+		By("waiting for the standby volume to be gone before starting the Cluster")
+		job.Status.Succeeded = 1
+		Expect(k8sClient.Status().Update(ctx, job)).To(Succeed())
+		_, err = reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(getCluster().Annotations).To(HaveKey(AnnotationRestoreInProgress))
+		// envtest runs no PVC protection controller to release the volume.
+		standby.Finalizers = nil
+		Expect(k8sClient.Update(ctx, standby)).To(Succeed())
+
+		By("starting the Cluster once the Job succeeded")
+		_, err = reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(k8sClient.Get(ctx, req.NamespacedName, restore)).To(Succeed())
+		Expect(restore.Status.Phase).To(Equal(postgresv1alpha1.RestorePhaseSucceeded))
+		Expect(getCluster().Annotations).NotTo(HaveKey(AnnotationRestoreInProgress))
+
+		By("deleting the Restore removes its finalizer")
+		Expect(k8sClient.Delete(ctx, restore)).To(Succeed())
+		_, err = reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+		err = k8sClient.Get(ctx, req.NamespacedName, restore)
+		Expect(apierrors.IsNotFound(err)).To(BeTrue())
+	})
+
+	It("should start the Cluster again when a physical Restore is deleted", func() {
+		clusterName := "cluster-" + suffix
+		newCluster(clusterName)
+		backup := &postgresv1alpha1.Backup{
+			ObjectMeta: metav1.ObjectMeta{Name: "pbackup-" + suffix, Namespace: RestoreNamespace},
+			Spec:       physicalBackupSpec(clusterName),
+		}
+		Expect(k8sClient.Create(ctx, backup)).To(Succeed())
+		run := &postgresv1alpha1.BackupRun{
+			ObjectMeta: metav1.ObjectMeta{Name: "prun-" + suffix, Namespace: RestoreNamespace},
+			Spec: postgresv1alpha1.BackupRunSpec{
+				BackupRef: postgresv1alpha1.ClusterReference{Name: backup.Name},
+				Type:      postgresv1alpha1.BackupRunTypeFull,
+			},
+		}
+		Expect(k8sClient.Create(ctx, run)).To(Succeed())
 		targetTime := metav1.NewTime(time.Unix(1767240000, 0).UTC())
 		restore := &postgresv1alpha1.Restore{
 			ObjectMeta: metav1.ObjectMeta{Name: "restore-" + suffix, Namespace: RestoreNamespace},
 			Spec: postgresv1alpha1.RestoreSpec{
 				Type:         postgresv1alpha1.BackupTypePhysical,
-				BackupRunRef: postgresv1alpha1.ClusterReference{Name: runName},
+				BackupRunRef: postgresv1alpha1.ClusterReference{Name: run.Name},
 				ClusterRef:   postgresv1alpha1.ClusterReference{Name: clusterName},
 				TargetTime:   &targetTime,
 			},
 		}
 		Expect(k8sClient.Create(ctx, restore)).To(Succeed())
-
-		_, err := reconciler.Reconcile(ctx, reconcile.Request{
-			NamespacedName: types.NamespacedName{Name: restore.Name, Namespace: RestoreNamespace},
-		})
+		req := reconcile.Request{NamespacedName: types.NamespacedName{Name: restore.Name, Namespace: RestoreNamespace}}
+		_, err := reconciler.Reconcile(ctx, req)
 		Expect(err).NotTo(HaveOccurred())
 
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: restore.Name, Namespace: RestoreNamespace}, restore)).To(Succeed())
-		Expect(restore.Status.Phase).To(Equal(postgresv1alpha1.RestorePhaseRunning))
+		By("the data volume is missing: the Restore fails and the Cluster stays stopped")
+		_, err = reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(k8sClient.Get(ctx, req.NamespacedName, restore)).To(Succeed())
+		Expect(restore.Status.Phase).To(Equal(postgresv1alpha1.RestorePhaseFailed))
+		cluster := &postgresv1alpha1.Cluster{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: clusterName, Namespace: RestoreNamespace}, cluster)).To(Succeed())
+		Expect(cluster.Annotations).To(HaveKeyWithValue(AnnotationRestoreInProgress, restore.Name))
 
-		job := &batchv1.Job{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: restore.Status.JobName, Namespace: RestoreNamespace}, job)).To(Succeed())
-		Expect(job.Spec.Template.Spec.Containers[0].Image).To(Equal(pgbackrestImage))
-		cmd := job.Spec.Template.Spec.Containers[0].Command[2]
-		Expect(cmd).To(ContainSubstring("pgbackrest"))
-		Expect(cmd).To(ContainSubstring("restore"))
-		Expect(cmd).To(ContainSubstring("--type=time"))
+		Expect(k8sClient.Delete(ctx, restore)).To(Succeed())
+		_, err = reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: clusterName, Namespace: RestoreNamespace}, cluster)).To(Succeed())
+		Expect(cluster.Annotations).NotTo(HaveKey(AnnotationRestoreInProgress))
+	})
+
+	It("should reject a physical restore into another Cluster", func() {
+		newCluster("cluster-" + suffix)
+		backup := &postgresv1alpha1.Backup{
+			ObjectMeta: metav1.ObjectMeta{Name: "pbackup-" + suffix, Namespace: RestoreNamespace},
+			Spec:       physicalBackupSpec("source-" + suffix),
+		}
+		Expect(k8sClient.Create(ctx, backup)).To(Succeed())
+		run := &postgresv1alpha1.BackupRun{
+			ObjectMeta: metav1.ObjectMeta{Name: "prun-" + suffix, Namespace: RestoreNamespace},
+			Spec: postgresv1alpha1.BackupRunSpec{
+				BackupRef: postgresv1alpha1.ClusterReference{Name: backup.Name},
+				Type:      postgresv1alpha1.BackupRunTypeFull,
+			},
+		}
+		Expect(k8sClient.Create(ctx, run)).To(Succeed())
+		restore := &postgresv1alpha1.Restore{
+			ObjectMeta: metav1.ObjectMeta{Name: "restore-" + suffix, Namespace: RestoreNamespace},
+			Spec: postgresv1alpha1.RestoreSpec{
+				Type:         postgresv1alpha1.BackupTypePhysical,
+				BackupRunRef: postgresv1alpha1.ClusterReference{Name: run.Name},
+				ClusterRef:   postgresv1alpha1.ClusterReference{Name: "cluster-" + suffix},
+			},
+		}
+		Expect(k8sClient.Create(ctx, restore)).To(Succeed())
+		req := reconcile.Request{NamespacedName: types.NamespacedName{Name: restore.Name, Namespace: RestoreNamespace}}
+		_, err := reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(k8sClient.Get(ctx, req.NamespacedName, restore)).To(Succeed())
+		Expect(restore.Status.Phase).To(Equal(postgresv1alpha1.RestorePhaseFailed))
+		Expect(restore.Status.Conditions[0].Message).To(ContainSubstring("the Cluster the Backup was taken from"))
+		cluster := &postgresv1alpha1.Cluster{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "cluster-" + suffix, Namespace: RestoreNamespace}, cluster)).To(Succeed())
+		Expect(cluster.Annotations).NotTo(HaveKey(AnnotationRestoreInProgress))
 	})
 
 	It("should mark the Restore Succeeded when its Job succeeds", func() {

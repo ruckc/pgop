@@ -37,6 +37,7 @@ nav:
     - Replication: user-guide/replication.md
     - Roles: user-guide/roles.md
     - Databases: user-guide/databases.md
+    - Backups: user-guide/backups.md
     - Restores: user-guide/restores.md
   - Reference:
     - API Reference: reference/api.md

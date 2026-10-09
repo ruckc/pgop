@@ -54,6 +54,11 @@ type RestoreReconciler struct {
 // +kubebuilder:rbac:groups=pgop.ruck.io,resources=restores/finalizers,verbs=update
 // +kubebuilder:rbac:groups=pgop.ruck.io,resources=backupruns,verbs=get;list;watch
 // +kubebuilder:rbac:groups=pgop.ruck.io,resources=backups,verbs=get;list;watch
+// +kubebuilder:rbac:groups=pgop.ruck.io,resources=clusters,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch
+// +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch
+// +kubebuilder:rbac:groups=core,resources=persistentvolumeclaims,verbs=get;list;watch;delete
+// +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
 
 func (r *RestoreReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
@@ -66,8 +71,14 @@ func (r *RestoreReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, err
 	}
 
-	// A restore is a one-shot operation; the Job it creates is garbage
-	// collected via owner references, so no finalizer is needed.
+	// A physical restore stops the Cluster and restores its data volume
+	// (see restore_physical.go).
+	if restore.Spec.Type == postgresv1alpha1.BackupTypePhysical {
+		return r.reconcilePhysicalRestore(ctx, restore)
+	}
+
+	// A logical restore is a one-shot operation; the Job it creates is
+	// garbage collected via owner references, so no finalizer is needed.
 
 	// Once a Job exists, keep status in sync with it.
 	if restore.Status.JobName != "" {
@@ -145,8 +156,6 @@ func (r *RestoreReconciler) buildRestoreJob(ctx context.Context, restore *postgr
 	switch restore.Spec.Type {
 	case postgresv1alpha1.BackupTypeLogical:
 		return r.buildLogicalRestoreJob(ctx, restore, backup, backupRun, cluster)
-	case postgresv1alpha1.BackupTypePhysical:
-		return r.buildPhysicalRestoreJob(restore, backup)
 	default:
 		return nil, fmt.Errorf("unsupported restore type %q", restore.Spec.Type)
 	}
@@ -240,60 +249,6 @@ echo "Restore complete"
 	return job, nil
 }
 
-// buildPhysicalRestoreJob runs `pgbackrest restore`, optionally to a
-// point-in-time target.
-//
-// NOTE: a physical restore rewrites the PostgreSQL data directory and therefore
-// requires the target cluster to be stopped with its data volume mounted
-// read-write. This Job issues the pgBackRest restore command against the shared
-// repository config; operators must scale the target Cluster down before
-// running it. See docs/user-guide/restores.md.
-func (r *RestoreReconciler) buildPhysicalRestoreJob(
-	restore *postgresv1alpha1.Restore,
-	backup *postgresv1alpha1.Backup,
-) (*batchv1.Job, error) {
-	target := ""
-	if restore.Spec.TargetTime != nil {
-		target = fmt.Sprintf(` --type=time --target="%s"`, restore.Spec.TargetTime.Format(time.RFC3339))
-	}
-
-	restoreScript := fmt.Sprintf(
-		"pgbackrest --config=/etc/pgbackrest/pgbackrest.conf --stanza=main restore --delta%s",
-		target,
-	)
-
-	envVars := s3EnvVarsForDestination(backup.Spec.Destination)
-	cmName := fmt.Sprintf("%s-pgbackrest", backup.Name)
-
-	job := r.newRestoreJob(restore, string(postgresv1alpha1.BackupTypePhysical))
-	job.Spec.Template.Spec.SecurityContext = restorePodSecurityContext(2000)
-	job.Spec.Template.Spec.Containers = []corev1.Container{
-		{
-			Name:            "pgbackrest",
-			Image:           pgbackrestImage,
-			SecurityContext: restoreContainerSecurityContext(true),
-			Command:         []string{shBin, "-c", restoreScript},
-			Env:             envVars,
-			VolumeMounts: []corev1.VolumeMount{
-				{Name: volPgbackrestConfig, MountPath: "/etc/pgbackrest", ReadOnly: true},
-				{Name: volPgbackrestTmp, MountPath: "/tmp"},
-			},
-		},
-	}
-	job.Spec.Template.Spec.Volumes = []corev1.Volume{
-		{
-			Name: volPgbackrestConfig,
-			VolumeSource: corev1.VolumeSource{
-				ConfigMap: &corev1.ConfigMapVolumeSource{
-					LocalObjectReference: corev1.LocalObjectReference{Name: cmName},
-				},
-			},
-		},
-		{Name: volPgbackrestTmp, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
-	}
-	return job, nil
-}
-
 // newRestoreJob returns a Job skeleton with the common metadata and pod-level
 // scheduling settings shared by logical and physical restores.
 func (r *RestoreReconciler) newRestoreJob(restore *postgresv1alpha1.Restore, restoreType string) *batchv1.Job {
@@ -348,7 +303,7 @@ func (r *RestoreReconciler) syncFromJob(restore *postgresv1alpha1.Restore, job *
 		meta.SetStatusCondition(&restore.Status.Conditions, metav1.Condition{
 			Type:               ConditionTypeAvailable,
 			Status:             metav1.ConditionTrue,
-			Reason:             "Succeeded",
+			Reason:             reasonSucceeded,
 			Message:            "Restore completed successfully",
 			ObservedGeneration: restore.Generation,
 			LastTransitionTime: now,

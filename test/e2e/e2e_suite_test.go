@@ -28,12 +28,17 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
+	"github.com/ruckc/pgop/internal/controller"
 	"github.com/ruckc/pgop/test/utils"
 )
 
 var (
 	// managerImage is the manager image to be built and loaded for testing.
 	managerImage = "example.com/pgop:coverage-v1"
+	// pgbackrestImage and postgresPgbackrestImage are the operator's default
+	// pgBackRest Job image and the Postgres+pgBackRest image of postgres:18.
+	pgbackrestImage         = controller.DefaultPgbackrestImage
+	postgresPgbackrestImage = controller.PgopPostgresImage(18)
 	// shouldCleanupCertManager tracks whether CertManager was installed by this suite.
 	shouldCleanupCertManager = false
 )
@@ -59,6 +64,19 @@ var _ = BeforeSuite(func() {
 	By("loading the manager image on Kind")
 	err = utils.LoadImageToKindClusterWithName(managerImage)
 	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to load the manager image into Kind")
+
+	// The physical backup tests run the pgBackRest images built from this
+	// tree under the tags the operator defaults to, so nothing is pulled
+	// from ghcr.io (the images are only published from main).
+	By("building the pgBackRest images")
+	cmd = exec.Command("make", "docker-build-pgbackrest",
+		"PGBACKREST_IMG="+pgbackrestImage, "POSTGRES_PGBACKREST_IMG="+postgresPgbackrestImage, "PG_MAJOR=18")
+	_, err = utils.Run(cmd)
+	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to build the pgBackRest images")
+	for _, img := range []string{pgbackrestImage, postgresPgbackrestImage} {
+		By("loading " + img + " on Kind")
+		ExpectWithOffset(1, utils.LoadImageToKindClusterWithName(img)).To(Succeed(), "Failed to load "+img+" into Kind")
+	}
 
 	setupCertManager()
 })

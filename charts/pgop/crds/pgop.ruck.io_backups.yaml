@@ -143,6 +143,23 @@ spec:
                       bucket:
                         description: bucket is the S3 bucket name
                         type: string
+                      caSecretRef:
+                        description: |-
+                          caSecretRef selects a Secret key holding the PEM CA bundle that
+                          verifies the endpoint's TLS certificate, for S3-compatible storage
+                          with a private CA. Used by physical (pgBackRest) backups, which always
+                          connect to S3 over HTTPS.
+                        properties:
+                          key:
+                            description: key is the key in the secret to select
+                            type: string
+                          name:
+                            description: name is the name of the secret
+                            type: string
+                        required:
+                        - key
+                        - name
+                        type: object
                       credentialsSecretRef:
                         description: |-
                           credentialsSecretRef references a Secret with AWS credentials.
@@ -213,6 +230,15 @@ spec:
                   fullSchedule:
                     default: 0 2 * * 0
                     description: fullSchedule is the cron schedule for full backups
+                    type: string
+                  image:
+                    description: |-
+                      image is the pgBackRest container image the backup and restore Jobs
+                      run. Defaults to the image built by the pgop project
+                      (ghcr.io/ruckc/pgop-pgbackrest) for the pgBackRest version the operator
+                      ships with. pgBackRest requires the same version on both ends of its
+                      protocol, so an override must match the version in the Cluster's
+                      PostgreSQL image.
                     type: string
                   incrementalSchedule:
                     default: 0 2 * * 1-6

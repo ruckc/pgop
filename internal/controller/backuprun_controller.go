@@ -21,6 +21,7 @@ import (
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -28,7 +29,9 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	postgresv1alpha1 "github.com/ruckc/pgop/api/v1alpha1"
 )
@@ -39,11 +42,17 @@ const defaultBackupRunTTL = 168 * time.Hour // 7 days
 type BackupRunReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+
+	// APIReader reads the pods of backup Jobs, which the manager's pod cache
+	// (PostgreSQL pods only) does not hold. Optional; defaults to Client.
+	APIReader client.Reader
 }
 
 // +kubebuilder:rbac:groups=pgop.ruck.io,resources=backupruns,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=pgop.ruck.io,resources=backupruns/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=pgop.ruck.io,resources=backupruns/finalizers,verbs=update
+// +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch
+// +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch
 
 func (r *BackupRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
@@ -54,6 +63,10 @@ func (r *BackupRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			return ctrl.Result{}, nil
 		}
 		return ctrl.Result{}, err
+	}
+
+	if requeue, err := r.recordLateLocation(ctx, run); err != nil || requeue {
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, err
 	}
 
 	// Enforce TTL: delete the BackupRun record once it has expired
@@ -80,6 +93,9 @@ func (r *BackupRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		}
 		if err == nil {
 			updated := r.syncFromJob(run, job)
+			if r.recordLocation(ctx, run, job) {
+				updated = true
+			}
 			if updated {
 				if err := r.Status().Update(ctx, run); err != nil {
 					return ctrl.Result{}, err
@@ -105,7 +121,8 @@ func (r *BackupRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		}
 	}
 
-	if run.Status.Phase == postgresv1alpha1.BackupRunPhaseRunning {
+	if run.Status.Phase == postgresv1alpha1.BackupRunPhaseRunning ||
+		(run.Status.Phase == postgresv1alpha1.BackupRunPhasePending && run.Status.JobName != "") {
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 
@@ -130,7 +147,7 @@ func (r *BackupRunReconciler) syncFromJob(run *postgresv1alpha1.BackupRun, job *
 			meta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{
 				Type:               ConditionTypeAvailable,
 				Status:             metav1.ConditionTrue,
-				Reason:             "Succeeded",
+				Reason:             reasonSucceeded,
 				Message:            "BackupRun completed successfully",
 				ObservedGeneration: run.Generation,
 				LastTransitionTime: now,
@@ -166,6 +183,52 @@ func (r *BackupRunReconciler) syncFromJob(run *postgresv1alpha1.BackupRun, job *
 	return changed
 }
 
+// recordLocation records where a successful physical backup Job stored its
+// backup (see physicalBackupLocation). Returns whether the status changed.
+func (r *BackupRunReconciler) recordLocation(ctx context.Context, run *postgresv1alpha1.BackupRun, job *batchv1.Job) bool {
+	if run.Status.Location != "" || job.Status.Succeeded == 0 || !isPhysicalRun(run) {
+		return false
+	}
+	backup := &postgresv1alpha1.Backup{}
+	if err := r.Get(ctx, types.NamespacedName{Name: run.Spec.BackupRef.Name, Namespace: run.Namespace}, backup); err != nil {
+		return false
+	}
+	pods := &corev1.PodList{}
+	reader := r.APIReader
+	if reader == nil {
+		reader = r.Client
+	}
+	if err := reader.List(ctx, pods, client.InNamespace(run.Namespace), client.MatchingLabels{labelJobName: job.Name}); err != nil {
+		logf.FromContext(ctx).Error(err, "Failed to list the pods of a backup Job", "job", job.Name)
+		return false
+	}
+	run.Status.Location = physicalBackupLocation(backup, pods.Items)
+	return run.Status.Location != ""
+}
+
+// recordLateLocation records the location of a physical backup whose run
+// already completed without one: the location is read from the Job's pod,
+// whose status can arrive after the Job's. Returns whether to look again.
+func (r *BackupRunReconciler) recordLateLocation(ctx context.Context, run *postgresv1alpha1.BackupRun) (bool, error) {
+	if run.Status.CompletionTime == nil || run.Status.Phase != postgresv1alpha1.BackupRunPhaseSucceeded ||
+		run.Status.Location != "" || run.Status.JobName == "" || !isPhysicalRun(run) {
+		return false, nil
+	}
+	job := &batchv1.Job{}
+	if err := r.Get(ctx, types.NamespacedName{Name: run.Status.JobName, Namespace: run.Namespace}, job); err != nil {
+		return false, client.IgnoreNotFound(err)
+	}
+	if r.recordLocation(ctx, run, job) {
+		return false, r.Status().Update(ctx, run)
+	}
+	return time.Since(run.Status.CompletionTime.Time) < time.Minute, nil
+}
+
+// isPhysicalRun reports whether the run is a pgBackRest backup.
+func isPhysicalRun(run *postgresv1alpha1.BackupRun) bool {
+	return run.Spec.Type == postgresv1alpha1.BackupRunTypeFull || run.Spec.Type == postgresv1alpha1.BackupRunTypeIncremental
+}
+
 func (r *BackupRunReconciler) ttlFor(run *postgresv1alpha1.BackupRun) time.Duration {
 	if run.Spec.TTL != nil {
 		return run.Spec.TTL.Duration
@@ -177,6 +240,17 @@ func (r *BackupRunReconciler) ttlFor(run *postgresv1alpha1.BackupRun) time.Durat
 func (r *BackupRunReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&postgresv1alpha1.BackupRun{}).
+		// A BackupRun recorded by the Backup controller has the name of its
+		// Job.
+		Watches(&batchv1.Job{}, handler.EnqueueRequestsFromMapFunc(backupRunForJob)).
 		Named("backuprun").
 		Complete(r)
+}
+
+// backupRunForJob maps a backup Job to the BackupRun of the same name.
+func backupRunForJob(_ context.Context, obj client.Object) []reconcile.Request {
+	if obj.GetLabels()[LabelAppName] != appNameBackup {
+		return nil
+	}
+	return []reconcile.Request{{NamespacedName: client.ObjectKeyFromObject(obj)}}
 }

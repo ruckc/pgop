@@ -49,6 +49,15 @@ type PhysicalBackupConfig struct {
 	// incrementalSchedule is the cron schedule for incremental backups
 	// +kubebuilder:default="0 2 * * 1-6"
 	IncrementalSchedule string `json:"incrementalSchedule,omitempty"`
+
+	// image is the pgBackRest container image the backup and restore Jobs
+	// run. Defaults to the image built by the pgop project
+	// (ghcr.io/ruckc/pgop-pgbackrest) for the pgBackRest version the operator
+	// ships with. pgBackRest requires the same version on both ends of its
+	// protocol, so an override must match the version in the Cluster's
+	// PostgreSQL image.
+	// +optional
+	Image string `json:"image,omitempty"`
 }
 
 // RetentionSpec configures how long backups are retained
@@ -90,6 +99,13 @@ type S3Destination struct {
 	// If omitted, ambient credentials (IRSA/instance profile) are used.
 	// +optional
 	CredentialsSecretRef *corev1.LocalObjectReference `json:"credentialsSecretRef,omitempty"`
+
+	// caSecretRef selects a Secret key holding the PEM CA bundle that
+	// verifies the endpoint's TLS certificate, for S3-compatible storage
+	// with a private CA. Used by physical (pgBackRest) backups, which always
+	// connect to S3 over HTTPS.
+	// +optional
+	CASecretRef *SecretKeySelector `json:"caSecretRef,omitempty"`
 }
 
 // AzureDestination configures an Azure Blob Storage backup destination

@@ -182,7 +182,8 @@ The resulting Secret `myapp-app-user-credentials` contains:
 
 ### Backup (alpha)
 
-Schedules logical backups to S3-compatible storage.
+Schedules logical (`pg_dump`) and physical (pgBackRest) backups to
+S3-compatible storage.
 
 ```yaml
 apiVersion: pgop.ruck.io/v1alpha1
@@ -211,6 +212,32 @@ spec:
 
 With Cluster TLS on, backup and restore Jobs connect with `sslmode=verify-full`
 and the server CA from the credentials Secret.
+
+Physical backups use pgBackRest: WAL archiving from the Cluster pod, full and
+incremental backups through a pgBackRest TLS server sidecar, and restores
+(to a backup or a point in time) that stop the Cluster, restore its volume and
+start it again. The S3 endpoint must be HTTPS.
+
+```yaml
+apiVersion: pgop.ruck.io/v1alpha1
+kind: Backup
+metadata:
+  name: my-cluster-backup
+spec:
+  type: physical
+  clusterRef:
+    name: my-cluster
+  destination:
+    type: s3
+    s3:
+      bucket: pgop-backups
+      prefix: my-cluster
+      region: us-east-1
+      credentialsSecretRef:
+        name: s3-credentials
+```
+
+See [Backups](docs/user-guide/backups.md) and [Restores](docs/user-guide/restores.md).
 
 ## Getting Started
 

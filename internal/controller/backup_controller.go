@@ -26,7 +26,9 @@ import (
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -45,8 +47,7 @@ import (
 const (
 	backupFinalizer = "pgop.ruck.io/backup-finalizer"
 
-	pgbackrestImage = "woblerr/pgbackrest:2.59.3"
-	awsCLIImage     = "amazon/aws-cli:2.27.46"
+	awsCLIImage = "amazon/aws-cli:2.27.46"
 
 	appNameBackup     = "pgop-backup"
 	capDropALL        = "ALL"
@@ -70,6 +71,8 @@ type BackupReconciler struct {
 // +kubebuilder:rbac:groups=pgop.ruck.io,resources=backups/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=pgop.ruck.io,resources=backups/finalizers,verbs=update
 // +kubebuilder:rbac:groups=pgop.ruck.io,resources=backupruns,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=pgop.ruck.io,resources=backupruns/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=pgop.ruck.io,resources=clusters,verbs=get;list;watch
 // +kubebuilder:rbac:groups=batch,resources=cronjobs,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=configmaps,verbs=get;list;watch;create;update;patch;delete
@@ -104,20 +107,38 @@ func (r *BackupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		}
 	}
 
+	before := backup.Status.DeepCopy()
+	var reconcileErr error
 	switch backup.Spec.Type {
 	case postgresv1alpha1.BackupTypeLogical:
-		if err := r.reconcileLogicalBackup(ctx, backup); err != nil {
-			log.Error(err, "Failed to reconcile logical backup")
-			return ctrl.Result{}, err
+		if reconcileErr = r.reconcileLogicalBackup(ctx, backup); reconcileErr != nil {
+			log.Error(reconcileErr, "Failed to reconcile logical backup")
 		}
 	case postgresv1alpha1.BackupTypePhysical:
-		if err := r.reconcilePhysicalBackup(ctx, backup); err != nil {
-			log.Error(err, "Failed to reconcile physical backup")
-			return ctrl.Result{}, err
+		if reconcileErr = r.reconcilePhysicalBackup(ctx, backup); reconcileErr != nil {
+			log.Error(reconcileErr, "Failed to reconcile physical backup")
 		}
 	}
 
-	return ctrl.Result{}, nil
+	cond := metav1.Condition{
+		Type:               ConditionTypeAvailable,
+		Status:             metav1.ConditionTrue,
+		ObservedGeneration: backup.Generation,
+		Reason:             "Scheduled",
+		Message:            "Backup CronJobs are scheduled",
+	}
+	if reconcileErr != nil {
+		cond.Status = metav1.ConditionFalse
+		cond.Reason = ReasonReconcileError
+		cond.Message = reconcileErr.Error()
+	}
+	meta.SetStatusCondition(&backup.Status.Conditions, cond)
+	if !apiequality.Semantic.DeepEqual(before, &backup.Status) {
+		if err := r.Status().Update(ctx, backup); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+	return ctrl.Result{}, reconcileErr
 }
 
 // reconcileLogicalBackup creates CronJobs for schema and data pg_dump backups.
@@ -315,210 +336,6 @@ echo "Uploaded to $DEST"
 	return r.applyCronJob(ctx, cronjob)
 }
 
-// reconcilePhysicalBackup injects pgBackRest CronJobs for the cluster.
-func (r *BackupReconciler) reconcilePhysicalBackup(ctx context.Context, backup *postgresv1alpha1.Backup) error {
-	if backup.Spec.ClusterRef == nil {
-		return fmt.Errorf("clusterRef is required for physical backups")
-	}
-
-	cluster := &postgresv1alpha1.Cluster{}
-	if err := r.Get(ctx, types.NamespacedName{Name: backup.Spec.ClusterRef.Name, Namespace: backup.Namespace}, cluster); err != nil {
-		return fmt.Errorf("failed to get cluster %s: %w", backup.Spec.ClusterRef.Name, err)
-	}
-
-	cfg := backup.Spec.Physical
-	if cfg == nil {
-		cfg = &postgresv1alpha1.PhysicalBackupConfig{
-			FullSchedule:        "0 2 * * 0",
-			IncrementalSchedule: "0 2 * * 1-6",
-		}
-	}
-
-	layout, err := resolvePostgresLayout(cluster)
-	if err != nil {
-		return err
-	}
-	pgbackrestConf := r.buildPgbackrestConfig(backup, layout.PGDATA)
-
-	if err := r.reconcilePgbackrestConfigMap(ctx, backup, pgbackrestConf); err != nil {
-		return err
-	}
-
-	type runEntry struct {
-		runType  postgresv1alpha1.BackupRunType
-		schedule string
-	}
-
-	for _, bt := range []runEntry{
-		{postgresv1alpha1.BackupRunTypeFull, cfg.FullSchedule},
-		{postgresv1alpha1.BackupRunTypeIncremental, cfg.IncrementalSchedule},
-	} {
-		if err := r.reconcilePhysicalCronJob(ctx, backup, cluster, bt.runType, bt.schedule); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-func (r *BackupReconciler) reconcilePgbackrestConfigMap(ctx context.Context, backup *postgresv1alpha1.Backup, conf string) error {
-	cmName := fmt.Sprintf("%s-pgbackrest", backup.Name)
-	existing := &corev1.ConfigMap{}
-	err := r.Get(ctx, types.NamespacedName{Name: cmName, Namespace: backup.Namespace}, existing)
-	if err == nil {
-		return nil
-	}
-	if !apierrors.IsNotFound(err) {
-		return err
-	}
-
-	cm := &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      cmName,
-			Namespace: backup.Namespace,
-			Labels: map[string]string{
-				LabelAppName:      appNameBackup,
-				LabelAppInstance:  backup.Name,
-				LabelAppManagedBy: LabelValuePgop,
-			},
-		},
-		Data: map[string]string{
-			"pgbackrest.conf": conf,
-		},
-	}
-
-	if err := controllerutil.SetControllerReference(backup, cm, r.Scheme); err != nil {
-		return err
-	}
-
-	return r.Create(ctx, cm)
-}
-
-func (r *BackupReconciler) reconcilePhysicalCronJob(
-	ctx context.Context,
-	backup *postgresv1alpha1.Backup,
-	cluster *postgresv1alpha1.Cluster,
-	runType postgresv1alpha1.BackupRunType,
-	schedule string,
-) error {
-	cronName := fmt.Sprintf("%s-%s", backup.Name, string(runType))
-
-	backupType := "full"
-	if runType == postgresv1alpha1.BackupRunTypeIncremental {
-		backupType = "incr"
-	}
-
-	pgPort := cluster.Spec.Port
-	if pgPort == 0 {
-		pgPort = 5432
-	}
-	pgHost := clusterHost(cluster)
-
-	envVars := r.buildS3EnvVars(backup)
-	ttlSeconds := int32(300)
-	parallelism := int32(1)
-	completions := int32(1)
-	backoffLimit := int32(3)
-	successHistory := int32(3)
-	failureHistory := int32(3)
-
-	backupScript := fmt.Sprintf(
-		"pgbackrest --config=/etc/pgbackrest/pgbackrest.conf --stanza=main --pg1-host=%s --pg1-port=%d backup --type=%s",
-		pgHost, pgPort, backupType,
-	)
-
-	cronjob := &batchv1.CronJob{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      cronName,
-			Namespace: backup.Namespace,
-			Labels: map[string]string{
-				LabelAppName:      appNameBackup,
-				LabelAppInstance:  backup.Name,
-				LabelAppManagedBy: LabelValuePgop,
-				labelBackupType:   string(runType),
-			},
-		},
-		Spec: batchv1.CronJobSpec{
-			Schedule:                   schedule,
-			ConcurrencyPolicy:          batchv1.ForbidConcurrent,
-			SuccessfulJobsHistoryLimit: &successHistory,
-			FailedJobsHistoryLimit:     &failureHistory,
-			JobTemplate: batchv1.JobTemplateSpec{
-				Spec: batchv1.JobSpec{
-					TTLSecondsAfterFinished: &ttlSeconds,
-					Parallelism:             &parallelism,
-					Completions:             &completions,
-					BackoffLimit:            &backoffLimit,
-					Template: corev1.PodTemplateSpec{
-						Spec: corev1.PodSpec{
-							RestartPolicy: corev1.RestartPolicyOnFailure,
-							SecurityContext: &corev1.PodSecurityContext{
-								RunAsNonRoot: func() *bool { b := true; return &b }(),
-								SeccompProfile: &corev1.SeccompProfile{
-									Type: corev1.SeccompProfileTypeRuntimeDefault,
-								},
-								RunAsUser:  func() *int64 { i := int64(2000); return &i }(),
-								RunAsGroup: func() *int64 { i := int64(2000); return &i }(),
-								FSGroup:    func() *int64 { i := int64(2000); return &i }(),
-							},
-							Containers: []corev1.Container{
-								{
-									Name:  "pgbackrest",
-									Image: pgbackrestImage,
-									SecurityContext: &corev1.SecurityContext{
-										AllowPrivilegeEscalation: new(bool),
-										Capabilities: &corev1.Capabilities{
-											Drop: []corev1.Capability{capDropALL},
-										},
-										ReadOnlyRootFilesystem: func() *bool { b := true; return &b }(),
-									},
-									Command: []string{shBin, "-c", backupScript},
-									Env:     envVars,
-									VolumeMounts: []corev1.VolumeMount{
-										{
-											Name:      volPgbackrestConfig,
-											MountPath: "/etc/pgbackrest",
-											ReadOnly:  true,
-										},
-										{
-											Name:      volPgbackrestTmp,
-											MountPath: "/tmp",
-										},
-									},
-								},
-							},
-							Volumes: []corev1.Volume{
-								{
-									Name: volPgbackrestConfig,
-									VolumeSource: corev1.VolumeSource{
-										ConfigMap: &corev1.ConfigMapVolumeSource{
-											LocalObjectReference: corev1.LocalObjectReference{
-												Name: fmt.Sprintf("%s-pgbackrest", backup.Name),
-											},
-										},
-									},
-								},
-								{
-									Name: volPgbackrestTmp,
-									VolumeSource: corev1.VolumeSource{
-										EmptyDir: &corev1.EmptyDirVolumeSource{},
-									},
-								},
-							},
-						},
-					},
-				},
-			},
-		},
-	}
-
-	if err := controllerutil.SetControllerReference(backup, cronjob, r.Scheme); err != nil {
-		return err
-	}
-
-	return r.applyCronJob(ctx, cronjob)
-}
-
 // applyCronJob creates the CronJob, or converges an existing one onto the
 // desired spec. A hash of the desired spec is kept in an annotation, so the
 // CronJob is only rewritten when what the operator generates changes (for
@@ -569,30 +386,6 @@ func cronJobSpecHash(cj *batchv1.CronJob) (string, error) {
 	}
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:16]), nil
-}
-
-func (r *BackupReconciler) buildPgbackrestConfig(backup *postgresv1alpha1.Backup, pgDataPath string) string {
-	dest := backup.Spec.Destination
-	s3 := dest.S3
-	if s3 == nil {
-		return ""
-	}
-
-	prefix := s3.Prefix
-	if prefix == "" {
-		prefix = backup.Name
-	}
-
-	conf := fmt.Sprintf("[global]\nrepo1-type=s3\nrepo1-s3-bucket=%s\nrepo1-s3-region=%s\nrepo1-path=/%s\n",
-		s3.Bucket, s3.Region, prefix)
-
-	if s3.Endpoint != "" {
-		conf += fmt.Sprintf("repo1-s3-endpoint=%s\nrepo1-s3-uri-style=path\n", s3.Endpoint)
-	}
-
-	conf += fmt.Sprintf("\n[main]\npg1-path=%s\n", pgDataPath)
-
-	return conf
 }
 
 func (r *BackupReconciler) buildS3Path(backup *postgresv1alpha1.Backup, suffix string) string {
@@ -669,6 +462,9 @@ func (r *BackupReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&postgresv1alpha1.Backup{}).
 		Owns(&batchv1.CronJob{}).
 		Owns(&corev1.ConfigMap{}).
+		// Physical backup Jobs (owned by the CronJobs) are recorded as
+		// BackupRuns and update the Backup status.
+		Watches(&batchv1.Job{}, handler.EnqueueRequestsFromMapFunc(backupForJob)).
 		// Spec changes (image, port, ...) of a Cluster flow into its backup
 		// CronJobs. TLS state needs no watch: Jobs read it from the
 		// credentials Secret at run time (see job_tls.go).

@@ -206,6 +206,16 @@ const (
 	envPGHost             = "PGHOST"
 	envPGPort             = "PGPORT"
 
-	volPgbackrestConfig = "pgbackrest-config"
-	volPgbackrestTmp    = "pgbackrest-tmp"
+	volPgbackrestTmp = "pgbackrest-tmp"
+
+	// AnnotationRestoreInProgress on a Cluster names the physical Restore
+	// that stopped it (StatefulSet scaled to 0) to restore its data
+	// directory. The Cluster starts again once the annotation is removed:
+	// by the Restore when it succeeds or is deleted.
+	AnnotationRestoreInProgress = "pgop.ruck.io/restore-in-progress"
+	// ReasonPausedForRestore: the Cluster is stopped for a physical Restore.
+	ReasonPausedForRestore = "PausedForRestore"
+
+	// reasonSucceeded: a BackupRun or Restore completed successfully.
+	reasonSucceeded = "Succeeded"
 )

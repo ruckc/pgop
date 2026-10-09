@@ -117,6 +117,7 @@ func (r *ClusterReconciler) now() time.Time {
 // +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch;patch;delete
 // +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=cert-manager.io,resources=certificates,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=pgop.ruck.io,resources=backups,verbs=get;list;watch
 
 func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
@@ -172,9 +173,19 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 	replication := replicationEnabled(cluster, existingSts)
 
+	// Physical backups: while a physical Backup names this Cluster, the pod
+	// archives WAL with pgBackRest and runs the pgBackRest TLS server (see
+	// pgbackrest.go). Clusters without one keep their pod template.
+	// The pgBackRest TLS Secret must exist before a pod that mounts it starts.
+	backup, pgbackrestRecheckAt, err := r.preparePgbackrest(ctx, cluster)
+	if err != nil {
+		log.Error(err, "Failed to prepare physical backups")
+		return r.updateStatus(ctx, cluster, false, err)
+	}
+
 	// Reconcile the read-write Service (primary only) before the StatefulSet,
 	// so it never selects a standby, then the read-only Service.
-	if err := r.reconcileServices(ctx, cluster); err != nil {
+	if err := r.reconcileServices(ctx, cluster, backup != nil); err != nil {
 		log.Error(err, "Failed to reconcile Services")
 		return r.updateStatus(ctx, cluster, false, err)
 	}
@@ -207,14 +218,14 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	} // else reconcileStatefulSet reports the layout error
 
 	// Reconcile StatefulSet
-	if err := r.reconcileStatefulSet(ctx, cluster, secret, replication); err != nil {
+	if err := r.reconcileStatefulSet(ctx, cluster, secret, replication, backup); err != nil {
 		log.Error(err, "Failed to reconcile StatefulSet")
 		return r.updateStatus(ctx, cluster, false, err)
 	}
 
 	// Remove a no longer needed pg_hba ConfigMap and TLS resources only after
 	// the StatefulSet stopped referencing them.
-	if err := r.cleanupUnusedResources(ctx, cluster, replication); err != nil {
+	if err := r.cleanupUnusedResources(ctx, cluster, replication, backup != nil); err != nil {
 		log.Error(err, "Failed to clean up resources")
 		return r.updateStatus(ctx, cluster, false, err)
 	}
@@ -270,12 +281,50 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			result.RequeueAfter = shorterRequeue(result.RequeueAfter, recheck)
 		}
 	}
-	if !tlsRecheckAt.IsZero() {
+	if recheckAt := earliest(tlsRecheckAt, pgbackrestRecheckAt); !recheckAt.IsZero() {
 		// Self-managed certificates: come back when they are due for renewal.
 		result.RequeueAfter = shorterRequeue(result.RequeueAfter,
-			min(max(tlsRecheckAt.Sub(r.now()), time.Second), maxTLSRecheckInterval))
+			min(max(recheckAt.Sub(r.now()), time.Second), maxTLSRecheckInterval))
 	}
 	return result, nil
+}
+
+// earliest returns the earlier of two times, where the zero time means none.
+func earliest(a, b time.Time) time.Time {
+	if a.IsZero() || (!b.IsZero() && b.Before(a)) {
+		return b
+	}
+	return a
+}
+
+// preparePgbackrest returns the Cluster's physical Backup (nil without one)
+// and, with one, creates or renews the pgBackRest TLS Secret, returning when
+// it must be looked at again.
+func (r *ClusterReconciler) preparePgbackrest(ctx context.Context, cluster *postgresv1alpha1.Cluster) (*postgresv1alpha1.Backup, time.Time, error) {
+	backup, err := r.physicalBackup(ctx, cluster)
+	if err != nil || backup == nil {
+		return nil, time.Time{}, err
+	}
+	recheckAt, err := r.reconcilePgbackrestTLS(ctx, cluster)
+	if err != nil {
+		return nil, time.Time{}, fmt.Errorf("failed to reconcile the pgBackRest TLS Secret: %w", err)
+	}
+	return backup, recheckAt, nil
+}
+
+// physicalBackup returns the physical Backup of the Cluster (see
+// physicalBackupFor), or nil. A Backup whose settings pgBackRest cannot use is
+// ignored here (the Backup reports why), so the pod is not changed for it.
+func (r *ClusterReconciler) physicalBackup(ctx context.Context, cluster *postgresv1alpha1.Cluster) (*postgresv1alpha1.Backup, error) {
+	backup, err := physicalBackupFor(ctx, r.Client, cluster)
+	if err != nil || backup == nil {
+		return nil, err
+	}
+	if err := validatePhysicalBackup(backup); err != nil {
+		logf.FromContext(ctx).Info("Ignoring an invalid physical Backup", "backup", backup.Name, "reason", err.Error())
+		return nil, nil
+	}
+	return backup, nil
 }
 
 // getStatefulSet returns the Cluster's StatefulSet, or nil when it does not
@@ -314,8 +363,13 @@ func (r *ClusterReconciler) prepareTLS(ctx context.Context, cluster *postgresv1a
 
 // reconcileServices converges the read-write Service (primary only) and the
 // read-only Service (standbys).
-func (r *ClusterReconciler) reconcileServices(ctx context.Context, cluster *postgresv1alpha1.Cluster) error {
-	if err := r.reconcileService(ctx, cluster); err != nil {
+func (r *ClusterReconciler) reconcileServices(ctx context.Context, cluster *postgresv1alpha1.Cluster, pgbackrest bool) error {
+	ports := servicePorts(cluster)
+	if pgbackrest {
+		// The backup Jobs reach the primary's pgBackRest TLS server.
+		ports = append(ports, pgbackrestServicePort())
+	}
+	if err := r.reconcileService(ctx, cluster, ports); err != nil {
 		return fmt.Errorf("service %q: %w", cluster.Name, err)
 	}
 	if err := r.reconcileReadOnlyService(ctx, cluster); err != nil {
@@ -327,7 +381,7 @@ func (r *ClusterReconciler) reconcileServices(ctx context.Context, cluster *post
 // cleanupUnusedResources removes the pg_hba ConfigMap, the configuration
 // ConfigMap and the TLS resources once they are no longer needed. It runs
 // after the StatefulSet stopped referencing them.
-func (r *ClusterReconciler) cleanupUnusedResources(ctx context.Context, cluster *postgresv1alpha1.Cluster, replication bool) error {
+func (r *ClusterReconciler) cleanupUnusedResources(ctx context.Context, cluster *postgresv1alpha1.Cluster, replication, pgbackrest bool) error {
 	if err := r.cleanupHBAConfigMap(ctx, cluster, replication); err != nil {
 		return fmt.Errorf("failed to clean up the pg_hba ConfigMap: %w", err)
 	}
@@ -336,6 +390,11 @@ func (r *ClusterReconciler) cleanupUnusedResources(ctx context.Context, cluster 
 	}
 	if err := r.cleanupTLSResources(ctx, cluster); err != nil {
 		return fmt.Errorf("failed to clean up TLS resources: %w", err)
+	}
+	if !pgbackrest {
+		if err := r.cleanupPgbackrestTLS(ctx, cluster); err != nil {
+			return fmt.Errorf("failed to clean up the pgBackRest TLS Secret: %w", err)
+		}
 	}
 	return nil
 }
@@ -763,14 +822,14 @@ func (r *ClusterReconciler) convergeSecretConnectionInfo(ctx context.Context, cl
 
 // reconcileService creates or converges the read-write Service "<cluster>",
 // which routes to the primary pod only (see primaryServiceSelector).
-func (r *ClusterReconciler) reconcileService(ctx context.Context, cluster *postgresv1alpha1.Cluster) error {
+func (r *ClusterReconciler) reconcileService(ctx context.Context, cluster *postgresv1alpha1.Cluster, ports []corev1.ServicePort) error {
 	serviceName := cluster.Name
 	service := &corev1.Service{}
 	err := r.Get(ctx, types.NamespacedName{Name: serviceName, Namespace: cluster.Namespace}, service)
 	if err == nil {
 		// Services created before replication existed selected every pod;
 		// the selector is narrowed to the primary in place.
-		return r.convergeServiceSpec(ctx, service, primaryServiceSelector(cluster), servicePorts(cluster))
+		return r.convergeServiceSpec(ctx, service, primaryServiceSelector(cluster), ports)
 	}
 	if !apierrors.IsNotFound(err) {
 		return err
@@ -788,7 +847,7 @@ func (r *ClusterReconciler) reconcileService(ctx context.Context, cluster *postg
 		},
 		Spec: corev1.ServiceSpec{
 			Selector: primaryServiceSelector(cluster),
-			Ports:    servicePorts(cluster),
+			Ports:    ports,
 			Type:     corev1.ServiceTypeClusterIP,
 		},
 	}
@@ -800,7 +859,8 @@ func (r *ClusterReconciler) reconcileService(ctx context.Context, cluster *postg
 	return r.Create(ctx, service)
 }
 
-func (r *ClusterReconciler) reconcileStatefulSet(ctx context.Context, cluster *postgresv1alpha1.Cluster, secret *corev1.Secret, replication bool) error {
+func (r *ClusterReconciler) reconcileStatefulSet(ctx context.Context, cluster *postgresv1alpha1.Cluster, secret *corev1.Secret,
+	replication bool, backup *postgresv1alpha1.Backup) error {
 	stsName := cluster.Name
 
 	// Set defaults
@@ -836,6 +896,17 @@ func (r *ClusterReconciler) reconcileStatefulSet(ctx context.Context, cluster *p
 	container.VolumeMounts = append(container.VolumeMounts, configMounts...)
 	container.Args = postgresServerArgs(cluster)
 
+	// Physical backups: the Postgres+pgBackRest image, WAL archiving and the
+	// pgbackrest sidecar (applied first, so the replication bootstrap init
+	// container uses the same image). Not added to Clusters without a
+	// physical Backup.
+	var sidecars []corev1.Container
+	if backup != nil {
+		var sidecar corev1.Container
+		sidecar, volumes = applyPgbackrestTemplate(cluster, backup, layout, &container, volumes)
+		sidecars = append(sidecars, sidecar)
+	}
+
 	// Streaming replication: bootstrap init container, recovery-aware
 	// postStart hook, primary_conninfo and the managed pg_hba. Not added to
 	// Clusters that never had more than one instance.
@@ -843,17 +914,25 @@ func (r *ClusterReconciler) reconcileStatefulSet(ctx context.Context, cluster *p
 	if replication {
 		initContainers, volumes = applyReplicationTemplate(cluster, secret.Name, layout, &container, volumes)
 	}
+	containers := append([]corev1.Container{container}, sidecars...)
 
 	sts := &appsv1.StatefulSet{}
 	err = r.Get(ctx, types.NamespacedName{Name: stsName, Namespace: cluster.Namespace}, sts)
 	if err == nil {
-		return r.convergeStatefulSet(ctx, sts, statefulSetReplicas(cluster, sts), labels, container, initContainers,
+		replicas := statefulSetReplicas(cluster, sts)
+		if pausedForRestore(cluster) {
+			replicas = 0
+		}
+		return r.convergeStatefulSet(ctx, sts, replicas, labels, containers, initContainers,
 			volumes, desiredPVCRetentionPolicy(cluster))
 	}
 	if !apierrors.IsNotFound(err) {
 		return err
 	}
 	replicas := desiredReplicas(cluster)
+	if pausedForRestore(cluster) {
+		replicas = 0
+	}
 
 	if err := r.detectExistingVolume(ctx, cluster); err != nil {
 		return err
@@ -887,7 +966,7 @@ func (r *ClusterReconciler) reconcileStatefulSet(ctx context.Context, cluster *p
 				Spec: corev1.PodSpec{
 					SecurityContext: postgresPodSecurityContext(),
 					InitContainers:  initContainers,
-					Containers:      []corev1.Container{container},
+					Containers:      containers,
 					Volumes:         volumes,
 				},
 			},
@@ -1101,27 +1180,12 @@ func buildPostgresContainer(secret *corev1.Secret, image string, port int32, res
 // an already-converged cluster is a no-op and does not trigger spurious
 // pod rollouts.
 func (r *ClusterReconciler) convergeStatefulSet(ctx context.Context, sts *appsv1.StatefulSet, replicas int32, labels map[string]string,
-	desired corev1.Container, initContainers []corev1.Container, volumes []corev1.Volume,
+	containers []corev1.Container, initContainers []corev1.Container, volumes []corev1.Volume,
 	retention *appsv1.StatefulSetPersistentVolumeClaimRetentionPolicy) error {
-	changed := false
-
 	// Init containers are operator-owned (only the replication bootstrap).
 	// They are compared like the main container, so server-side defaults do
 	// not cause a perpetual diff.
-	if cur := sts.Spec.Template.Spec.InitContainers; len(cur) != len(initContainers) ||
-		slices.ContainsFunc(cur, func(c corev1.Container) bool {
-			return !slices.ContainsFunc(initContainers, func(d corev1.Container) bool { return d.Name == c.Name })
-		}) {
-		sts.Spec.Template.Spec.InitContainers = initContainers
-		changed = true
-	} else {
-		for i := range cur {
-			idx := slices.IndexFunc(initContainers, func(d corev1.Container) bool { return d.Name == cur[i].Name })
-			if convergeContainer(&cur[i], initContainers[idx]) {
-				changed = true
-			}
-		}
-	}
+	changed := convergeContainerList(&sts.Spec.Template.Spec.InitContainers, initContainers)
 
 	// Pod volumes are entirely operator-owned (the data volume comes from
 	// volumeClaimTemplates), so they are replaced wholesale. Semantic.DeepEqual
@@ -1154,10 +1218,9 @@ func (r *ClusterReconciler) convergeStatefulSet(ctx context.Context, sts *appsv1
 		changed = true
 	}
 
-	if len(sts.Spec.Template.Spec.Containers) == 0 {
-		sts.Spec.Template.Spec.Containers = []corev1.Container{desired}
-		changed = true
-	} else if convergeContainer(&sts.Spec.Template.Spec.Containers[0], desired) {
+	// The postgresql container (first) and the pgbackrest sidecar while
+	// physical backups are enabled.
+	if convergeContainerList(&sts.Spec.Template.Spec.Containers, containers) {
 		changed = true
 	}
 
@@ -1166,6 +1229,32 @@ func (r *ClusterReconciler) convergeStatefulSet(ctx context.Context, sts *appsv1
 	}
 
 	return r.Update(ctx, sts)
+}
+
+// convergeContainerList converges the containers in cur onto desired. When
+// the container names differ (in order) the list is replaced, which changes
+// the pod template anyway; otherwise each container is converged in place, so
+// server-side defaults do not cause a perpetual diff. Returns whether
+// anything changed.
+func convergeContainerList(cur *[]corev1.Container, desired []corev1.Container) bool {
+	names := func(cs []corev1.Container) []string {
+		out := make([]string, len(cs))
+		for i, c := range cs {
+			out[i] = c.Name
+		}
+		return out
+	}
+	if !slices.Equal(names(*cur), names(desired)) {
+		*cur = desired
+		return true
+	}
+	changed := false
+	for i := range *cur {
+		if convergeContainer(&(*cur)[i], desired[i]) {
+			changed = true
+		}
+	}
+	return changed
 }
 
 // convergeContainer overwrites the fields of existing that pgop derives from
@@ -1314,6 +1403,11 @@ func (r *ClusterReconciler) updateStatus(ctx context.Context, cluster *postgresv
 		condition.Status = metav1.ConditionFalse
 		condition.Reason = ReasonReconcileError
 		condition.Message = reconcileErr.Error()
+	} else if pausedForRestore(cluster) {
+		condition.Status = metav1.ConditionFalse
+		condition.Reason = ReasonPausedForRestore
+		condition.Message = fmt.Sprintf("Stopped while Restore %q restores the data directory",
+			cluster.Annotations[AnnotationRestoreInProgress])
 	} else {
 		condition.Status = metav1.ConditionFalse
 		condition.Reason = "ClusterNotReady"
@@ -1354,7 +1448,9 @@ func (r *ClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		// Pods belong to the StatefulSet, not the Cluster: map them by label
 		// so new pods get their role label and readiness changes re-check
 		// replication.
-		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(clustersForPod))
+		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(clustersForPod)).
+		// A physical Backup changes the pod template of the Cluster it names.
+		Watches(&postgresv1alpha1.Backup{}, handler.EnqueueRequestsFromMapFunc(clustersForBackup))
 	// Watch cert-manager Certificates only when cert-manager is installed: a
 	// watch on a missing API would keep the controller from starting. Without
 	// it, issuerRef Clusters still converge through the Secret watch and
