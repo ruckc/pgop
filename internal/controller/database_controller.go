@@ -18,7 +18,9 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -157,6 +159,15 @@ func (r *DatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	// Record the PostgreSQL name that now exists so deletion drops exactly it.
 	database.Status.DatabaseName = pgName
 
+	// Settings and database grants. A problem with them (a grantee that does
+	// not exist yet, a setting that is not allowed) does not hold up the
+	// extensions, schemas and credentials below: it is reported once those
+	// are done, and the Database stays not ready until it is fixed.
+	accessErr := r.reconcileSettingsAndGrants(ctx, adminClient, database, pgName)
+	if accessErr != nil {
+		log.Error(accessErr, "Failed to reconcile database settings or grants")
+	}
+
 	// Get a connection to the new database to install extensions and create schemas
 	dbClient, err := newOperatorClient(ctx, r.Client, cluster, pgName)
 	if err != nil {
@@ -198,8 +209,49 @@ func (r *DatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return r.updateStatus(ctx, database, false, installedExtensions, createdSchemas, err)
 	}
 
+	if accessErr != nil {
+		return r.updateStatus(ctx, database, false, installedExtensions, createdSchemas, accessErr)
+	}
+
 	log.Info("Database reconciled successfully")
 	return r.updateStatus(ctx, database, true, installedExtensions, createdSchemas, nil)
+}
+
+// reconcileSettingsAndGrants applies the per-database settings (ALTER
+// DATABASE ... SET/RESET; they only affect new sessions, so they are applied
+// before the database connection used for extensions is opened) and the
+// database-level grants. Both are attempted even when the other fails.
+func (r *DatabaseReconciler) reconcileSettingsAndGrants(ctx context.Context, pg databaseGrantClient,
+	database *postgresv1alpha1.Database, pgName string) error {
+	deleting, err := r.deletingRoleNames(ctx, database)
+	if err != nil {
+		return err
+	}
+	return errors.Join(
+		reconcileDatabaseSettings(ctx, pg, database, pgName),
+		reconcileDatabaseGrants(ctx, pg, database, pgName, deleting),
+	)
+}
+
+// deletingRoleNames returns the PostgreSQL names of the Roles on the
+// Database's cluster that are being deleted, so their grants are not
+// re-applied while the Role controller revokes them and drops the role.
+func (r *DatabaseReconciler) deletingRoleNames(ctx context.Context, database *postgresv1alpha1.Database) (map[string]bool, error) {
+	if len(database.Spec.Grants) == 0 {
+		return nil, nil
+	}
+	roles := &postgresv1alpha1.RoleList{}
+	if err := r.List(ctx, roles, client.InNamespace(database.Namespace)); err != nil {
+		return nil, fmt.Errorf("failed to list Roles: %w", err)
+	}
+	deleting := map[string]bool{}
+	for i := range roles.Items {
+		role := &roles.Items[i]
+		if role.DeletionTimestamp != nil && role.Spec.ClusterRef.Name == database.Spec.ClusterRef.Name {
+			deleting[role.PostgresName()] = true
+		}
+	}
+	return deleting, nil
 }
 
 // resolveOwnerRole returns the Role named by spec.owner, or nil when no owner
@@ -315,6 +367,9 @@ func (r *DatabaseReconciler) updateStatus(ctx context.Context, database *postgre
 	} else if reconcileErr != nil {
 		condition.Status = metav1.ConditionFalse
 		condition.Reason = ReasonReconcileError
+		if ce, ok := errors.AsType[*conditionError](reconcileErr); ok {
+			condition.Reason = ce.reason
+		}
 		condition.Message = reconcileErr.Error()
 	} else {
 		condition.Status = metav1.ConditionFalse
@@ -336,16 +391,26 @@ func (r *DatabaseReconciler) updateStatus(ctx context.Context, database *postgre
 }
 
 // databasesForOwnerRole maps a Role to the Databases in its namespace whose
-// spec.owner names it, so they reconcile when the owner becomes Ready.
+// spec.owner names it, or whose spec.grants name its PostgreSQL role, so they
+// reconcile when the owner becomes Ready or a grantee is created.
 func (r *DatabaseReconciler) databasesForOwnerRole(ctx context.Context, obj client.Object) []reconcile.Request {
 	databases := &postgresv1alpha1.DatabaseList{}
 	if err := r.List(ctx, databases, client.InNamespace(obj.GetNamespace())); err != nil {
 		logf.FromContext(ctx).Error(err, "Failed to list Databases for owner Role", "role", obj.GetName())
 		return nil
 	}
+	pgName := ""
+	if role, ok := obj.(*postgresv1alpha1.Role); ok {
+		pgName = role.PostgresName()
+	}
+	grantsTo := func(db *postgresv1alpha1.Database) bool {
+		return pgName != "" && slices.ContainsFunc(db.Spec.Grants, func(g postgresv1alpha1.DatabaseGrantSpec) bool {
+			return g.Role == pgName
+		})
+	}
 	var requests []reconcile.Request
 	for i := range databases.Items {
-		if databases.Items[i].Spec.Owner == obj.GetName() {
+		if databases.Items[i].Spec.Owner == obj.GetName() || grantsTo(&databases.Items[i]) {
 			requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&databases.Items[i])})
 		}
 	}

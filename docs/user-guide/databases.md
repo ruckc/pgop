@@ -8,10 +8,11 @@ The Database controller:
 
 1. Connects to the referenced PostgreSQL cluster
 2. Creates the database with the specified owner
-3. Installs requested extensions
-4. Creates schemas with ownership
-5. Applies schema grants
-6. Drops the database on deletion
+3. Applies per-database settings (`ALTER DATABASE ... SET`) and resets removed ones
+4. Applies database-level grants (`GRANT ... ON DATABASE`) and revokes removed ones
+5. Installs requested extensions
+6. Creates schemas with ownership and applies schema grants
+7. Drops the database on deletion
 
 ## Example
 
@@ -25,6 +26,12 @@ spec:
   clusterRef:
     name: my-cluster
   owner: app-user
+  grants:
+    - role: readonly_role      # PostgreSQL role name
+      privileges: [CONNECT]
+  settings:
+    search_path: '"$user", app, public'
+    statement_timeout: 30s
   extensions:
     - name: uuid-ossp
     - name: pg_trgm
@@ -39,7 +46,6 @@ spec:
         - role: readonly_role
           privileges:
             - USAGE
-            - SELECT
 ```
 
 ## Spec Reference
@@ -51,6 +57,8 @@ spec:
 | `owner` | string | - | Name of the **Role resource** that owns the database (operator superuser if unset) |
 | `extensions` | []ExtensionSpec | - | Extensions to install |
 | `schemas` | []SchemaSpec | - | Schemas to create |
+| `grants` | []DatabaseGrantSpec | - | Database-level privileges (see [Database Grants](#database-grants)) |
+| `settings` | map[string]string | - | Per-database parameter defaults (see [Database Settings](#database-settings)) |
 
 ### ExtensionSpec
 
@@ -72,7 +80,16 @@ spec:
 | Field | Type | Description |
 |-------|------|-------------|
 | `role` | string | PostgreSQL role name to grant privileges to |
-| `privileges` | []string | Privileges (USAGE, CREATE, SELECT, etc.) |
+| `privileges` | []string | Schema privileges: `USAGE`, `CREATE` or `ALL` |
+| `withGrantOption` | bool | Allow the grantee to grant the privileges to others |
+
+### DatabaseGrantSpec
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `role` | string | PostgreSQL role name to grant privileges to (unique within `grants`) |
+| `privileges` | []string | Database privileges: `CONNECT`, `CREATE`, `TEMPORARY` (or `TEMP`), or `ALL` |
+| `withGrantOption` | bool | Allow the grantee to grant the privileges to others |
 
 ## Status
 
@@ -82,6 +99,8 @@ spec:
 | `databaseName` | The effective PostgreSQL database name that was reconciled |
 | `installedExtensions` | List of installed extensions |
 | `createdSchemas` | List of created schemas |
+| `managedGrants` | Database privileges pgop granted (revoked when removed from `grants`) |
+| `managedSettings` | Parameter names pgop set (reset when removed from `settings`) |
 | `conditions` | Detailed status conditions |
 
 ## Connection Secret
@@ -151,14 +170,138 @@ spec:
 ## Grants and DDL
 
 - `schemas[].grants` grant **schema-level** privileges (`USAGE`, `CREATE`,
-  `SELECT`, …) via `GRANT ... ON SCHEMA`.
+  `ALL`/`ALL PRIVILEGES`, in any letter case) via `GRANT ... ON SCHEMA`. Table
+  privileges such as `SELECT` are not schema privileges and are rejected.
+- `grants` grant **database-level** privileges (`CONNECT`, `CREATE`,
+  `TEMPORARY`) via `GRANT ... ON DATABASE`; see
+  [Database Grants](#database-grants).
 - The Database is created with `OWNER <owner>` and each schema with
   `AUTHORIZATION <owner>`, so the **owner Role has full DDL** (create tables,
   run migrations) on the database and its owned schemas — make your app's login
   role the `owner` if it needs to create tables at runtime.
-- Database-level grants (`GRANT CONNECT`/`CREATE ON DATABASE <db> TO <role>`)
-  are **not** currently expressible in the spec. For a non-owner login role that
-  needs to connect, grant it access at the schema level, or make it the owner.
+- Arbitrary SQL (event triggers, setup that depends on an extension) is not
+  supported yet; an `initSQL` escape hatch is tracked in issue #24.
+
+!!! note "Upgrade note: schema privileges are validated"
+    Earlier versions passed `schemas[].grants[].privileges` into the `GRANT`
+    statement unchecked (a SQL injection path). They are now limited to
+    `USAGE`, `CREATE`, `ALL` and `ALL PRIVILEGES` (case-insensitive, at most 8
+    entries of at most 32 characters), both by the API server and by the
+    operator. Anything else, such as `SELECT` (which PostgreSQL rejects on a
+    schema anyway), makes the Database invalid: fix the spec before upgrading.
+    On Kubernetes older than 1.30 (no CRD validation ratcheting) an existing
+    object with such a value cannot be updated at all, not even to remove its
+    finalizer, until the value is corrected.
+
+## Database Grants
+
+`spec.grants` grants database-level privileges to PostgreSQL roles:
+
+```yaml
+spec:
+  grants:
+    - role: app_reader          # raw PostgreSQL role name
+      privileges: [CONNECT]
+    - role: app_migrator
+      privileges: [CONNECT, CREATE, TEMP]
+      withGrantOption: false
+```
+
+- `privileges` may only contain `CONNECT`, `CREATE`, `TEMPORARY`, `TEMP` (an
+  alias of `TEMPORARY`) or `ALL` (all three), in upper case. Anything else is
+  rejected by the API server, and again by the operator before any SQL is
+  built.
+- Each `role` may appear once. The role must exist; until it does, the Database
+  reports `Available=False` with a message naming the missing role and retries
+  (it also reconciles as soon as a Role resource with that PostgreSQL name
+  changes). A missing grantee or a refused setting does not hold up the rest
+  of the Database: extensions, schemas and the credentials Secret are still
+  reconciled, and the Database stays not ready until the problem is fixed.
+- Grants are re-applied on every reconcile, so privileges revoked by hand are
+  restored.
+- pgop records what it granted in `status.managedGrants`. When a role is removed
+  from `grants`, or a privilege from its list, pgop **revokes exactly what it
+  had granted**. Turning `withGrantOption` off revokes the grant option it
+  granted. Privileges granted outside pgop are never revoked.
+- When pgop granted a privilege `WITH GRANT OPTION`, its revoke uses
+  `CASCADE`: privileges the grantee passed on to other roles are revoked too
+  (otherwise PostgreSQL refuses with "dependent privileges exist").
+- PostgreSQL grants `CONNECT` and `TEMPORARY` on every new database to `PUBLIC`
+  by default, so revoking `CONNECT` from a role does not stop it connecting
+  unless `PUBLIC`'s privilege is revoked as well (not managed by pgop).
+- Deleting the grantee's Role works while a Database still grants to it: the
+  Database stops granting to a Role that is being deleted (reported as
+  "paused" in its condition), and the Role controller revokes the role's
+  database and schema privileges before dropping it (see
+  [Roles: deletion](roles.md#deletion)). Remove the entry from `grants`
+  afterwards, or the Database reports the missing role.
+
+## Database Settings
+
+`spec.settings` sets per-database defaults for configuration parameters, like
+`ALTER DATABASE <db> SET <name> TO <value>`. They apply to sessions that start
+after the change.
+
+```yaml
+spec:
+  settings:
+    # The YAML single quotes only quote the string; the value is
+    # "$user", app, public (with the double quotes).
+    search_path: '"$user", app, public'
+    statement_timeout: 30s
+    work_mem: 64MB
+    myapp.tenant: acme            # custom parameters are allowed
+```
+
+- Keys must be parameter names: identifiers (`[A-Za-z_][A-Za-z0-9_]*`),
+  optionally separated by dots, at most 127 characters. Names are
+  case-insensitive; pgop uses them lowercased.
+- Values are always sent as SQL string literals (quotes and backslashes are
+  escaped), at most 4096 characters. PostgreSQL validates them: an unknown
+  parameter or an invalid value is reported in the `Available` condition.
+- For the list parameters `search_path` and `temp_tablespaces`, write the value
+  as in `postgresql.conf`: a comma-separated list where unquoted names are
+  lowercased and double-quoted names keep their case. In YAML, quote the whole
+  value when it starts with a double quote, as above. An empty list (`""`)
+  is rejected, because `SET search_path TO ''` would store a schema literally
+  named `""`; remove the key instead to fall back to the server default.
+- Settings are re-applied on every reconcile. pgop records the names it set in
+  `status.managedSettings` and runs `ALTER DATABASE ... RESET <name>` for any
+  of them removed from `settings`. Settings made outside pgop are never reset.
+
+### Which parameters may be set
+
+The operator runs `ALTER DATABASE ... SET` as the cluster superuser, so it
+restricts what a Database author can set:
+
+- Only parameters with context `user` in `pg_settings` (those any role may set
+  in its own session) and custom parameters the server does not know yet (such
+  as `myapp.tenant`) are applied. Superuser-only parameters (for example
+  `log_statement`, `session_preload_libraries`), and parameters that cannot be
+  set per database anyway (`postmaster`, `sighup`, `internal`, `backend`), are
+  refused.
+- These parameters are always refused, whatever their context: `role`,
+  `session_authorization` (they would switch the identity of every session,
+  the operator's included), `session_preload_libraries`,
+  `local_preload_libraries`, `shared_preload_libraries`,
+  `dynamic_library_path`, `jit_provider` (code loading),
+  `session_replication_role` (disables triggers and foreign keys), and the
+  `pgaudit.*`, `set_user.*`, `anon.*` and `sepgsql.*` namespaces (security
+  extensions, which may not be loaded yet when the setting is checked). The
+  API server rejects these names directly.
+- A refused setting is skipped, the others are applied, and the Database
+  reports `Available=False` with reason `SettingNotAllowed` naming the
+  parameter. A setting pgop applied earlier that is no longer allowed is
+  reset.
+
+!!! warning "Remaining risk"
+    User-context parameters still affect every session in the database,
+    including the operator's own connection used for extensions and schemas
+    (for example `default_transaction_read_only=on` makes `CREATE EXTENSION`
+    fail). Custom placeholder parameters are accepted without a context check;
+    if an extension that defines them is loaded later, their value applies
+    with that extension's rules. Restrict who may create or edit Database
+    resources accordingly.
 
 ## Ordering & Dependencies
 
@@ -208,19 +351,21 @@ extensions:
 
 ## Schema with Grants
 
-Create a schema with read-only access for reporting:
+Create a schema that a reporting role may use:
 
 ```yaml
 schemas:
   - name: app
     owner: app-user
-  - name: app
     grants:
       - role: readonly_user
         privileges:
           - USAGE
-          - SELECT
 ```
+
+`USAGE` lets the role look up objects in the schema. Table privileges such as
+`SELECT` are not schema privileges and are not managed by pgop; grant them in
+your migrations (for example with `ALTER DEFAULT PRIVILEGES`).
 
 ## Multi-Schema Application
 
@@ -244,8 +389,8 @@ spec:
       owner: analytics-user
       grants:
         - role: product-service
-          privileges: [USAGE, SELECT]
+          privileges: [USAGE]
         - role: order-service
-          privileges: [USAGE, SELECT]
+          privileges: [USAGE]
 ```
 

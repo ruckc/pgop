@@ -149,6 +149,67 @@ spec:
                 x-kubernetes-list-map-keys:
                 - role
                 x-kubernetes-list-type: map
+              parameterGrants:
+                description: |-
+                  parameterGrants grants privileges on configuration parameters to this
+                  role (GRANT SET ON PARAMETER), so it can change superuser-only
+                  parameters in its sessions. Requires PostgreSQL 15 or later. Grants
+                  that pgop made (tracked in status.managedParameterGrants) are revoked
+                  once they are removed from the spec. Parameters that switch identity,
+                  load code or bypass safeguards (role, session_authorization,
+                  *_preload_libraries, dynamic_library_path, jit_provider,
+                  session_replication_role, pgaudit.*, set_user.*, anon.*, sepgsql.*)
+                  cannot be granted.
+                items:
+                  description: ParameterGrantSpec grants privileges on a configuration
+                    parameter.
+                  properties:
+                    parameter:
+                      description: |-
+                        parameter is the configuration parameter name, for example
+                        log_statement or a custom parameter such as myapp.tenant_id.
+                      maxLength: 127
+                      minLength: 1
+                      pattern: ^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$
+                      type: string
+                      x-kubernetes-validations:
+                      - message: privileges on role, session_authorization, *_preload_libraries,
+                          dynamic_library_path, jit_provider, session_replication_role
+                          and pgaudit.*, set_user.*, anon.*, sepgsql.* parameters
+                          cannot be granted
+                        rule: '!(self.lowerAscii() in [''role'', ''session_authorization'',
+                          ''session_preload_libraries'', ''local_preload_libraries'',
+                          ''shared_preload_libraries'', ''dynamic_library_path'',
+                          ''jit_provider'', ''session_replication_role''] || self.lowerAscii().startsWith(''pgaudit.'')
+                          || self.lowerAscii().startsWith(''set_user.'') || self.lowerAscii().startsWith(''anon.'')
+                          || self.lowerAscii().startsWith(''sepgsql.''))'
+                    privileges:
+                      default:
+                      - SET
+                      description: |-
+                        privileges lists the privileges to grant. Only SET is supported (the
+                        default): ALTER SYSTEM would let the role rewrite the server
+                        configuration and is deliberately not offered.
+                      items:
+                        enum:
+                        - SET
+                        type: string
+                      maxItems: 1
+                      minItems: 1
+                      type: array
+                    withGrantOption:
+                      description: |-
+                        withGrantOption allows the role to grant the same privileges to others.
+                        Turning it off for a grant pgop made revokes the grant option.
+                      type: boolean
+                  required:
+                  - parameter
+                  type: object
+                maxItems: 256
+                type: array
+                x-kubernetes-list-map-keys:
+                - parameter
+                x-kubernetes-list-type: map
               passwordRotation:
                 description: |-
                   passwordRotation enables scheduled rotation of the operator-generated
@@ -318,6 +379,39 @@ spec:
                   type: string
                 type: array
                 x-kubernetes-list-type: set
+              managedParameterGrants:
+                description: |-
+                  managedParameterGrants lists the parameter privileges pgop has granted
+                  to this role. Only these are revoked when they are removed from
+                  spec.parameterGrants.
+                items:
+                  description: |-
+                    ManagedParameterGrant records privileges on a configuration parameter that
+                    pgop granted to the role.
+                  properties:
+                    parameter:
+                      description: parameter is the parameter name, normalized to
+                        lowercase.
+                      type: string
+                    privileges:
+                      description: privileges are the granted privileges.
+                      items:
+                        type: string
+                      type: array
+                      x-kubernetes-list-type: set
+                    withGrantOption:
+                      description: |-
+                        withGrantOption records whether pgop granted the privileges with the
+                        grant option.
+                      type: boolean
+                  required:
+                  - parameter
+                  - privileges
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - parameter
+                x-kubernetes-list-type: map
               passwordHash:
                 description: |-
                   passwordHash is deprecated and no longer written: the operator clears it

@@ -89,20 +89,8 @@ func (r *RoleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 				return ctrl.Result{}, err
 			}
 			if err == nil {
-				pgClient, err := newOperatorClient(ctx, r.Client, cluster, defaultDatabaseName)
-				if err != nil {
-					log.Error(err, "Failed to create PostgreSQL client during deletion")
-					return ctrl.Result{}, err
-				}
-				defer func() { _ = pgClient.Close() }()
-				// Prefer the name recorded in status so we drop what was actually created.
-				pgName := role.Status.RoleName
-				if pgName == "" {
-					pgName = role.PostgresName()
-				}
-				if err := pgClient.DropRole(ctx, pgName); err != nil {
-					log.Error(err, "Failed to drop role")
-					return ctrl.Result{}, err
+				if res, err := r.dropPostgresRole(ctx, cluster, role); err != nil || !res.IsZero() {
+					return res, err
 				}
 			} else {
 				log.Info("Cluster not found during deletion, skipping PG cleanup")
@@ -211,9 +199,9 @@ func (r *RoleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		role.Status.PasswordRotatedAt = nil
 	}
 
-	// Handle role memberships (grant, update options, revoke removed ones)
-	if err := reconcileMemberships(ctx, pgClient, role, pgName); err != nil {
-		log.Error(err, "Failed to reconcile role memberships")
+	// Handle role memberships and parameter privileges
+	if err := reconcileRoleGrants(ctx, pgClient, role, pgName); err != nil {
+		log.Error(err, "Failed to reconcile role grants")
 		return r.updateStatus(ctx, role, false, secretName, err)
 	}
 
@@ -225,6 +213,94 @@ func (r *RoleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		}
 	}
 	return result, err
+}
+
+// dropPostgresRole drops the Role's PostgreSQL role during deletion. Privileges
+// held by the role block DROP ROLE, so it first revokes the parameter grants
+// pgop made and every database and schema privilege the role holds on the
+// cluster (with CASCADE: the role is going away). Anything else that still
+// depends on the role (objects it owns, table privileges) is reported as an
+// Available=False condition with reason RoleDropBlocked and PostgreSQL's
+// list of dependents, and the drop is retried periodically. A non-zero
+// result or an error means the role has not been dropped yet.
+func (r *RoleReconciler) dropPostgresRole(ctx context.Context, cluster *postgresv1alpha1.Cluster, role *postgresv1alpha1.Role) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+	pgClient, err := newOperatorClient(ctx, r.Client, cluster, defaultDatabaseName)
+	if err != nil {
+		log.Error(err, "Failed to create PostgreSQL client during deletion")
+		return ctrl.Result{}, err
+	}
+	defer func() { _ = pgClient.Close() }()
+	// Prefer the name recorded in status so we drop what was actually created.
+	pgName := role.Status.RoleName
+	if pgName == "" {
+		pgName = role.PostgresName()
+	}
+	exists, err := pgClient.RoleExists(ctx, pgName)
+	if err != nil || !exists {
+		return ctrl.Result{}, err
+	}
+
+	// REVOKE is idempotent, so a retry after a partial failure is safe.
+	if err := revokeManagedParameterGrants(ctx, pgClient, role, pgName); err != nil {
+		log.Error(err, "Failed to revoke parameter grants")
+		return ctrl.Result{}, err
+	}
+	if err := pgClient.RevokeAllDatabasePrivileges(ctx, pgName); err != nil {
+		log.Error(err, "Failed to revoke database privileges")
+		return ctrl.Result{}, err
+	}
+	dbs, err := pgClient.DatabasesWithSchemaPrivileges(ctx, pgName)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	for _, db := range dbs {
+		if err := revokeSchemaPrivilegesIn(ctx, r.Client, cluster, db, pgName); err != nil {
+			log.Error(err, "Failed to revoke schema privileges", "database", db)
+			return ctrl.Result{}, err
+		}
+	}
+
+	err = pgClient.DropRole(ctx, pgName)
+	if depErr, ok := errors.AsType[*postgres.DependentObjectsError](err); ok {
+		log.Info("Role cannot be dropped yet", "reason", depErr.Error())
+		meta.SetStatusCondition(&role.Status.Conditions, metav1.Condition{
+			Type:               ConditionTypeAvailable,
+			Status:             metav1.ConditionFalse,
+			ObservedGeneration: role.Generation,
+			Reason:             ReasonRoleDropBlocked,
+			Message:            depErr.Error(),
+		})
+		if statusErr := r.Status().Update(ctx, role); statusErr != nil {
+			return ctrl.Result{}, statusErr
+		}
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+	if err != nil {
+		log.Error(err, "Failed to drop role")
+	}
+	return ctrl.Result{}, err
+}
+
+// revokeSchemaPrivilegesIn revokes every schema privilege role holds in the
+// database db.
+func revokeSchemaPrivilegesIn(ctx context.Context, c client.Client, cluster *postgresv1alpha1.Cluster, db, role string) error {
+	dbClient, err := newOperatorClient(ctx, c, cluster, db)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = dbClient.Close() }()
+	return dbClient.RevokeAllSchemaPrivileges(ctx, role)
+}
+
+// reconcileRoleGrants brings the role's memberships (grant, update options,
+// revoke removed ones) and its privileges on configuration parameters
+// (PostgreSQL 15+) to the declared state.
+func reconcileRoleGrants(ctx context.Context, pgClient *postgres.Client, role *postgresv1alpha1.Role, pgName string) error {
+	if err := reconcileMemberships(ctx, pgClient, role, pgName); err != nil {
+		return err
+	}
+	return reconcileParameterGrants(ctx, pgClient, role, pgName)
 }
 
 // credentialsSecretName returns the name of the Role's credentials Secret.

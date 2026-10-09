@@ -693,6 +693,7 @@ spec:
 	})
 
 	RegisterPasswordTests()
+	RegisterGrantsTests()
 	RegisterBackupTests()
 	RegisterRetentionTests()
 	RegisterTLSTests()

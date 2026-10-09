@@ -334,6 +334,9 @@ func (c *Client) DropRole(ctx context.Context, name string) error {
 	query := fmt.Sprintf("DROP ROLE IF EXISTS %s", quoteIdent(name))
 	_, err := c.db.ExecContext(ctx, query)
 	if err != nil {
+		if depErr := dependentObjectsError(name, err); depErr != nil {
+			return depErr
+		}
 		return fmt.Errorf("failed to drop role: %w", err)
 	}
 	return nil
@@ -589,15 +592,16 @@ func (c *Client) CreateSchema(ctx context.Context, name, owner string) error {
 	return nil
 }
 
-// GrantSchemaPrivileges grants privileges on a schema to a role
+// GrantSchemaPrivileges grants privileges on a schema to a role. The
+// privileges are checked against the schema allow-list (USAGE, CREATE, ALL)
+// before any SQL is built, since they cannot be passed as bind parameters.
 func (c *Client) GrantSchemaPrivileges(ctx context.Context, schema, role string, privileges []string, withGrantOption bool) error {
-	privs := strings.Join(privileges, ", ")
-	query := fmt.Sprintf("GRANT %s ON SCHEMA %s TO %s", privs, quoteIdent(schema), quoteIdent(role))
-	if withGrantOption {
-		query += " WITH GRANT OPTION"
+	query, err := buildGrantSchemaPrivilegesQuery(schema, role, privileges, withGrantOption)
+	if err != nil {
+		return err
 	}
 
-	_, err := c.db.ExecContext(ctx, query)
+	_, err = c.db.ExecContext(ctx, query)
 	if err != nil {
 		return fmt.Errorf("failed to grant schema privileges: %w", err)
 	}

@@ -10,7 +10,8 @@ The Role controller:
 2. Creates or updates the role with specified permissions
 3. Auto-generates a password and creates a credentials Secret
 4. Manages role memberships (GRANT, option changes, and REVOKE of memberships it granted)
-5. Cleans up the role on deletion
+5. Grants privileges on configuration parameters (`parameterGrants`, PostgreSQL 15+)
+6. Cleans up the role on deletion, revoking its privileges first (see [Deletion](#deletion))
 
 ## Example
 
@@ -49,6 +50,7 @@ spec:
 | `revokeRemovedMemberships` | bool | `true` | Revoke pgop-granted memberships removed from the spec (transitional opt-out) |
 | `passwordSecretRef` | SecretKeySelector | - | Take the password from a key of a Secret you manage (see [Password Source](#password-source)) |
 | `passwordRotation.every` | duration | - | Rotate the generated password on this interval, e.g. `720h` (minimum `1h`; see [Password Rotation](#password-rotation)) |
+| `parameterGrants` | []ParameterGrantSpec | - | `GRANT SET ON PARAMETER` privileges (see [Parameter Grants](#parameter-grants)) |
 
 ## Status
 
@@ -58,6 +60,7 @@ spec:
 | `roleName` | The effective PostgreSQL role name that was reconciled |
 | `secretName` | Name of the auto-generated credentials secret (`<cluster>-<role>-credentials`) |
 | `managedMemberships` | PostgreSQL roles whose membership pgop granted to this role |
+| `managedParameterGrants` | Parameter privileges pgop granted to this role |
 | `passwordHash` | **Deprecated**, no longer written and cleared on the next reconcile (the fingerprint moved to the credentials Secret, see [Password Source](#password-source)) |
 | `passwordRotatedAt` | When the operator last generated the password; the rotation schedule counts from it |
 | `passwordRotationRequest` | Last `pgop.ruck.io/rotate-password` annotation value acted on |
@@ -210,6 +213,69 @@ memberships:
 
 Moving an entry from `memberOf` to `memberships` in a single update does not
 revoke and re-grant it.
+
+## Parameter Grants
+
+`spec.parameterGrants` lets a role change configuration parameters that
+normally only a superuser may set, with `GRANT SET ON PARAMETER` (PostgreSQL
+15 or later):
+
+```yaml
+spec:
+  parameterGrants:
+    - parameter: log_statement      # SET is the default privilege
+    - parameter: myapp.tenant_id    # custom parameters work too
+      privileges: [SET]
+      withGrantOption: true
+```
+
+- `parameter` is a parameter name: identifiers optionally separated by dots,
+  at most 127 characters, case-insensitive (pgop lowercases it). Each parameter
+  may appear once.
+- `privileges` only accepts `SET` (the default). `ALTER SYSTEM` is
+  deliberately not offered: it would let the role rewrite
+  `postgresql.auto.conf`, which overrides the Cluster's `spec.parameters`.
+- On a server older than PostgreSQL 15 the Role reports `Available=False` with
+  reason `UnsupportedServerVersion`; nothing is granted.
+- pgop records what it granted in `status.managedParameterGrants`. Removing a
+  parameter (or turning `withGrantOption` off) revokes what pgop granted;
+  privileges granted outside pgop are never revoked. A revoke of privileges
+  granted with `withGrantOption` uses `CASCADE`, so grants the role passed on
+  are revoked too.
+- Some parameters can never be granted, because SET on them lets the role
+  switch identity, load code or bypass safeguards: `role`,
+  `session_authorization`, `session_preload_libraries`,
+  `local_preload_libraries`, `shared_preload_libraries`,
+  `dynamic_library_path`, `jit_provider`, `session_replication_role` and the
+  `pgaudit.*`, `set_user.*`, `anon.*` and `sepgsql.*` namespaces. The API
+  server rejects them; a Role that still lists one (or an older object) gets
+  `Available=False` with reason `ParameterNotAllowed`, the other grants are
+  applied, and a managed grant on such a parameter is revoked.
+- Granting SET on any other superuser-only parameter is a real privilege
+  escalation for that role: for example SET on `log_statement` lets it turn
+  statement logging off for its own sessions. Grant only what the role
+  needs.
+
+## Deletion
+
+When a Role is deleted, pgop drops the PostgreSQL role. PostgreSQL refuses to
+drop a role that still holds privileges, so pgop first revokes:
+
+- the parameter privileges it granted (`status.managedParameterGrants`),
+- every database-level privilege the role holds on any database of the
+  cluster, and
+- every schema privilege the role holds, in every database,
+
+all with `CASCADE` (privileges the role passed on go with it, as with
+`DROP OWNED`). Databases whose `grants` list the role stop granting to it while
+it is being deleted, so they do not undo this.
+
+Anything else that depends on the role, such as objects it owns or privileges
+on tables, is left alone. The drop then fails, and the Role reports
+`Available=False` with reason `RoleDropBlocked` and PostgreSQL's list of
+dependents. pgop retries every 30 seconds until you resolve them (for
+example with `REASSIGN OWNED BY ... TO ...` and `DROP OWNED BY ...` in each
+database), after which the finalizer is removed.
 
 ## Role Types
 

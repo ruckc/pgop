@@ -54,6 +54,77 @@ type DatabaseSpec struct {
 	// schemas lists schemas to create in this database
 	// +optional
 	Schemas []SchemaSpec `json:"schemas,omitempty"`
+
+	// grants lists database-level privileges (GRANT ... ON DATABASE) to grant
+	// to PostgreSQL roles. Privileges that pgop granted (tracked in
+	// status.managedGrants) are revoked once they are removed from the spec;
+	// privileges granted outside pgop are never revoked.
+	// +optional
+	// +listType=map
+	// +listMapKey=role
+	// +kubebuilder:validation:MaxItems=256
+	Grants []DatabaseGrantSpec `json:"grants,omitempty"`
+
+	// settings are per-database defaults for configuration parameters
+	// (ALTER DATABASE ... SET name TO value). They apply to new sessions.
+	// Settings that pgop applied (tracked in status.managedSettings) are reset
+	// (ALTER DATABASE ... RESET name) once they are removed from the spec.
+	// Keys are parameter names (for example work_mem or myapp.tenant); values
+	// are written as SQL string literals. For the list parameters search_path
+	// and temp_tablespaces the value is a comma-separated list as in
+	// postgresql.conf (the YAML string "$user", public with the double quotes
+	// kept); an empty list is rejected.
+	// Only parameters that any user may set (context "user" in pg_settings)
+	// and custom parameters are accepted; superuser-only parameters and a
+	// denylist of identity-switching, code-loading and safeguard-bypassing
+	// parameters are refused (reason SettingNotAllowed), because pgop runs
+	// ALTER DATABASE as a superuser.
+	// +optional
+	// +kubebuilder:validation:MaxProperties=256
+	// +kubebuilder:validation:XValidation:rule="self.all(k, size(k) <= 127 && k.matches('^[A-Za-z_][A-Za-z0-9_]*(\\\\.[A-Za-z_][A-Za-z0-9_]*)*$'))",message="settings keys must be parameter names: identifiers ([A-Za-z_][A-Za-z0-9_]*) optionally separated by dots, at most 127 characters"
+	// +kubebuilder:validation:XValidation:rule="self.all(k, size(self[k]) <= 4096)",message="settings values must be at most 4096 characters"
+	// +kubebuilder:validation:XValidation:rule="!self.exists(k, k.lowerAscii() in ['role', 'session_authorization', 'session_preload_libraries', 'local_preload_libraries', 'shared_preload_libraries', 'dynamic_library_path', 'jit_provider', 'session_replication_role'] || k.lowerAscii().startsWith('pgaudit.') || k.lowerAscii().startsWith('set_user.') || k.lowerAscii().startsWith('anon.') || k.lowerAscii().startsWith('sepgsql.'))",message="settings must not include role, session_authorization, *_preload_libraries, dynamic_library_path, jit_provider, session_replication_role or pgaudit.*, set_user.*, anon.*, sepgsql.* parameters"
+	Settings map[string]string `json:"settings,omitempty"`
+}
+
+// DatabaseGrantSpec grants database-level privileges to a PostgreSQL role.
+type DatabaseGrantSpec struct {
+	// role is the PostgreSQL name of the role to grant privileges to (a raw
+	// PostgreSQL role name, not a Role resource name). The role must exist;
+	// the grant is retried until it does.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	Role string `json:"role"`
+
+	// privileges lists the database privileges to grant: CONNECT, CREATE,
+	// TEMPORARY (or TEMP), or ALL (all three).
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=5
+	// +kubebuilder:validation:items:Enum=CONNECT;CREATE;TEMPORARY;TEMP;ALL
+	Privileges []string `json:"privileges"`
+
+	// withGrantOption allows the grantee to grant the same privileges to
+	// others. Turning it off for a grant pgop made revokes the grant option.
+	// +optional
+	WithGrantOption bool `json:"withGrantOption,omitempty"`
+}
+
+// ManagedDatabaseGrant records database privileges that pgop granted to a role.
+type ManagedDatabaseGrant struct {
+	// role is the PostgreSQL role the privileges were granted to.
+	Role string `json:"role"`
+
+	// privileges are the granted privileges, normalized (TEMP is recorded as
+	// TEMPORARY and ALL as CONNECT, CREATE and TEMPORARY).
+	// +listType=set
+	Privileges []string `json:"privileges"`
+
+	// withGrantOption records whether pgop granted the privileges with the
+	// grant option.
+	// +optional
+	WithGrantOption bool `json:"withGrantOption,omitempty"`
 }
 
 // ExtensionSpec defines a PostgreSQL extension to install
@@ -95,9 +166,13 @@ type GrantSpec struct {
 	// +kubebuilder:validation:Required
 	Role string `json:"role"`
 
-	// privileges lists the privileges to grant (e.g., USAGE, CREATE, ALL)
+	// privileges lists the schema privileges to grant: USAGE, CREATE or ALL
+	// (also written ALL PRIVILEGES), in any letter case.
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=8
+	// +kubebuilder:validation:items:MaxLength=32
+	// +kubebuilder:validation:items:Pattern=`^(?i:usage|create|all|all privileges)$`
 	Privileges []string `json:"privileges"`
 
 	// withGrantOption allows the grantee to grant the same privileges to others
@@ -121,6 +196,20 @@ type DatabaseStatus struct {
 	// createdSchemas lists schemas that have been successfully created
 	// +optional
 	CreatedSchemas []string `json:"createdSchemas,omitempty"`
+
+	// managedGrants lists the database privileges pgop has granted. Only
+	// these are revoked when they are removed from spec.grants.
+	// +optional
+	// +listType=map
+	// +listMapKey=role
+	ManagedGrants []ManagedDatabaseGrant `json:"managedGrants,omitempty"`
+
+	// managedSettings lists the parameter names pgop has set with ALTER
+	// DATABASE ... SET (normalized to lowercase). Only these are reset when
+	// they are removed from spec.settings.
+	// +optional
+	// +listType=set
+	ManagedSettings []string `json:"managedSettings,omitempty"`
 
 	// conditions represent the current state of the Database resource.
 	// +listType=map
