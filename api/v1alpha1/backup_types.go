@@ -71,6 +71,16 @@ type PhysicalBackupConfig struct {
 	// +optional
 	PostgresImageIncludesPgbackrest bool `json:"postgresImageIncludesPgbackrest,omitempty"`
 
+	// acceptImageSwap acknowledges that the Cluster's official postgres image
+	// given by a bare tag of PostgreSQL 16 or 17 ("17", "17.2") is replaced
+	// by pgop's Debian trixie image. Those tags were Debian bookworm until
+	// August 2025, whose glibc collations can differ from trixie's: confirm
+	// that the Cluster was initialized on a trixie image (or that its text
+	// indexes were rebuilt) before setting it. Not needed for "-trixie" tags
+	// or PostgreSQL 18, whose released images were always trixie.
+	// +optional
+	AcceptImageSwap bool `json:"acceptImageSwap,omitempty"`
+
 	// archivePushQueueMax bounds the WAL that may queue up in pg_wal while
 	// archiving fails (pgBackRest archive-push-queue-max). Beyond it,
 	// pgBackRest drops WAL (and logs it) instead of filling the data

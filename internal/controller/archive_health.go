@@ -19,7 +19,11 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
+
+	corev1 "k8s.io/api/core/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -36,11 +40,15 @@ const (
 	reasonArchiveFailing   = "ArchiveFailing"
 	reasonNoWALArchivedYet = "NoWALArchivedYet"
 	reasonArchiveUnknown   = "Unknown"
+	// reasonWALDropped: pgBackRest dropped WAL (queue full); latched until a
+	// backup that started afterwards succeeded.
+	reasonWALDropped = "WALDropped"
 )
 
 // ArchiveServer reads WAL archiving statistics from the primary.
 type ArchiveServer interface {
 	ArchiverStats(ctx context.Context) (postgres.ArchiverStats, error)
+	TailFile(ctx context.Context, name string) (string, error)
 	Close() error
 }
 
@@ -106,5 +114,74 @@ func (r *ClusterReconciler) reconcileArchiveHealth(ctx context.Context, cluster 
 	if err != nil {
 		return set(metav1.ConditionUnknown, reasonArchiveUnknown, err.Error())
 	}
+	marker, err := srv.TailFile(ctx, walDropMarkerFile)
+	if err != nil {
+		return set(metav1.ConditionUnknown, reasonArchiveUnknown, err.Error())
+	}
+	r.recordWALDrop(cluster, marker)
+	if drop := cluster.Status.LastWALDrop; drop != nil && drop.ClosedBy == "" {
+		closedBy, err := r.backupStartedAfter(ctx, backup, drop.Time.Time)
+		if err != nil {
+			return set(metav1.ConditionUnknown, reasonArchiveUnknown, err.Error())
+		}
+		if closedBy == "" {
+			// Latched until a backup started after the drop succeeds:
+			// archiving itself may look healthy again.
+			return set(metav1.ConditionFalse, reasonWALDropped, fmt.Sprintf(
+				"pgBackRest dropped WAL segment %s at %s because the archive queue exceeded archive-push-queue-max; "+
+					"point-in-time recovery across it is impossible. This stays False until a backup (full, "+
+					"differential or incremental) that starts after the drop succeeds; take one now",
+				drop.Segment, drop.Time.UTC().Format(time.RFC3339)))
+		}
+		drop.ClosedBy = closedBy
+	}
 	return set(archivingCondition(stats))
+}
+
+// recordWALDrop records the newest drop from the drop marker file
+// ("<RFC3339 time> <segment>" lines) in status.lastWALDrop, with a Warning
+// event, when it is newer than the one recorded.
+func (r *ClusterReconciler) recordWALDrop(cluster *postgresv1alpha1.Cluster, marker string) {
+	var at time.Time
+	var segment string
+	for line := range strings.Lines(marker) {
+		ts, seg, ok := strings.Cut(strings.TrimSpace(line), " ")
+		if !ok {
+			continue
+		}
+		if t, err := time.Parse(time.RFC3339, ts); err == nil && t.After(at) {
+			at, segment = t, seg
+		}
+	}
+	if at.IsZero() {
+		return
+	}
+	if last := cluster.Status.LastWALDrop; last != nil && !at.After(last.Time.Time) {
+		return
+	}
+	cluster.Status.LastWALDrop = &postgresv1alpha1.WALDropRecord{Time: metav1.NewTime(at), Segment: segment}
+	if r.Recorder != nil {
+		r.Recorder.Eventf(cluster, nil, corev1.EventTypeWarning, reasonWALDropped, "ArchiveWAL",
+			"pgBackRest dropped WAL segment %s at %s (archive queue full); point-in-time recovery across it is impossible "+
+				"until a new backup", segment, at.Format(time.RFC3339))
+	}
+}
+
+// backupStartedAfter returns the name of a successful BackupRun of the
+// Backup that started after t ("" if none).
+func (r *ClusterReconciler) backupStartedAfter(ctx context.Context, backup *postgresv1alpha1.Backup, t time.Time) (string, error) {
+	runs := &postgresv1alpha1.BackupRunList{}
+	if err := r.List(ctx, runs, client.InNamespace(backup.Namespace), client.MatchingLabels{
+		LabelAppName:     appNameBackup,
+		LabelAppInstance: backup.Name,
+	}); err != nil {
+		return "", err
+	}
+	for _, run := range runs.Items {
+		if run.Status.Phase == postgresv1alpha1.BackupRunPhaseSucceeded && run.Status.StartTime != nil &&
+			run.Status.StartTime.After(t) {
+			return run.Name, nil
+		}
+	}
+	return "", nil
 }

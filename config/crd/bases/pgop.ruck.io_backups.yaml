@@ -227,6 +227,16 @@ spec:
               physical:
                 description: physical configures schedules for physical backups
                 properties:
+                  acceptImageSwap:
+                    description: |-
+                      acceptImageSwap acknowledges that the Cluster's official postgres image
+                      given by a bare tag of PostgreSQL 16 or 17 ("17", "17.2") is replaced
+                      by pgop's Debian trixie image. Those tags were Debian bookworm until
+                      August 2025, whose glibc collations can differ from trixie's: confirm
+                      that the Cluster was initialized on a trixie image (or that its text
+                      indexes were rebuilt) before setting it. Not needed for "-trixie" tags
+                      or PostgreSQL 18, whose released images were always trixie.
+                    type: boolean
                   archivePushQueueMax:
                     anyOf:
                     - type: integer

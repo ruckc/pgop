@@ -35,6 +35,18 @@ type RestoreRecord struct {
 	CompletionTime metav1.Time `json:"completionTime"`
 }
 
+// WALDropRecord is a WAL segment pgBackRest dropped instead of archiving.
+type WALDropRecord struct {
+	// time the segment was dropped.
+	Time metav1.Time `json:"time"`
+	// segment is the WAL file name.
+	Segment string `json:"segment"`
+	// closedBy is the BackupRun of the first successful backup that started
+	// after the drop; empty while no such backup exists.
+	// +optional
+	ClosedBy string `json:"closedBy,omitempty"`
+}
+
 // ClusterSpec defines the desired state of Cluster
 type ClusterSpec struct {
 	// image is the PostgreSQL container image to use.
@@ -277,6 +289,13 @@ type ClusterStatus struct {
 	// (see the pgop.ruck.io/allow-restore annotation).
 	// +optional
 	LastRestore *RestoreRecord `json:"lastRestore,omitempty"`
+
+	// lastWALDrop records the last WAL segment pgBackRest dropped because
+	// the archive queue exceeded archive-push-queue-max. Point-in-time
+	// recovery across it is impossible; closedBy names the first successful
+	// backup that started after it (recovery from that backup on works).
+	// +optional
+	LastWALDrop *WALDropRecord `json:"lastWALDrop,omitempty"`
 
 	// ready indicates if the cluster is ready to accept connections
 	Ready bool `json:"ready,omitempty"`

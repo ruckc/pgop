@@ -417,6 +417,29 @@ spec:
                 - result
                 - uid
                 type: object
+              lastWALDrop:
+                description: |-
+                  lastWALDrop records the last WAL segment pgBackRest dropped because
+                  the archive queue exceeded archive-push-queue-max. Point-in-time
+                  recovery across it is impossible; closedBy names the first successful
+                  backup that started after it (recovery from that backup on works).
+                properties:
+                  closedBy:
+                    description: |-
+                      closedBy is the BackupRun of the first successful backup that started
+                      after the drop; empty while no such backup exists.
+                    type: string
+                  segment:
+                    description: segment is the WAL file name.
+                    type: string
+                  time:
+                    description: time the segment was dropped.
+                    format: date-time
+                    type: string
+                required:
+                - segment
+                - time
+                type: object
               parametersHash:
                 description: |-
                   parametersHash identifies the generated configuration (spec.parameters)

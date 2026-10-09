@@ -48,3 +48,16 @@ func (c *Client) ArchiverStats(ctx context.Context) (ArchiverStats, error) {
 	s.LastArchivedTime, s.LastFailedTime = archivedAt.Time, failedAt.Time
 	return s, nil
 }
+
+// TailFile returns up to the last 4 KiB of a file in the data directory
+// ("" when it does not exist). The operator is a superuser, so it may read
+// server files.
+func (c *Client) TailFile(ctx context.Context, name string) (string, error) {
+	var out sql.NullString
+	err := c.db.QueryRowContext(ctx, `SELECT pg_read_file($1,
+		greatest(coalesce((pg_stat_file($1, true)).size, 0) - 4096, 0), 4096, true)`, name).Scan(&out)
+	if err != nil {
+		return "", fmt.Errorf("failed to read %s: %w", name, err)
+	}
+	return out.String, nil
+}

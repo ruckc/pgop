@@ -30,6 +30,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	postgresv1alpha1 "github.com/ruckc/pgop/api/v1alpha1"
@@ -285,8 +286,9 @@ var _ = Describe("Restore Controller", func() {
 	// runToJob drives a confirmed Restore up to its restore Job.
 	runToJob := func(req reconcile.Request, restore *postgresv1alpha1.Restore) *batchv1.Job {
 		reconcileRestore(req, restore) // stop the Cluster
-		reconcileRestore(req, restore) // create the Job (envtest has no StatefulSet)
+		reconcileRestore(req, restore) // record the Job name (envtest has no StatefulSet)
 		Expect(restore.Status.JobName).NotTo(BeEmpty())
+		reconcileRestore(req, restore) // create the Job
 		job := &batchv1.Job{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: restore.Status.JobName, Namespace: RestoreNamespace}, job)).To(Succeed())
 		return job
@@ -309,8 +311,14 @@ var _ = Describe("Restore Controller", func() {
 		Expect(restore.Status.Phase).To(Equal(postgresv1alpha1.RestorePhaseRunning))
 		Expect(restore.Finalizers).To(ContainElement(restoreFinalizer))
 
-		By("restoring once no pod runs (envtest has no StatefulSet)")
+		By("recording the Job name before creating the Job, once no pod runs (envtest has no StatefulSet)")
 		reconcileRestore(req, restore)
+		Expect(restore.Status.JobName).To(Equal(restore.Name + "-restore"))
+		Expect(restore.Status.Conditions[0].Reason).To(Equal(reasonCreatingJob))
+		err := k8sClient.Get(ctx, types.NamespacedName{Name: restore.Status.JobName, Namespace: RestoreNamespace}, &batchv1.Job{})
+		Expect(apierrors.IsNotFound(err)).To(BeTrue())
+		reconcileRestore(req, restore)
+		Expect(restore.Status.Conditions[0].Reason).To(Equal(reasonRestoring))
 		job := &batchv1.Job{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: restore.Status.JobName, Namespace: RestoreNamespace}, job)).To(Succeed())
 		c := job.Spec.Template.Spec.Containers[0]
@@ -345,14 +353,19 @@ var _ = Describe("Restore Controller", func() {
 		Expect(cluster.Status.LastRestore.UID).To(Equal(string(restore.UID)))
 		Expect(cluster.Status.LastRestore.Result).To(Equal(reasonSucceeded))
 
-		By("an identical Restore re-created right after needs a UID confirmation")
+		By("once the Cluster had a restore, a name-only confirmation (e.g. kept in git) no longer works")
 		Expect(k8sClient.Delete(ctx, restore)).To(Succeed())
 		reconcileRestore(req, restore)
 		again, req2 := newPhysicalRestore("restore-"+suffix, clusterName, runName, nil)
 		annotate(clusterName, AnnotationAllowRestore, again.Name)
 		reconcileRestore(req2, again)
 		Expect(again.Status.Phase).To(Equal(postgresv1alpha1.RestorePhasePending))
-		Expect(again.Status.Conditions[0].Message).To(ContainSubstring("identical Restore"))
+		Expect(again.Status.Conditions[0].Message).To(ContainSubstring("only the UID form confirms a new one"))
+
+		By("the Restore spec is immutable")
+		edited := again.DeepCopy()
+		edited.Spec.TargetTime = &metav1.Time{Time: time.Now()}
+		Expect(k8sClient.Update(ctx, edited)).To(MatchError(ContainSubstring("spec is immutable")))
 		Expect(getCluster(clusterName).Annotations).NotTo(HaveKey(AnnotationRestoreInProgress))
 		annotate(clusterName, AnnotationAllowRestore, again.Name+"/"+string(again.UID))
 		reconcileRestore(req2, again)
@@ -401,7 +414,7 @@ var _ = Describe("Restore Controller", func() {
 
 		By("a new confirmed Restore that succeeds clears the interruption")
 		next, req2 := newPhysicalRestore("restore2-"+suffix, clusterName, runName, nil)
-		annotate(clusterName, AnnotationAllowRestore, next.Name)
+		annotate(clusterName, AnnotationAllowRestore, next.Name+"/"+string(next.UID))
 		job2 := runToJob(req2, next)
 		job2.Status.Succeeded = 1
 		Expect(k8sClient.Status().Update(ctx, job2)).To(Succeed())
@@ -472,6 +485,84 @@ var _ = Describe("Restore Controller", func() {
 		reconcileRestore(req, restore)
 		Expect(restore.Status.JobName).To(BeEmpty())
 		Expect(restore.Status.Conditions[0].Reason).To(Equal(reasonWaitingForOldJob))
+	})
+
+	It("should never start the Cluster while a Job of the Restore exists, even without a recorded Job name", func() {
+		clusterName, runName := physicalFixture(1)
+		restore, req := newPhysicalRestore("restore-"+suffix, clusterName, runName, nil)
+		annotate(clusterName, AnnotationAllowRestore, restore.Name)
+		reconcileRestore(req, restore) // stop the Cluster
+		Expect(restore.Status.JobName).To(BeEmpty())
+
+		By("a Job of this Restore exists whose name was never recorded (a lost status update)")
+		job := &batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{Name: restore.Name + "-restore", Namespace: RestoreNamespace},
+			Spec: batchv1.JobSpec{Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+				RestartPolicy: corev1.RestartPolicyNever,
+				Containers:    []corev1.Container{{Name: "c", Image: "x"}},
+			}}},
+		}
+		Expect(controllerutil.SetControllerReference(restore, job, k8sClient.Scheme())).To(Succeed())
+		Expect(k8sClient.Create(ctx, job)).To(Succeed())
+
+		By("the BackupRun disappears: the restore fails, but counts as interrupted")
+		run := &postgresv1alpha1.BackupRun{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: runName, Namespace: RestoreNamespace}, run)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, run)).To(Succeed())
+		reconcileRestore(req, restore)
+		Expect(restore.Status.Phase).To(Equal(postgresv1alpha1.RestorePhaseFailed))
+		cluster := getCluster(clusterName)
+		Expect(cluster.Annotations).To(HaveKeyWithValue(AnnotationRestoreInterrupted, restore.Name))
+		Expect(pausedForRestore(cluster)).To(BeTrue())
+	})
+
+	It("should keep the Cluster stopped when a Restore is deleted right after recording its Job name", func() {
+		clusterName, runName := physicalFixture(1)
+		restore, req := newPhysicalRestore("restore-"+suffix, clusterName, runName, nil)
+		annotate(clusterName, AnnotationAllowRestore, restore.Name)
+		reconcileRestore(req, restore) // stop the Cluster
+		reconcileRestore(req, restore) // record the Job name
+		Expect(restore.Status.Conditions[0].Reason).To(Equal(reasonCreatingJob))
+
+		By("deleting the Restore before its Job was created")
+		Expect(k8sClient.Delete(ctx, restore)).To(Succeed())
+		reconcileRestore(req, restore)
+		err := k8sClient.Get(ctx, req.NamespacedName, &postgresv1alpha1.Restore{})
+		Expect(apierrors.IsNotFound(err)).To(BeTrue())
+		Expect(getCluster(clusterName).Annotations).To(HaveKeyWithValue(AnnotationRestoreInterrupted, restore.Name),
+			"once the Job name is recorded the restore counts as started")
+	})
+
+	It("should keep the Cluster stopped when the target cannot be resolved while creating the Job", func() {
+		clusterName, runName := physicalFixture(1)
+		restore, req := newPhysicalRestore("restore-"+suffix, clusterName, runName, nil)
+		annotate(clusterName, AnnotationAllowRestore, restore.Name)
+		reconcileRestore(req, restore) // stop the Cluster
+		reconcileRestore(req, restore) // record the Job name
+		run := &postgresv1alpha1.BackupRun{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: runName, Namespace: RestoreNamespace}, run)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, run)).To(Succeed())
+		reconcileRestore(req, restore)
+		Expect(restore.Status.Phase).To(Equal(postgresv1alpha1.RestorePhaseFailed))
+		Expect(getCluster(clusterName).Annotations).To(HaveKeyWithValue(AnnotationRestoreInterrupted, restore.Name))
+	})
+
+	It("should remove the finalizer of a Restore whose Cluster is gone", func() {
+		clusterName, runName := physicalFixture(1)
+		restore, req := newPhysicalRestore("restore-"+suffix, clusterName, runName, nil)
+		annotate(clusterName, AnnotationAllowRestore, restore.Name)
+		job := runToJob(req, restore)
+		job.Status.Succeeded = 1
+		Expect(k8sClient.Status().Update(ctx, job)).To(Succeed())
+		cluster := getCluster(clusterName)
+		Expect(k8sClient.Delete(ctx, cluster)).To(Succeed())
+		Eventually(func() bool {
+			return apierrors.IsNotFound(k8sClient.Get(ctx, client.ObjectKeyFromObject(cluster), &postgresv1alpha1.Cluster{}))
+		}).Should(BeTrue())
+		Expect(k8sClient.Delete(ctx, restore)).To(Succeed())
+		reconcileRestore(req, restore)
+		err := k8sClient.Get(ctx, req.NamespacedName, &postgresv1alpha1.Restore{})
+		Expect(apierrors.IsNotFound(err)).To(BeTrue(), "not stuck Terminating")
 	})
 
 	DescribeTable("should reject a physical restore that cannot work",

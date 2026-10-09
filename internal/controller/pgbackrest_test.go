@@ -20,8 +20,10 @@ import (
 	"context"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"regexp"
 	"slices"
 	"strings"
@@ -102,10 +104,11 @@ var _ = Describe("pgBackRest", func() {
 	)
 
 	DescribeTable("picks the image of a Cluster with physical backups",
-		func(image string, major *int32, optIn bool, want string) {
+		func(image string, major *int32, optIn bool, want string, acceptSwap ...bool) {
 			c := &postgresv1alpha1.Cluster{Spec: postgresv1alpha1.ClusterSpec{Image: image, PostgresMajorVersion: major}}
 			b := &postgresv1alpha1.Backup{Spec: postgresv1alpha1.BackupSpec{
-				Physical: &postgresv1alpha1.PhysicalBackupConfig{PostgresImageIncludesPgbackrest: optIn}}}
+				Physical: &postgresv1alpha1.PhysicalBackupConfig{PostgresImageIncludesPgbackrest: optIn,
+					AcceptImageSwap: len(acceptSwap) > 0 && acceptSwap[0]}}}
 			got, err := postgresImageForBackups(c, b)
 			if want == "" {
 				Expect(err).To(MatchError(errUnsupportedBackupImage))
@@ -115,8 +118,13 @@ var _ = Describe("pgBackRest", func() {
 			Expect(got).To(Equal(want))
 		},
 		Entry("default", "", nil, false, "ghcr.io/ruckc/pgop-postgres:18-"+pgbackrestVersion),
-		Entry("official major", "postgres:17", nil, false, "ghcr.io/ruckc/pgop-postgres:17-"+pgbackrestVersion),
+		Entry("18 minor (always trixie)", "postgres:18.1", nil, false, "ghcr.io/ruckc/pgop-postgres:18-"+pgbackrestVersion),
+		Entry("17-trixie", "postgres:17-trixie", nil, false, "ghcr.io/ruckc/pgop-postgres:17-"+pgbackrestVersion),
 		Entry("official minor, trixie", "docker.io/library/postgres:16.4-trixie", nil, false, "ghcr.io/ruckc/pgop-postgres:16-"+pgbackrestVersion),
+		Entry("bare 17 is rejected (was bookworm)", "postgres:17", nil, false, ""),
+		Entry("bare 16.4 is rejected (was bookworm)", "postgres:16.4", nil, false, ""),
+		Entry("bare 17 with acceptImageSwap", "postgres:17", nil, false, "ghcr.io/ruckc/pgop-postgres:17-"+pgbackrestVersion, true),
+		Entry("bookworm is rejected even with acceptImageSwap", "postgres:17-bookworm", nil, false, "", true),
 		Entry("alpine is rejected (musl)", "postgres:18-alpine", nil, false, ""),
 		Entry("alpine with minor is rejected", "postgres:17.2-alpine3.21", nil, false, ""),
 		Entry("bookworm is rejected (other glibc)", "postgres:16-bookworm", nil, false, ""),
@@ -318,7 +326,7 @@ var _ = Describe("Physical backups (envtest)", func() {
 		Expect(pg.Image).To(Equal(PgopPostgresImage(18)))
 		Expect(sidecar.Name).To(Equal(pgbackrestContainerName))
 		Expect(sidecar.Image).To(Equal(pg.Image))
-		Expect(strings.Join(pg.Args, " ")).To(ContainSubstring("-c archive_mode=on -c archive_command=/usr/bin/pgbackrest --stanza=main archive-push %p"))
+		Expect(strings.Join(pg.Args, " ")).To(ContainSubstring("-c archive_mode=on -c archive_command=" + archiveCommand()))
 		Expect(envValue(pg.Env, "PGBACKREST_REPO1_S3_BUCKET")).To(Equal("bucket"))
 		Expect(envValue(sidecar.Env, "PGBACKREST_TLS_SERVER_AUTH")).To(Equal(pgbackrestClientCN + "=main"))
 		Expect(pg.VolumeMounts).To(ContainElement(HaveField("MountPath", postgresSocketDir)))
@@ -367,8 +375,14 @@ var _ = Describe("Physical backups (envtest)", func() {
 		Expect(err).NotTo(HaveOccurred())
 		after := sts()
 		Expect(after.Spec.Template.Spec.Containers).To(HaveLen(1))
-		Expect(after.Spec.Template.Spec.Containers[0].Image).To(Equal(DefaultPostgresImage))
+		Expect(after.Spec.Template.Spec.Containers[0].Image).To(Equal(PgopPostgresImage(18)),
+			"pgop's image is kept: switching back could change the C library")
 		Expect(after.Spec.Template.Spec.Containers[0].Args).To(BeEmpty())
+		Expect(k8sClient.Get(ctx, req.NamespacedName, cluster)).To(Succeed())
+		pb := meta.FindStatusCondition(cluster.Status.Conditions, ConditionTypePhysicalBackup)
+		Expect(pb).NotTo(BeNil())
+		Expect(pb.Status).To(Equal(metav1.ConditionFalse))
+		Expect(pb.Reason).To(Equal("Disabled"))
 		Expect(after.Spec.Template.Spec.Volumes).To(BeEmpty())
 		Expect(k8sClient.Get(ctx, req.NamespacedName, svc)).To(Succeed())
 		Expect(svc.Spec.Ports).To(HaveLen(1))
@@ -501,6 +515,11 @@ var _ = Describe("Physical backups (envtest)", func() {
 		Expect(sts.Spec.Template.Spec.Containers).To(HaveLen(1))
 		Expect(sts.Spec.Template.Spec.Containers[0].Image).To(Equal("postgres:17-alpine"))
 		Expect(sts.Spec.Template.Spec.Containers[0].Args).To(BeEmpty(), "no archive_command without pgBackRest")
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(cluster), cluster)).To(Succeed())
+		pb := meta.FindStatusCondition(cluster.Status.Conditions, ConditionTypePhysicalBackup)
+		Expect(pb).NotTo(BeNil(), "the Cluster shows that WAL is not archived")
+		Expect(pb.Status).To(Equal(metav1.ConditionFalse))
+		Expect(pb.Reason).To(Equal(reasonInvalid))
 	})
 
 	It("reports WAL archiving health from pg_stat_archiver", func() {
@@ -536,12 +555,89 @@ var _ = Describe("Physical backups (envtest)", func() {
 		By("the condition goes away without a physical Backup")
 		r.reconcileArchiveHealth(ctx, cluster, nil, true)
 		Expect(meta.FindStatusCondition(cluster.Status.Conditions, ConditionTypeWALArchiving)).To(BeNil())
+
+		By("a dropped WAL segment latches the condition although archiving looks healthy")
+		dropAt := time.Now().Add(-10 * time.Minute).UTC().Truncate(time.Second)
+		healthy := postgres.ArchiverStats{ArchivedCount: 9, LastArchivedTime: time.Now()}
+		marker := dropAt.Add(-time.Minute).Format(time.RFC3339) + " 000000010000000000000004\n" +
+			dropAt.Format(time.RFC3339) + " 000000010000000000000005\n"
+		r.ConnectArchiveServer = func(context.Context, postgres.ConnectionConfig) (ArchiveServer, error) {
+			return fakeArchiveServer{stats: healthy, marker: marker}, nil
+		}
+		r.reconcileArchiveHealth(ctx, cluster, backup, true)
+		c = meta.FindStatusCondition(cluster.Status.Conditions, ConditionTypeWALArchiving)
+		Expect(c.Status).To(Equal(metav1.ConditionFalse))
+		Expect(c.Reason).To(Equal(reasonWALDropped))
+		Expect(c.Message).To(ContainSubstring("000000010000000000000005"))
+		Expect(cluster.Status.LastWALDrop.Segment).To(Equal("000000010000000000000005"))
+
+		By("a successful backup that started before the drop does not close it")
+		Expect(k8sClient.Create(ctx, backup)).To(Succeed())
+		newRun := func(name string, start time.Time) {
+			run := &postgresv1alpha1.BackupRun{
+				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns,
+					Labels: map[string]string{LabelAppName: appNameBackup, LabelAppInstance: backup.Name}},
+				Spec: postgresv1alpha1.BackupRunSpec{BackupRef: postgresv1alpha1.ClusterReference{Name: backup.Name},
+					Type: postgresv1alpha1.BackupRunTypeIncremental},
+			}
+			Expect(k8sClient.Create(ctx, run)).To(Succeed())
+			run.Status.Phase = postgresv1alpha1.BackupRunPhaseSucceeded
+			run.Status.StartTime = &metav1.Time{Time: start}
+			Expect(k8sClient.Status().Update(ctx, run)).To(Succeed())
+		}
+		newRun("before-"+suffix, dropAt.Add(-time.Hour))
+		r.reconcileArchiveHealth(ctx, cluster, backup, true)
+		Expect(meta.FindStatusCondition(cluster.Status.Conditions, ConditionTypeWALArchiving).Reason).To(Equal(reasonWALDropped))
+
+		By("a successful backup that started after the drop closes it")
+		newRun("after-"+suffix, dropAt.Add(time.Minute))
+		r.reconcileArchiveHealth(ctx, cluster, backup, true)
+		c = meta.FindStatusCondition(cluster.Status.Conditions, ConditionTypeWALArchiving)
+		Expect(c.Status).To(Equal(metav1.ConditionTrue))
+		Expect(cluster.Status.LastWALDrop.ClosedBy).To(Equal("after-" + suffix))
+		r.reconcileArchiveHealth(ctx, cluster, backup, true)
+		Expect(cluster.Status.LastWALDrop.ClosedBy).To(Equal("after-"+suffix), "the same drop is not recorded again")
+	})
+
+	It("records WAL segments pgBackRest drops from the archive_command", func() {
+		dir := GinkgoT().TempDir()
+		fake := dir + "/pgbackrest"
+		run := func(output string, rc int) (int, string) {
+			Expect(os.WriteFile(fake, fmt.Appendf(nil, "#!/bin/sh\necho %q\nexit %d\n", output, rc), 0o755)).To(Succeed())
+			cmd := strings.ReplaceAll(archiveCommand(), pgbackrestBin, fake)
+			// PostgreSQL's substitution of %p, %f and %%.
+			cmd = strings.NewReplacer("%p", "pg_wal/000000010000000000000009", "%f", "000000010000000000000009", "%%", "%").Replace(cmd)
+			c := exec.Command("sh", "-c", cmd)
+			c.Env = append(os.Environ(), "PGDATA="+dir)
+			err := c.Run()
+			code := 0
+			if exitErr, ok := errors.AsType[*exec.ExitError](err); ok {
+				code = exitErr.ExitCode()
+			} else {
+				Expect(err).NotTo(HaveOccurred())
+			}
+			marker, _ := os.ReadFile(dir + "/" + walDropMarkerFile)
+			return code, string(marker)
+		}
+		code, marker := run("P00   INFO: pushed WAL file '000000010000000000000009' to the archive", 0)
+		Expect(code).To(Equal(0))
+		Expect(marker).To(BeEmpty())
+		code, marker = run("P00   ERROR: [039]: S3 unreachable", 39)
+		Expect(code).To(Equal(39), "failures are reported to PostgreSQL")
+		Expect(marker).To(BeEmpty())
+		code, marker = run("P00   WARN: dropped WAL file '000000010000000000000009' because archive queue exceeded 256MB", 0)
+		Expect(code).To(Equal(0))
+		Expect(marker).To(MatchRegexp(`^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z 000000010000000000000009\n$`))
 	})
 })
 
-type fakeArchiveServer struct{ stats postgres.ArchiverStats }
+type fakeArchiveServer struct {
+	stats  postgres.ArchiverStats
+	marker string
+}
 
 func (f fakeArchiveServer) ArchiverStats(context.Context) (postgres.ArchiverStats, error) {
 	return f.stats, nil
 }
-func (f fakeArchiveServer) Close() error { return nil }
+func (f fakeArchiveServer) TailFile(context.Context, string) (string, error) { return f.marker, nil }
+func (f fakeArchiveServer) Close() error                                     { return nil }

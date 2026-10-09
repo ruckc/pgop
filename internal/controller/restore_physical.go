@@ -70,6 +70,9 @@ const (
 	// annotation for this Restore yet.
 	reasonAwaitingConfirmation = "AwaitingConfirmation"
 	reasonWaitingForOldJob     = "WaitingForOldJob"
+	// reasonCreatingJob: the Job name is recorded and the Job is being
+	// created.
+	reasonCreatingJob = "CreatingJob"
 
 	restorePollInterval = 5 * time.Second
 )
@@ -168,7 +171,7 @@ func (r *RestoreReconciler) reconcilePhysicalRestore(ctx context.Context, restor
 
 	// 1. Confirmation and stopping the Cluster.
 	if holder := cluster.Annotations[AnnotationRestoreInProgress]; holder != restore.Name {
-		if ok, msg := restoreConfirmation(cluster, restore, time.Now()); !ok {
+		if ok, msg := restoreConfirmation(cluster, restore); !ok {
 			return r.setPhysicalRestoreState(ctx, restore, postgresv1alpha1.RestorePhasePending, reasonAwaitingConfirmation, msg, 10*time.Second)
 		}
 		if holder != "" && r.restoreActive(ctx, restore.Namespace, holder) {
@@ -209,33 +212,80 @@ func (r *RestoreReconciler) reconcilePhysicalRestore(ctx context.Context, restor
 		}
 		return ctrl.Result{}, err
 	}
-	job := r.buildPhysicalRestoreJob(restore, target)
-	if err := controllerutil.SetControllerReference(restore, job, r.Scheme); err != nil {
+	existing, err := r.restoreJob(ctx, restore)
+	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := r.Create(ctx, job); err != nil {
-		if !apierrors.IsAlreadyExists(err) {
-			return ctrl.Result{}, err
-		}
-		existing := &batchv1.Job{}
-		if err := r.Get(ctx, client.ObjectKeyFromObject(job), existing); client.IgnoreNotFound(err) != nil {
-			return ctrl.Result{}, err
-		}
-		if !metav1.IsControlledBy(existing, restore) {
-			// A Job of an earlier Restore with the same name: it is removed
-			// together with that Restore; never follow it.
-			return r.setPhysicalRestoreProgress(ctx, restore, reasonWaitingForOldJob,
-				fmt.Sprintf("Waiting for Job %s of an earlier Restore to be deleted (delete it if it remains)", job.Name),
-				restorePollInterval)
-		}
+	if existing != nil && !metav1.IsControlledBy(existing, restore) {
+		// A Job of an earlier Restore with the same name: it is removed
+		// together with that Restore; never follow it.
+		return r.setPhysicalRestoreProgress(ctx, restore, reasonWaitingForOldJob,
+			fmt.Sprintf("Waiting for Job %s of an earlier Restore to be deleted (delete it if it remains)", existing.Name),
+			restorePollInterval)
 	}
-	restore.Status.JobName = job.Name
+	// The Job name is recorded before the Job is created: from then on every
+	// path (deletion, a failed lookup) treats the restore as started, so the
+	// Cluster can never start while the Job may write its volume.
+	restore.Status.JobName = restoreJobName(restore)
 	if restore.Status.StartTime == nil {
 		now := metav1.Now()
 		restore.Status.StartTime = &now
 	}
+	return r.setPhysicalRestoreProgress(ctx, restore, reasonCreatingJob,
+		fmt.Sprintf("Creating the restore Job for Cluster %q", cluster.Name), time.Second)
+}
+
+// restoreJobName is the name of a Restore's Job.
+func restoreJobName(restore *postgresv1alpha1.Restore) string {
+	return restore.Name + "-restore"
+}
+
+// restoreJob returns the Job named after the Restore (nil when there is
+// none), read from the API server: right after the Job was created the cache
+// may not have it yet, and a missing Job means the restore was interrupted.
+func (r *RestoreReconciler) restoreJob(ctx context.Context, restore *postgresv1alpha1.Restore) (*batchv1.Job, error) {
+	job := &batchv1.Job{}
+	err := r.reader().Get(ctx, types.NamespacedName{Name: restoreJobName(restore), Namespace: restore.Namespace}, job)
+	if apierrors.IsNotFound(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return job, nil
+}
+
+// reader is the uncached reader (APIReader), or Client in tests.
+func (r *RestoreReconciler) reader() client.Reader {
+	if r.APIReader != nil {
+		return r.APIReader
+	}
+	return r.Client
+}
+
+// createRestoreJob creates the restore Job of a Restore whose Job name is
+// recorded. If the target can no longer be resolved, the restore counts as
+// interrupted: whether a Job ran before cannot be told for sure.
+func (r *RestoreReconciler) createRestoreJob(ctx context.Context, restore *postgresv1alpha1.Restore) (ctrl.Result, error) {
+	target, err := r.resolvePhysicalRestore(ctx, restore)
+	if err != nil {
+		if errors.Is(err, errRestoreInvalid) || apierrors.IsNotFound(err) {
+			if err := r.finishOnCluster(ctx, restore, restoreOutcomeInterrupted); err != nil {
+				return ctrl.Result{}, err
+			}
+			return r.failPhysicalRestore(ctx, restore, fmt.Errorf("%w; %s", err, interruptedHint(restore.Spec.ClusterRef.Name)))
+		}
+		return ctrl.Result{}, err
+	}
+	job := r.buildPhysicalRestoreJob(restore, target)
+	if err := controllerutil.SetControllerReference(restore, job, r.Scheme); err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := r.Create(ctx, job); client.IgnoreAlreadyExists(err) != nil {
+		return ctrl.Result{}, err
+	}
 	return r.setPhysicalRestoreProgress(ctx, restore, reasonRestoring,
-		fmt.Sprintf("Restoring the data directory of Cluster %q", cluster.Name), 10*time.Second)
+		fmt.Sprintf("Restoring the data directory of Cluster %q", target.cluster.Name), 10*time.Second)
 }
 
 // restoreOutcome is how a physical Restore left the Cluster.
@@ -272,6 +322,18 @@ func (o restoreOutcome) result() string {
 // stopped, and a successful restore clears it. The finished Restore is
 // recorded in status.lastRestore.
 func (r *RestoreReconciler) finishOnCluster(ctx context.Context, restore *postgresv1alpha1.Restore, outcome restoreOutcome) error {
+	if outcome == restoreOutcomeReleased {
+		// Defensive: a Job of this Restore means the volume may have been
+		// written (e.g. its name could not be recorded), so the Cluster
+		// must not start.
+		job, err := r.restoreJob(ctx, restore)
+		if err != nil {
+			return err
+		}
+		if job != nil && metav1.IsControlledBy(job, restore) {
+			outcome = restoreOutcomeInterrupted
+		}
+	}
 	cluster := &postgresv1alpha1.Cluster{}
 	if err := r.Get(ctx, types.NamespacedName{Name: restore.Spec.ClusterRef.Name, Namespace: restore.Namespace}, cluster); err != nil {
 		return client.IgnoreNotFound(err)
@@ -323,29 +385,27 @@ func restoreFingerprint(restore *postgresv1alpha1.Restore) string {
 	return hex.EncodeToString(sum[:8])
 }
 
-// restoreRepeatWindow is how long a Restore identical (same name and spec)
-// to the last one finished on the Cluster needs a UID confirmation.
-const restoreRepeatWindow = 24 * time.Hour
-
 // restoreConfirmation checks the Cluster's allow-restore annotation: it must
-// name the Restore ("<name>" or "<name>/<uid>"). Within restoreRepeatWindow
-// of an identical Restore (same name and spec, e.g. a manifest re-applied by
-// GitOps after it was deleted) only "<name>/<uid>" confirms it. Returns
-// whether the Restore is confirmed, or why not.
-func restoreConfirmation(cluster *postgresv1alpha1.Cluster, restore *postgresv1alpha1.Restore, now time.Time) (bool, string) {
+// name the Restore ("<name>" or "<name>/<uid>"). Once the Cluster had a
+// physical restore (status.lastRestore), only "<name>/<uid>" confirms one, so
+// a standing "<name>" approval (e.g. kept in git and re-applied by GitOps)
+// can never run a Restore again. Returns whether the Restore is confirmed, or
+// why not. The Restore spec is immutable, so what was confirmed is what runs.
+func restoreConfirmation(cluster *postgresv1alpha1.Cluster, restore *postgresv1alpha1.Restore) (bool, string) {
 	value := cluster.Annotations[AnnotationAllowRestore]
 	name, uid, withUID := strings.Cut(value, "/")
-	if value == "" || name != restore.Name || (withUID && uid != string(restore.UID)) {
-		return false, fmt.Sprintf("Waiting for confirmation: a physical restore stops Cluster %q and replaces its data. "+
-			"Confirm it by annotating the Cluster with %s=%s (or %s/%s)",
-			cluster.Name, AnnotationAllowRestore, restore.Name, restore.Name, restore.UID)
-	}
 	last := cluster.Status.LastRestore
-	if !withUID && last != nil && last.Name == restore.Name && last.UID != string(restore.UID) &&
-		last.Fingerprint == restoreFingerprint(restore) && now.Sub(last.CompletionTime.Time) < restoreRepeatWindow {
-		return false, fmt.Sprintf("An identical Restore %q already finished on Cluster %q at %s (a re-applied manifest?). "+
-			"To restore again, confirm this Restore by its UID: %s=%s/%s",
-			restore.Name, cluster.Name, last.CompletionTime.UTC().Format(time.RFC3339), AnnotationAllowRestore, restore.Name, restore.UID)
+	needUID := last != nil && last.UID != string(restore.UID)
+	if value == "" || name != restore.Name || (withUID && uid != string(restore.UID)) || (needUID && !withUID) {
+		msg := fmt.Sprintf("Waiting for confirmation: a physical restore stops Cluster %q and replaces its data. "+
+			"Confirm it by annotating the Cluster with %s=%s/%s", cluster.Name, AnnotationAllowRestore, restore.Name, restore.UID)
+		if !needUID {
+			msg += fmt.Sprintf(" (or %s=%s)", AnnotationAllowRestore, restore.Name)
+		} else {
+			msg += fmt.Sprintf("; Restore %q already ran on this Cluster at %s, so only the UID form confirms a new one",
+				last.Name, last.CompletionTime.UTC().Format(time.RFC3339))
+		}
+		return false, msg
 	}
 	return true, ""
 }
@@ -360,12 +420,14 @@ func (r *RestoreReconciler) followPhysicalRestoreJob(ctx context.Context, restor
 		}
 		return ctrl.Result{}, err
 	}
-	job := &batchv1.Job{}
-	err := r.Get(ctx, types.NamespacedName{Name: restore.Status.JobName, Namespace: restore.Namespace}, job)
-	if err != nil && !apierrors.IsNotFound(err) {
+	job, err := r.restoreJob(ctx, restore)
+	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if apierrors.IsNotFound(err) || !metav1.IsControlledBy(job, restore) {
+	if job == nil && restoreReason(restore) == reasonCreatingJob {
+		return r.createRestoreJob(ctx, restore)
+	}
+	if job == nil || !metav1.IsControlledBy(job, restore) {
 		if err := r.finishOnCluster(ctx, restore, restoreOutcomeInterrupted); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -441,52 +503,66 @@ func (r *RestoreReconciler) finalizePhysicalRestore(ctx context.Context, restore
 	if !controllerutil.ContainsFinalizer(restore, restoreFinalizer) {
 		return ctrl.Result{}, nil
 	}
-	switch {
-	case restore.Status.Phase == postgresv1alpha1.RestorePhaseSucceeded || restore.Status.Phase == postgresv1alpha1.RestorePhaseFailed:
-		// Finished; a failed Job's pods have terminated.
-	case restore.Status.JobName == "":
-		if err := r.finishOnCluster(ctx, restore, restoreOutcomeReleased); err != nil {
-			return ctrl.Result{}, err
-		}
-	default:
-		job := &batchv1.Job{}
-		err := r.Get(ctx, types.NamespacedName{Name: restore.Status.JobName, Namespace: restore.Namespace}, job)
-		if err != nil && !apierrors.IsNotFound(err) {
-			return ctrl.Result{}, err
-		}
-		if err == nil && metav1.IsControlledBy(job, restore) {
-			if job.DeletionTimestamp == nil && (jobConditionTrue(job, batchv1.JobComplete) || job.Status.Succeeded > 0) {
-				cluster := &postgresv1alpha1.Cluster{}
-				if err := r.Get(ctx, types.NamespacedName{Name: restore.Spec.ClusterRef.Name, Namespace: restore.Namespace}, cluster); err != nil {
-					return ctrl.Result{}, client.IgnoreNotFound(err)
-				}
-				return r.completePhysicalRestore(ctx, restore, cluster)
-			}
-			if err := r.finishOnCluster(ctx, restore, restoreOutcomeInterrupted); err != nil {
-				return ctrl.Result{}, err
-			}
-			if job.DeletionTimestamp == nil {
-				logf.FromContext(ctx).Info("Restore deleted while restoring; stopping its Job", "job", job.Name)
-				if err := r.Delete(ctx, job, client.PropagationPolicy(metav1.DeletePropagationForeground)); client.IgnoreNotFound(err) != nil {
-					return ctrl.Result{}, err
-				}
-			}
-			return ctrl.Result{RequeueAfter: restorePollInterval}, nil
-		}
-		running, err := r.jobPodsExist(ctx, restore.Namespace, restore.Status.JobName)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		if running {
-			return ctrl.Result{RequeueAfter: restorePollInterval}, nil
-		}
-		if err := r.finishOnCluster(ctx, restore, restoreOutcomeInterrupted); err != nil {
-			return ctrl.Result{}, err
-		}
+	done, err := r.finalizeRestoreJob(ctx, restore)
+	if err != nil || !done {
+		return ctrl.Result{RequeueAfter: restorePollInterval}, err
 	}
 	base := restore.DeepCopy()
 	controllerutil.RemoveFinalizer(restore, restoreFinalizer)
 	return ctrl.Result{}, r.Patch(ctx, restore, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{}))
+}
+
+// finalizeRestoreJob settles the Cluster and the Job of a deleted Restore.
+// Returns whether the finalizer can be removed. Every path ends without a
+// Cluster, Job or Backup to wait for: a missing Cluster or Backup never
+// blocks the deletion.
+func (r *RestoreReconciler) finalizeRestoreJob(ctx context.Context, restore *postgresv1alpha1.Restore) (bool, error) {
+	if restore.Status.Phase == postgresv1alpha1.RestorePhaseSucceeded || restore.Status.Phase == postgresv1alpha1.RestorePhaseFailed {
+		return true, nil // finished; a failed Job's pods have terminated
+	}
+	job, err := r.restoreJob(ctx, restore)
+	if err != nil {
+		return false, err
+	}
+	if job != nil && !metav1.IsControlledBy(job, restore) {
+		job = nil // an earlier Restore's Job, never ours
+	}
+	if restore.Status.JobName == "" && job == nil {
+		// The restore never started: the Cluster starts again.
+		return true, r.finishOnCluster(ctx, restore, restoreOutcomeReleased)
+	}
+	if job != nil && job.DeletionTimestamp == nil && (jobConditionTrue(job, batchv1.JobComplete) || job.Status.Succeeded > 0) {
+		cluster := &postgresv1alpha1.Cluster{}
+		err := r.Get(ctx, types.NamespacedName{Name: restore.Spec.ClusterRef.Name, Namespace: restore.Namespace}, cluster)
+		if apierrors.IsNotFound(err) {
+			return true, nil // the Cluster is gone: nothing to start
+		}
+		if err != nil {
+			return false, err
+		}
+		res, err := r.completePhysicalRestore(ctx, restore, cluster)
+		if err != nil || res.RequeueAfter > 0 {
+			return false, err
+		}
+		return true, nil
+	}
+	// Started and not (known to be) complete: the data directory may be
+	// partly restored. Keep the Cluster stopped, stop the Job and wait until
+	// none of its pods exists.
+	if err := r.finishOnCluster(ctx, restore, restoreOutcomeInterrupted); err != nil {
+		return false, err
+	}
+	if job != nil {
+		if job.DeletionTimestamp == nil {
+			logf.FromContext(ctx).Info("Restore deleted while restoring; stopping its Job", "job", job.Name)
+			if err := r.Delete(ctx, job, client.PropagationPolicy(metav1.DeletePropagationForeground)); client.IgnoreNotFound(err) != nil {
+				return false, err
+			}
+		}
+		return false, nil
+	}
+	running, err := r.jobPodsExist(ctx, restore.Namespace, restoreJobName(restore))
+	return err == nil && !running, err
 }
 
 // jobPodsExist reports whether any pod of the named Job still exists. Job
@@ -667,4 +743,12 @@ exec ` + pgbackrestBin + ` restore "$@"
 		{Name: volPgbackrestTmp, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
 	}, caVolumes...)
 	return job
+}
+
+// restoreReason is the reason of the Restore's Available condition.
+func restoreReason(restore *postgresv1alpha1.Restore) string {
+	if c := meta.FindStatusCondition(restore.Status.Conditions, ConditionTypeAvailable); c != nil {
+		return c.Reason
+	}
+	return ""
 }

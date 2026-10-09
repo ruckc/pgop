@@ -97,11 +97,20 @@ Restore finishes (succeeded, failed or deleted), so a confirmation is used
 once.
 
 The Cluster records the last finished Restore in `status.lastRestore` (name,
-UID, a fingerprint of its spec, result and time). A Restore with the **same
-name and spec** within 24 hours of it, typically the same manifest applied
-again by GitOps after it was pruned, is only accepted when confirmed by its
-UID (`pgop.ruck.io/allow-restore=<name>/<uid>`), since a name-only annotation
-could be re-applied by the same tooling.
+UID, a fingerprint of its spec, result and time). **Once a Cluster had a
+physical restore, only the UID form confirms a new one**
+(`pgop.ruck.io/allow-restore=<name>/$(kubectl get restore <name> -o jsonpath='{.metadata.uid}')`):
+a name-only approval could be re-applied by tooling and re-run the same
+Restore manifest.
+
+The Restore `spec` is immutable (the API server rejects changes), so what was
+confirmed is what runs.
+
+!!! danger "Never commit `pgop.ruck.io/allow-restore` to git"
+    The annotation is a one-time, interactive approval. Kept in a Cluster
+    manifest, a GitOps tool would re-add it after pgop removed it, which turns
+    it into a standing approval. Apply it with `kubectl annotate`, and exclude
+    it from drift detection if your tool reports it.
 
 ### What happens
 
@@ -112,7 +121,9 @@ and other Clusters are not affected:
    `pgop.ruck.io/restore-in-progress: <restore>` on the Cluster; the Cluster
    controller scales the StatefulSet to 0 and reports
    `Available=False` (`PausedForRestore`).
-2. **Restore.** Once no PostgreSQL pod runs, it runs the Job
+2. **Restore.** Once no PostgreSQL pod runs, it records the Job name in the
+   Restore status (from then on the restore counts as started: deleting the
+   Restore can no longer start the Cluster) and runs the Job
    `<restore>-restore`: the pgBackRest image, as UID 999, with the primary's
    volume `data-<cluster>-0` mounted. It runs `pgbackrest restore --delta`
    (only changed files are rewritten), which also writes `recovery.signal`
@@ -158,8 +169,14 @@ start on an incomplete restore instead of running on mixed data; but a restore
 that was interrupted early may have left the previous data without its
 `pg_control`, which then needs a new restore as well.
 
-A Restore deleted before its Job started (still `Pending` or stopping the
-Cluster) leaves the data untouched, and the Cluster simply starts again.
+A Restore deleted before it recorded its Job name (still `Pending` or
+stopping the Cluster), with no Job of it existing, leaves the data untouched,
+and the Cluster simply starts again. From the moment the Job name is recorded
+(condition reason `CreatingJob`), any interruption, including a Restore whose
+target (BackupRun, Backup) disappears while its Job is created, counts as
+interrupted: whether the Job ran cannot be told for sure, so the Cluster stays
+stopped. pgop also never starts the Cluster while a Job of the Restore
+exists.
 
 ### Disaster recovery
 

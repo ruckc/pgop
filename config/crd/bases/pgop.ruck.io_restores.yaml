@@ -113,6 +113,9 @@ spec:
             - clusterRef
             - type
             type: object
+            x-kubernetes-validations:
+            - message: spec is immutable; create a new Restore instead
+              rule: self == oldSelf
           status:
             description: RestoreStatus defines the observed state of Restore.
             properties:

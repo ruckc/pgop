@@ -135,14 +135,25 @@ func postgresMajor(cluster *postgresv1alpha1.Cluster) int {
 	return parsePostgresMajor(cmp.Or(cluster.Spec.Image, DefaultPostgresImage))
 }
 
-// swappableTagPattern matches the tags of the official postgres image whose
-// variant is Debian trixie, the base of pgop's Postgres+pgBackRest image:
-// "<major>[.<minor>]" (the default variant, trixie since PostgreSQL 18 and
-// the 2025 Debian release) and "<major>[.<minor>]-trixie". Other variants
-// (alpine/musl, bookworm, bullseye) use a different C library or glibc
-// release, whose collations may differ: swapping the image could silently
-// corrupt text indexes.
-var swappableTagPattern = regexp.MustCompile(`^[0-9]+(\.[0-9]+)?(-trixie)?$`)
+// Tags of the official postgres image pgop may replace with its Debian
+// trixie Postgres+pgBackRest image without changing the C library (and so
+// the collations text indexes depend on):
+//
+//   - trixieTagPattern: "<major>[.<minor>]-trixie", trixie by name;
+//   - bareTagPattern: "<major>[.<minor>]", the default variant. It is trixie
+//     for every released PostgreSQL 18 image, but was Debian bookworm (an
+//     older glibc) for 16 and 17 until August 2025, so for those the swap
+//     needs spec.physical.acceptImageSwap.
+//
+// Everything else (alpine/musl, bookworm, bullseye, digests, "latest") is
+// refused: swapping could silently corrupt text indexes.
+var (
+	trixieTagPattern = regexp.MustCompile(`^[0-9]+(\.[0-9]+)?-trixie$`)
+	bareTagPattern   = regexp.MustCompile(`^[0-9]+(\.[0-9]+)?$`)
+)
+
+// alwaysTrixieMajor is the first major whose bare tags were always trixie.
+const alwaysTrixieMajor = 18
 
 // imageTag returns the tag of an image reference ("" without one, e.g. a
 // digest-only reference).
@@ -178,12 +189,22 @@ func postgresImageForBackups(cluster *postgresv1alpha1.Cluster, backup *postgres
 	if !isOfficialPostgresImage(image) {
 		return "", fmt.Errorf("%w: %q is not the official postgres image; %s", errUnsupportedBackupImage, image, hint)
 	}
-	if tag := imageTag(image); !swappableTagPattern.MatchString(tag) {
+	major := postgresMajor(cluster)
+	tag := imageTag(image)
+	switch {
+	case trixieTagPattern.MatchString(tag):
+	case bareTagPattern.MatchString(tag) && major >= alwaysTrixieMajor:
+	case bareTagPattern.MatchString(tag) && backup.Spec.Physical != nil && backup.Spec.Physical.AcceptImageSwap:
+	case bareTagPattern.MatchString(tag):
+		return "", fmt.Errorf("%w: %q: this tag was Debian bookworm until August 2025, and pgop's image is Debian trixie, "+
+			"whose glibc collations can differ; if the Cluster was initialized on a trixie image (or its text indexes are "+
+			"rebuilt after the change), set spec.physical.acceptImageSwap=true on the Backup",
+			errUnsupportedBackupImage, image)
+	default:
 		return "", fmt.Errorf("%w: %q: only the Debian trixie variant of the official image (tags like \"18\", \"18.1\", "+
-			"\"18-trixie\") is replaced by pgop's Postgres+pgBackRest image (other variants use a different C library, "+
+			"\"17-trixie\") is replaced by pgop's Postgres+pgBackRest image (other variants use a different C library, "+
 			"whose collations may differ); %s", errUnsupportedBackupImage, image, hint)
 	}
-	major := postgresMajor(cluster)
 	if !slices.Contains(supportedPgopPostgresMajors, major) {
 		return "", fmt.Errorf("%w: PostgreSQL %d: pgop builds Postgres+pgBackRest images for %v only; %s",
 			errUnsupportedBackupImage, major, supportedPgopPostgresMajors, hint)
@@ -410,9 +431,24 @@ func s3CAVolume(backup *postgresv1alpha1.Backup) ([]corev1.Volume, []corev1.Volu
 
 // archiveCommand is the operator-owned archive_command. The repository
 // settings come from the environment of the postgresql container.
+//
+// pgBackRest reports success to PostgreSQL when it drops a segment because
+// the queue exceeded archive-push-queue-max (it only logs a warning), so
+// pg_stat_archiver cannot show it. The command therefore wraps archive-push:
+// its output still goes to the server log, and a drop is appended to
+// $PGDATA/walDropMarkerFile ("<UTC time> <segment>"), which the operator
+// reads (see archive_health.go). "%%" is PostgreSQL's escape for "%".
 func archiveCommand() string {
-	return pgbackrestBin + " --stanza=" + pgbackrestStanza + " archive-push %p"
+	return `out=$(` + pgbackrestBin + ` --stanza=` + pgbackrestStanza + ` archive-push "%p" 2>&1); rc=$?; ` +
+		`printf '%%s\n' "$out" >&2; ` +
+		`case "$out" in *"dropped WAL file"*) ` +
+		`printf '%%s %%s\n' "$(date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ)" "%f" >> "$PGDATA/` + walDropMarkerFile + `";; esac; ` +
+		`exit $rc`
 }
+
+// walDropMarkerFile, in the data directory, records the WAL segments
+// pgBackRest dropped (see archiveCommand).
+const walDropMarkerFile = "pgop-wal-dropped"
 
 // pgbackrestServerArgs are the server options for WAL archiving.
 func pgbackrestServerArgs() []string {
@@ -680,4 +716,20 @@ func clustersForBackup(_ context.Context, obj client.Object) []reconcile.Request
 		return nil
 	}
 	return []reconcile.Request{{NamespacedName: client.ObjectKey{Namespace: b.Namespace, Name: b.Spec.ClusterRef.Name}}}
+}
+
+// keptPgopImage returns the pgop Postgres+pgBackRest image the StatefulSet
+// runs, when the Cluster no longer has a (valid) physical Backup but its
+// spec.image is the official image of the same major: switching back could
+// change the C library across glibc releases, so pgop keeps its image (only
+// archiving and the sidecar are removed). "" otherwise.
+func keptPgopImage(cluster *postgresv1alpha1.Cluster, running string) string {
+	if !strings.HasPrefix(running, pgopPostgresImageRepository+":") {
+		return ""
+	}
+	image := cmp.Or(cluster.Spec.Image, DefaultPostgresImage)
+	if !isOfficialPostgresImage(image) || parsePostgresMajor(running) != postgresMajor(cluster) {
+		return ""
+	}
+	return running
 }

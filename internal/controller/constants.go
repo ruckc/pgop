@@ -226,6 +226,11 @@ const (
 	// ConditionTypeWALArchiving reports WAL archiving health from
 	// pg_stat_archiver while the Cluster has a physical Backup.
 	ConditionTypeWALArchiving = "WALArchiving"
+	// ConditionTypePhysicalBackup reports on the Cluster whether WAL is
+	// archived for a physical Backup: True (Enabled), False (Invalid: a
+	// physical Backup names the Cluster but cannot be used; Disabled: none,
+	// while pgop's image is kept). Absent for Clusters that never had one.
+	ConditionTypePhysicalBackup = "PhysicalBackup"
 	// ConditionTypeRestoreInterrupted is True while the Cluster is stopped
 	// because a physical restore did not complete (see
 	// AnnotationRestoreInterrupted).

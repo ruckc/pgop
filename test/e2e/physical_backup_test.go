@@ -119,7 +119,9 @@ spec:
 					`jsonpath={.status.conditions[?(@.type=="Available")].reason}`)).To(Equal("AwaitingConfirmation"))
 			}).Should(Succeed())
 			Expect(get(Default, "cluster", name, "-o", "jsonpath={.status.ready}")).To(Equal("true"), "not stopped yet")
-			_, err := kubectl("annotate", "cluster", name, "--overwrite", "pgop.ruck.io/allow-restore="+restoreName)
+			// The UID form: after the first restore the Cluster only accepts it.
+			uid := get(Default, "restore.pgop.ruck.io", restoreName, "-o", "jsonpath={.metadata.uid}")
+			_, err := kubectl("annotate", "cluster", name, "--overwrite", "pgop.ruck.io/allow-restore="+restoreName+"/"+uid)
 			Expect(err).NotTo(HaveOccurred())
 
 			Eventually(func(g Gomega) {
@@ -225,6 +227,8 @@ spec:
 			waitReady()
 			Expect(mustSQL("SHOW archive_mode")).To(Equal("on"))
 			Expect(mustSQL("SHOW archive_command")).To(ContainSubstring("pgbackrest"))
+			Expect(get(Default, "cluster", name, "-o",
+				`jsonpath={.status.conditions[?(@.type=="PhysicalBackup")].status}`)).To(Equal("True"))
 			Expect(get(Default, "backup.pgop.ruck.io", backupName, "-o",
 				`jsonpath={.status.conditions[?(@.type=="Available")].status}`)).To(Equal("True"))
 
