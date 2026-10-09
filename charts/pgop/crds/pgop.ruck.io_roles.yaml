@@ -280,8 +280,8 @@ spec:
                   metadata.name when unset, and lets the PostgreSQL name use characters
                   (such as underscores) that Kubernetes object names do not allow.
                   It must be a lowercase unquoted identifier, must not start with "pg_",
-                  must not be a reserved name (postgres, pgop_operator), and cannot be
-                  changed after creation.
+                  must not be a reserved name (postgres, pgop_operator, pgop_replicator),
+                  and cannot be changed after creation.
                 maxLength: 63
                 minLength: 1
                 pattern: ^[a-z_][a-z0-9_]*$
@@ -289,8 +289,9 @@ spec:
                 x-kubernetes-validations:
                 - message: roleName must not start with 'pg_' (reserved by PostgreSQL)
                   rule: '!self.startsWith(''pg_'')'
-                - message: roleName must not be a reserved role name (postgres, pgop_operator)
-                  rule: '!(self in [''postgres'', ''pgop_operator''])'
+                - message: roleName must not be a reserved role name (postgres, pgop_operator,
+                    pgop_replicator)
+                  rule: '!(self in [''postgres'', ''pgop_operator'', ''pgop_replicator''])'
               superuser:
                 description: superuser grants superuser privileges to the role
                 type: boolean

@@ -294,6 +294,7 @@ var _ = Describe("Cluster parameters", func() {
 		sts.Status.Replicas = 1
 		sts.Status.ReadyReplicas = 1
 		Expect(k8sClient.Status().Update(ctx, sts)).To(Succeed())
+		ensureSTSPod(sts, 0, true)
 	}
 	getConfigMap := func() (*corev1.ConfigMap, error) {
 		cm := &corev1.ConfigMap{}

@@ -261,10 +261,11 @@ echo "Uploaded to $DEST"
 										secretEnv("PGUSER", clusterSecretName, SecretKeyUsername),
 										secretEnv("PGPASSWORD", clusterSecretName, SecretKeyPassword),
 										{
-											// The Service FQDN: the name the server
+											// The FQDN of the Service that routes to
+											// the primary only, and the name the server
 											// certificate is validated for (verify-full).
 											Name:  envPGHost,
-											Value: fmt.Sprintf("%s.%s.svc.cluster.local", cluster.Name, backup.Namespace),
+											Value: clusterHost(cluster),
 										},
 										{
 											Name:  envPGPort,
@@ -411,7 +412,7 @@ func (r *BackupReconciler) reconcilePhysicalCronJob(
 	if pgPort == 0 {
 		pgPort = 5432
 	}
-	pgHost := fmt.Sprintf("%s.%s.svc.cluster.local", cluster.Name, backup.Namespace)
+	pgHost := clusterHost(cluster)
 
 	envVars := r.buildS3EnvVars(backup)
 	ttlSeconds := int32(300)

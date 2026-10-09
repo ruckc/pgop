@@ -13,7 +13,9 @@ spec:
   # PostgreSQL container image (default: postgres:18)
   image: string
 
-  # Number of replicas (default: 1, max: 1)
+  # Number of PostgreSQL instances (default: 1, max: 10): pod <cluster>-0 is
+  # the primary, the others are asynchronous streaming hot standbys. No
+  # automated failover. See User Guide -> Replication.
   replicas: integer
 
   # PostgreSQL port (default: 5432)
@@ -53,20 +55,25 @@ spec:
   # data_directory, hba_file, ident_file, external_pid_file, include,
   # include_dir, include_if_exists, ssl, ssl_cert_file, ssl_key_file,
   # ssl_min_protocol_version, archive_mode, archive_command, archive_library,
-  # restore_command) are rejected.
+  # restore_command, wal_level, max_wal_senders, max_replication_slots,
+  # hot_standby, primary_conninfo, primary_slot_name) are rejected.
   parameters:
     <name>: string
 ```
 
-See [Clusters → TLS](../user-guide/clusters.md#tls) and
-[Clusters → Parameters](../user-guide/clusters.md#parameters) for details.
+See [Clusters → TLS](../user-guide/clusters.md#tls),
+[Clusters → Parameters](../user-guide/clusters.md#parameters) and
+[Replication](../user-guide/replication.md) for details.
 
 ### ClusterStatus
 
 ```yaml
 status:
   ready: boolean           # Cluster is accepting connections
-  endpoint: string         # Service endpoint (host:port)
+  endpoint: string         # Read-write Service endpoint (host:port); always the primary
+  readOnlyEndpoint: string # Read-only Service endpoint <cluster>-ro (host:port); only with replicas > 1
+  readyInstances: integer  # Number of ready PostgreSQL pods (primary and standbys)
+  currentPrimary: string   # Name of the pod running the primary (<cluster>-0)
   secretName: string       # Credentials secret name
   tlsSecretHash: string    # Hash of the certificate the server was last confirmed to present
   parametersHash: string   # Hash of the generated config file last reloaded (spec.parameters only)
@@ -83,9 +90,10 @@ Condition types:
 
 | Type | Meaning |
 |------|---------|
-| `Available` | `True` (reason `ClusterReady`) once the StatefulSet is ready. |
+| `Available` | `True` (reason `ClusterReady`) while the primary pod is ready. Standbys never affect it (nor `status.ready`, `TLSReady`, the `sslmode` published to clients, or Role/Database reconciles); their health is reported by `status.readyInstances` and `ReplicationHealthy`. |
+| `ReplicationHealthy` | Only present while `spec.replicas` is greater than 1. `True` (reason `Streaming`) when every standby streams from the primary. `False` with reason `StandbyNotStreaming` (a standby is still being cloned, catching up, or disconnected; the message names it), `WaitingForPrimary` (the primary pod is not ready) or `ReplicationError` (the operator could not set up the replication role or slots on the primary). When a standby's replication slot was invalidated, the message says which standby to re-clone and a `ReplicationSlotInvalidated` Warning event is recorded. Never affects `Available`. |
 | `ExistingVolume` | Set once when the StatefulSet is created. `True` (reason `PreExistingPVC`) if the data PVC already existed, so PostgreSQL started on retained data; `False` (reason `NewVolume`) otherwise. Never recomputed afterwards. |
-| `TLSReady` | Only present while `spec.tls` is set. `True` (reason `TLSActive`) once the server presents the certificate from its TLS Secret (`spec.tls.secretName`, `<cluster>-server-tls` for `issuerRef`, `<cluster>-server-cert` for the self-managed CA). `False` with reason `InvalidTLSSecret` (Secret missing/incomplete/unusable, or a Secret the operator would manage exists and is not owned by the Cluster; the StatefulSet is left unchanged), `CertManagerUnavailable` (`issuerRef` set but cert-manager is not installed), `CertificatePending` (cert-manager has not issued the certificate yet), `WaitingForServer` (pod not ready or not serving TLS yet) or `CertificateReloading` (a rotated certificate is not loaded yet; the operator ran `pg_reload_conf()`, or restarted the pod because the new CA cannot verify the old certificate). |
+| `TLSReady` | Only present while `spec.tls` is set. `True` (reason `TLSActive`) once the primary presents the certificate from its TLS Secret (`spec.tls.secretName`, `<cluster>-server-tls` for `issuerRef`, `<cluster>-server-cert` for the self-managed CA). `False` with reason `InvalidTLSSecret` (Secret missing/incomplete/unusable, or a Secret the operator would manage exists and is not owned by the Cluster; the StatefulSet is left unchanged), `CertManagerUnavailable` (`issuerRef` set but cert-manager is not installed), `CertificatePending` (cert-manager has not issued the certificate yet), `WaitingForServer` (pod not ready or not serving TLS yet) or `CertificateReloading` (a rotated certificate is not loaded yet; the operator ran `pg_reload_conf()`, or restarted the pod because the new CA cannot verify the old certificate). |
 | `ParametersApplied` | Only present while `spec.parameters` is set. `True` (reason `Applied`) once every parameter is in effect. `False` with reason `WaitingForServer` (pod not ready, rollout in progress, or no connection), `WaitingForSync` (the server does not see the current configuration file yet), `Reloading` (`pg_reload_conf()` ran; checking the result), `PendingRestart` (a parameter needs a restart; the operator restarts the pod once), `InvalidParameter` (the server rejects a name or value; nothing is reloaded or restarted) or `OverriddenByAlterSystem` (`ALTER SYSTEM` overrides a parameter). Never affects `Available`. |
 
 ---
@@ -104,7 +112,7 @@ spec:
 
   # Optional PostgreSQL role name (default: metadata.name). Immutable.
   # Must match ^[a-z_][a-z0-9_]*$, max 63 chars, no "pg_" prefix,
-  # not "postgres" or "pgop_operator".
+  # not "postgres", "pgop_operator" or "pgop_replicator".
   roleName: string
 
   # PostgreSQL role options
@@ -339,8 +347,12 @@ storage:
   retainPolicy: string     # Optional: Retain (default) | Delete
 ```
 
-`retainPolicy` controls what happens to the data PVC (`data-<cluster>-0`) when
-the Cluster is deleted. `Retain` keeps it; `Delete` removes it with the Cluster.
-It maps onto the StatefulSet `persistentVolumeClaimRetentionPolicy.whenDeleted`
-(`whenScaled` is always `Retain`) and requires Kubernetes 1.27+. The field is
-mutable; changing it updates the StatefulSet in place.
+`retainPolicy` controls what happens to the data PVCs (`data-<cluster>-<n>`)
+when the Cluster is deleted. `Retain` keeps them; `Delete` removes them with
+the Cluster. It maps onto the StatefulSet
+`persistentVolumeClaimRetentionPolicy.whenDeleted` (`whenScaled` is always
+`Retain`, so a scale-down never deletes the primary's volume) and requires
+Kubernetes 1.27+. The field is mutable; changing it updates the StatefulSet in
+place. When `spec.replicas` is lowered, the operator itself deletes the data
+PVCs of the removed standbys (never `data-<cluster>-0`) once their pods are
+gone, so a standby added later is cloned afresh.

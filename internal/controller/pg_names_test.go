@@ -110,7 +110,7 @@ var _ = Describe("PostgreSQL name overrides", func() {
 			cleanup(role)
 		})
 
-		for _, name := range append(invalidNames, "pg_foo", "postgres", "pgop_operator") {
+		for _, name := range append(invalidNames, "pg_foo", "postgres", "pgop_operator", "pgop_replicator") {
 			It(fmt.Sprintf("rejects %q", name), func() {
 				err := k8sClient.Create(ctx, newRole("bad-"+suffix, name))
 				Expect(apierrors.IsInvalid(err)).To(BeTrue(), "expected Invalid, got %v", err)

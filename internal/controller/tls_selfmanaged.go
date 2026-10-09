@@ -103,13 +103,26 @@ func selfManagedServerSecretName(cluster *postgresv1alpha1.Cluster) string {
 
 // serverDNSNames are the SANs of operator-requested server certificates. The
 // fully qualified Service name comes first: it is what verify-full checks.
+// With more than one instance the names of the read-only Service follow, so
+// clients can verify the standbys too (every instance serves the same
+// certificate).
 func serverDNSNames(cluster *postgresv1alpha1.Cluster) []string {
-	return []string{
+	names := []string{
 		clusterHost(cluster),
 		fmt.Sprintf("%s.%s.svc", cluster.Name, cluster.Namespace),
 		fmt.Sprintf("%s.%s", cluster.Name, cluster.Namespace),
 		cluster.Name,
 	}
+	if desiredReplicas(cluster) > 1 {
+		ro := readOnlyServiceName(cluster)
+		names = append(names,
+			readOnlyHost(cluster),
+			fmt.Sprintf("%s.%s.svc", ro, cluster.Namespace),
+			fmt.Sprintf("%s.%s", ro, cluster.Namespace),
+			ro,
+		)
+	}
+	return names
 }
 
 // keyPair is a parsed certificate and its private key.

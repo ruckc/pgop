@@ -72,8 +72,11 @@ func hbaConfigMapName(cluster *postgresv1alpha1.Cluster) string {
 	return cluster.Name + "-hba"
 }
 
-// clusterHost is the in-cluster DNS name of the Cluster's Service. Server
-// certificates must carry it as a SAN for verify-full to succeed.
+// clusterHost is the in-cluster DNS name of the Cluster's Service, which only
+// ever routes to the primary. Everything that writes (the operator, Role and
+// Database reconciles, backups, restores) and the standbys' replication
+// connections use it. Server certificates must carry it as a SAN for
+// verify-full to succeed.
 func clusterHost(cluster *postgresv1alpha1.Cluster) string {
 	return fmt.Sprintf("%s.%s.svc.cluster.local", cluster.Name, cluster.Namespace)
 }
@@ -216,7 +219,7 @@ func postgresTLSArgs(spec *postgresv1alpha1.ClusterTLSSpec) []string {
 		"-c", "ssl_min_protocol_version=" + string(spec.GetMinProtocolVersion()),
 	}
 	if spec.IsRequireTLS() {
-		args = append(args, "-c", "hba_file="+hbaMountPath+"/"+hbaFileName)
+		args = append(args, "-c", hbaFileArg())
 	}
 	return args
 }
@@ -238,20 +241,43 @@ func postgresTLSVolumes(cluster *postgresv1alpha1.Cluster) ([]corev1.Volume, []c
 			},
 		},
 	}}
-	mounts := []corev1.VolumeMount{{Name: tlsVolumeName, MountPath: tlsMountPath, ReadOnly: true}}
+	mounts := []corev1.VolumeMount{tlsVolumeMount()}
 	if spec.IsRequireTLS() {
-		volumes = append(volumes, corev1.Volume{
-			Name: hbaVolumeName,
-			VolumeSource: corev1.VolumeSource{
-				ConfigMap: &corev1.ConfigMapVolumeSource{
-					LocalObjectReference: corev1.LocalObjectReference{Name: hbaConfigMapName(cluster)},
-					DefaultMode:          new(hbaFileMode),
-				},
-			},
-		})
-		mounts = append(mounts, corev1.VolumeMount{Name: hbaVolumeName, MountPath: hbaMountPath, ReadOnly: true})
+		volumes = append(volumes, hbaVolume(cluster))
+		mounts = append(mounts, hbaVolumeMount())
 	}
 	return volumes, mounts
+}
+
+// tlsVolumeMount mounts the server certificate Secret.
+func tlsVolumeMount() corev1.VolumeMount {
+	return corev1.VolumeMount{Name: tlsVolumeName, MountPath: tlsMountPath, ReadOnly: true}
+}
+
+// hbaVolume is the pod volume of the operator-managed pg_hba ConfigMap.
+func hbaVolume(cluster *postgresv1alpha1.Cluster) corev1.Volume {
+	return corev1.Volume{
+		Name: hbaVolumeName,
+		VolumeSource: corev1.VolumeSource{
+			ConfigMap: &corev1.ConfigMapVolumeSource{
+				LocalObjectReference: corev1.LocalObjectReference{Name: hbaConfigMapName(cluster)},
+				DefaultMode:          new(hbaFileMode),
+			},
+		},
+	}
+}
+
+// hbaVolumeMount mounts the operator-managed pg_hba ConfigMap.
+func hbaVolumeMount() corev1.VolumeMount {
+	return corev1.VolumeMount{Name: hbaVolumeName, MountPath: hbaMountPath, ReadOnly: true}
+}
+
+// hbaFileArg is the server option that loads the operator-managed pg_hba.
+func hbaFileArg() string { return "hba_file=" + hbaMountPath + "/" + hbaFileName }
+
+// tlsRequired reports whether spec.tls.requireTLS is in effect.
+func tlsRequired(cluster *postgresv1alpha1.Cluster) bool {
+	return cluster.Spec.TLS != nil && cluster.Spec.TLS.IsRequireTLS()
 }
 
 // errServerTLSUnavailable means the server answered the SSLRequest with 'N'.

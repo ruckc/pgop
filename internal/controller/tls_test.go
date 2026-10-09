@@ -378,6 +378,7 @@ var _ = Describe("Cluster TLS", func() {
 		sts.Status.Replicas = 1
 		sts.Status.ReadyReplicas = 1
 		Expect(k8sClient.Status().Update(ctx, sts)).To(Succeed())
+		ensureSTSPod(sts, 0, true)
 	}
 
 	tlsCondition := func() *metav1.Condition {

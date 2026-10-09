@@ -139,9 +139,66 @@ const (
 	ReasonPreExistingPVC        = "PreExistingPVC"
 	ReasonNewVolume             = "NewVolume"
 
+	// LabelRole is set by the operator on every PostgreSQL pod: primary or
+	// replica. The "<cluster>-ro" Service selects role=replica.
+	LabelRole        = "pgop.ruck.io/role"
+	LabelRolePrimary = "primary"
+	LabelRoleReplica = "replica"
+	// LabelStatefulSetPodName is set by the StatefulSet controller on each of
+	// its pods. The "<cluster>" Service selects the primary pod by it, so the
+	// read-write Service keeps routing to the primary even when the primary
+	// pod was recreated while the operator was not running.
+	LabelStatefulSetPodName = "statefulset.kubernetes.io/pod-name"
+
+	// LabelStreaming is set by the operator on standby pods: "true" while the
+	// standby streams from the primary (pg_stat_replication). The
+	// "<cluster>-ro" Service only selects streaming standbys.
+	LabelStreaming = "pgop.ruck.io/streaming"
+	labelValueTrue = "true"
+
+	// AnnotationPasswordSyncRestart on the credentials Secret records that
+	// the primary was restarted once because it rejected the operator
+	// password (value: fingerprint of that password).
+	AnnotationPasswordSyncRestart = "pgop.ruck.io/password-sync-restart"
+	// AnnotationAllowPrimaryInit on a Cluster ("true") allows the primary to
+	// initialize an empty data directory although the Cluster held data
+	// before (see initializedMarkerKey).
+	AnnotationAllowPrimaryInit = "pgop.ruck.io/allow-primary-init"
+
+	// ReplicationUsername is the role standbys use for streaming replication.
+	ReplicationUsername = "pgop_replicator"
+	// SecretKeyReplicationPassword is the credentials Secret key holding the
+	// password of ReplicationUsername.
+	SecretKeyReplicationPassword = "replication-password"
+	// AnnotationReplicationPasswordFingerprint on the credentials Secret is
+	// the salted fingerprint of the replication password last set in
+	// PostgreSQL.
+	AnnotationReplicationPasswordFingerprint = "pgop.ruck.io/replication-password-fingerprint"
+	// AnnotationReplicationPasswordRollout on the credentials Secret records
+	// (unix time) that the replication password changed and the standbys
+	// started before then are being restarted one at a time.
+	AnnotationReplicationPasswordRollout = "pgop.ruck.io/replication-password-rollout"
+
+	// ConditionTypeReplicationHealthy reports whether every standby streams
+	// from the primary. Only set while spec.replicas is greater than 1.
+	ConditionTypeReplicationHealthy = "ReplicationHealthy"
+	// ReasonStreaming: every standby streams from the primary.
+	ReasonStreaming = "Streaming"
+	// ReasonStandbyNotStreaming: at least one standby is not (yet) streaming.
+	ReasonStandbyNotStreaming = "StandbyNotStreaming"
+	// ReasonWaitingForPrimary: the primary is not ready, so replication
+	// cannot be set up or checked.
+	ReasonWaitingForPrimary = "WaitingForPrimary"
+	// ReasonReplicationError: the operator could not set up or check
+	// replication on the primary.
+	ReasonReplicationError = "ReplicationError"
+
 	// dataVolumeName is the name of the StatefulSet volumeClaimTemplate; the
 	// StatefulSet controller names PVCs "<dataVolumeName>-<sts>-<ordinal>".
 	dataVolumeName = "data"
+	// defaultStorageSize is the data volume size when spec.storage.size is
+	// unset.
+	defaultStorageSize = "1Gi"
 
 	envAWSAccessKeyID     = "AWS_ACCESS_KEY_ID"
 	envAWSSecretAccessKey = "AWS_SECRET_ACCESS_KEY"

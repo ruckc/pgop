@@ -4,6 +4,8 @@ metadata:
   name: example-cluster
 spec:
   image: postgres:18
+  # Total PostgreSQL instances: 1 primary plus (replicas - 1) streaming
+  # read-only standbys, reachable through the Service <name>-ro.
   replicas: 1
   port: 5432
   storage:
