@@ -178,6 +178,59 @@ type RoleSpec struct {
 	// passwordSecretRef.
 	// +optional
 	PasswordRotation *PasswordRotationSpec `json:"passwordRotation,omitempty"`
+
+	// parameterGrants grants privileges on configuration parameters to this
+	// role (GRANT SET ON PARAMETER), so it can change superuser-only
+	// parameters in its sessions. Requires PostgreSQL 15 or later. Grants
+	// that pgop made (tracked in status.managedParameterGrants) are revoked
+	// once they are removed from the spec.
+	// +optional
+	// +listType=map
+	// +listMapKey=parameter
+	// +kubebuilder:validation:MaxItems=256
+	ParameterGrants []ParameterGrantSpec `json:"parameterGrants,omitempty"`
+}
+
+// ParameterGrantSpec grants privileges on a configuration parameter.
+type ParameterGrantSpec struct {
+	// parameter is the configuration parameter name, for example
+	// log_statement or a custom parameter such as myapp.tenant_id.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=127
+	// +kubebuilder:validation:Pattern=`^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$`
+	Parameter string `json:"parameter"`
+
+	// privileges lists the privileges to grant. Only SET is supported (the
+	// default): ALTER SYSTEM would let the role rewrite the server
+	// configuration and is deliberately not offered.
+	// +optional
+	// +kubebuilder:default={"SET"}
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=1
+	// +kubebuilder:validation:items:Enum=SET
+	Privileges []string `json:"privileges,omitempty"`
+
+	// withGrantOption allows the role to grant the same privileges to others.
+	// Turning it off for a grant pgop made revokes the grant option.
+	// +optional
+	WithGrantOption bool `json:"withGrantOption,omitempty"`
+}
+
+// ManagedParameterGrant records privileges on a configuration parameter that
+// pgop granted to the role.
+type ManagedParameterGrant struct {
+	// parameter is the parameter name, normalized to lowercase.
+	Parameter string `json:"parameter"`
+
+	// privileges are the granted privileges.
+	// +listType=set
+	Privileges []string `json:"privileges"`
+
+	// withGrantOption records whether pgop granted the privileges with the
+	// grant option.
+	// +optional
+	WithGrantOption bool `json:"withGrantOption,omitempty"`
 }
 
 // RoleStatus defines the observed state of Role.
@@ -220,6 +273,14 @@ type RoleStatus struct {
 	// +optional
 	// +listType=set
 	ManagedMemberships []string `json:"managedMemberships,omitempty"`
+
+	// managedParameterGrants lists the parameter privileges pgop has granted
+	// to this role. Only these are revoked when they are removed from
+	// spec.parameterGrants.
+	// +optional
+	// +listType=map
+	// +listMapKey=parameter
+	ManagedParameterGrants []ManagedParameterGrant `json:"managedParameterGrants,omitempty"`
 
 	// conditions represent the current state of the Role resource.
 	// +listType=map

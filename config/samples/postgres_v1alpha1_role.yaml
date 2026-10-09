@@ -20,5 +20,9 @@ spec:
   #     inherit: true
   #     set: false
   #     admin: false
+  # Optional privileges to SET superuser-only parameters (PostgreSQL 15+).
+  # Only SET is supported. Removed entries are revoked.
+  # parameterGrants:
+  #   - parameter: log_statement
   # Password is auto-generated and stored in a Secret named: <cluster-name>-<role-name>-credentials
   # The secret contains keys: username, password, host, port

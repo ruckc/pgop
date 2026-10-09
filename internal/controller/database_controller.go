@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"slices"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -156,6 +157,20 @@ func (r *DatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	}
 	// Record the PostgreSQL name that now exists so deletion drops exactly it.
 	database.Status.DatabaseName = pgName
+
+	// Per-database parameter defaults (ALTER DATABASE ... SET/RESET). They
+	// only affect new sessions, so they are applied before the connection
+	// below is opened.
+	if err := reconcileDatabaseSettings(ctx, adminClient, database, pgName); err != nil {
+		log.Error(err, "Failed to reconcile database settings")
+		return r.updateStatus(ctx, database, false, database.Status.InstalledExtensions, database.Status.CreatedSchemas, err)
+	}
+
+	// Database-level privileges (GRANT/REVOKE ... ON DATABASE)
+	if err := reconcileDatabaseGrants(ctx, adminClient, database, pgName); err != nil {
+		log.Error(err, "Failed to reconcile database grants")
+		return r.updateStatus(ctx, database, false, database.Status.InstalledExtensions, database.Status.CreatedSchemas, err)
+	}
 
 	// Get a connection to the new database to install extensions and create schemas
 	dbClient, err := newOperatorClient(ctx, r.Client, cluster, pgName)
@@ -336,16 +351,26 @@ func (r *DatabaseReconciler) updateStatus(ctx context.Context, database *postgre
 }
 
 // databasesForOwnerRole maps a Role to the Databases in its namespace whose
-// spec.owner names it, so they reconcile when the owner becomes Ready.
+// spec.owner names it, or whose spec.grants name its PostgreSQL role, so they
+// reconcile when the owner becomes Ready or a grantee is created.
 func (r *DatabaseReconciler) databasesForOwnerRole(ctx context.Context, obj client.Object) []reconcile.Request {
 	databases := &postgresv1alpha1.DatabaseList{}
 	if err := r.List(ctx, databases, client.InNamespace(obj.GetNamespace())); err != nil {
 		logf.FromContext(ctx).Error(err, "Failed to list Databases for owner Role", "role", obj.GetName())
 		return nil
 	}
+	pgName := ""
+	if role, ok := obj.(*postgresv1alpha1.Role); ok {
+		pgName = role.PostgresName()
+	}
+	grantsTo := func(db *postgresv1alpha1.Database) bool {
+		return pgName != "" && slices.ContainsFunc(db.Spec.Grants, func(g postgresv1alpha1.DatabaseGrantSpec) bool {
+			return g.Role == pgName
+		})
+	}
 	var requests []reconcile.Request
 	for i := range databases.Items {
-		if databases.Items[i].Spec.Owner == obj.GetName() {
+		if databases.Items[i].Spec.Owner == obj.GetName() || grantsTo(&databases.Items[i]) {
 			requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&databases.Items[i])})
 		}
 	}

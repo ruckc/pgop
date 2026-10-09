@@ -100,6 +100,13 @@ func (r *RoleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 				if pgName == "" {
 					pgName = role.PostgresName()
 				}
+				// DROP ROLE fails while the role holds privileges on
+				// parameters, so revoke the ones pgop granted first (REVOKE
+				// is idempotent, so a retry after a partial failure is safe).
+				if err := revokeManagedParameterGrants(ctx, pgClient, role, pgName); err != nil {
+					log.Error(err, "Failed to revoke parameter grants")
+					return ctrl.Result{}, err
+				}
 				if err := pgClient.DropRole(ctx, pgName); err != nil {
 					log.Error(err, "Failed to drop role")
 					return ctrl.Result{}, err
@@ -211,9 +218,9 @@ func (r *RoleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		role.Status.PasswordRotatedAt = nil
 	}
 
-	// Handle role memberships (grant, update options, revoke removed ones)
-	if err := reconcileMemberships(ctx, pgClient, role, pgName); err != nil {
-		log.Error(err, "Failed to reconcile role memberships")
+	// Handle role memberships and parameter privileges
+	if err := reconcileRoleGrants(ctx, pgClient, role, pgName); err != nil {
+		log.Error(err, "Failed to reconcile role grants")
 		return r.updateStatus(ctx, role, false, secretName, err)
 	}
 
@@ -225,6 +232,16 @@ func (r *RoleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		}
 	}
 	return result, err
+}
+
+// reconcileRoleGrants brings the role's memberships (grant, update options,
+// revoke removed ones) and its privileges on configuration parameters
+// (PostgreSQL 15+) to the declared state.
+func reconcileRoleGrants(ctx context.Context, pgClient *postgres.Client, role *postgresv1alpha1.Role, pgName string) error {
+	if err := reconcileMemberships(ctx, pgClient, role, pgName); err != nil {
+		return err
+	}
+	return reconcileParameterGrants(ctx, pgClient, role, pgName)
 }
 
 // credentialsSecretName returns the name of the Role's credentials Secret.

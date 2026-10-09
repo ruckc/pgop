@@ -107,6 +107,53 @@ spec:
                   - name
                   type: object
                 type: array
+              grants:
+                description: |-
+                  grants lists database-level privileges (GRANT ... ON DATABASE) to grant
+                  to PostgreSQL roles. Privileges that pgop granted (tracked in
+                  status.managedGrants) are revoked once they are removed from the spec;
+                  privileges granted outside pgop are never revoked.
+                items:
+                  description: DatabaseGrantSpec grants database-level privileges
+                    to a PostgreSQL role.
+                  properties:
+                    privileges:
+                      description: |-
+                        privileges lists the database privileges to grant: CONNECT, CREATE,
+                        TEMPORARY (or TEMP), or ALL (all three).
+                      items:
+                        enum:
+                        - CONNECT
+                        - CREATE
+                        - TEMPORARY
+                        - TEMP
+                        - ALL
+                        type: string
+                      maxItems: 5
+                      minItems: 1
+                      type: array
+                    role:
+                      description: |-
+                        role is the PostgreSQL name of the role to grant privileges to (a raw
+                        PostgreSQL role name, not a Role resource name). The role must exist;
+                        the grant is retried until it does.
+                      maxLength: 63
+                      minLength: 1
+                      type: string
+                    withGrantOption:
+                      description: |-
+                        withGrantOption allows the grantee to grant the same privileges to
+                        others. Turning it off for a grant pgop made revokes the grant option.
+                      type: boolean
+                  required:
+                  - privileges
+                  - role
+                  type: object
+                maxItems: 256
+                type: array
+                x-kubernetes-list-map-keys:
+                - role
+                x-kubernetes-list-type: map
               owner:
                 description: |-
                   owner is the name of the Role resource (in the same namespace) that owns
@@ -125,10 +172,15 @@ spec:
                         description: GrantSpec defines privileges to grant to a role
                         properties:
                           privileges:
-                            description: privileges lists the privileges to grant
-                              (e.g., USAGE, CREATE, ALL)
+                            description: 'privileges lists the schema privileges to
+                              grant: USAGE, CREATE or ALL.'
                             items:
+                              enum:
+                              - USAGE
+                              - CREATE
+                              - ALL
                               type: string
+                            maxItems: 3
                             minItems: 1
                             type: array
                           role:
@@ -155,6 +207,27 @@ spec:
                   - name
                   type: object
                 type: array
+              settings:
+                additionalProperties:
+                  type: string
+                description: |-
+                  settings are per-database defaults for configuration parameters
+                  (ALTER DATABASE ... SET name TO value). They apply to new sessions.
+                  Settings that pgop applied (tracked in status.managedSettings) are reset
+                  (ALTER DATABASE ... RESET name) once they are removed from the spec.
+                  Keys are parameter names (for example work_mem or myapp.tenant); values
+                  are written as SQL string literals. For list parameters (search_path,
+                  temp_tablespaces, session_preload_libraries, local_preload_libraries)
+                  the value is a comma-separated list as in postgresql.conf, for example
+                  '"$user", public'.
+                maxProperties: 256
+                type: object
+                x-kubernetes-validations:
+                - message: 'settings keys must be parameter names: identifiers ([A-Za-z_][A-Za-z0-9_]*)
+                    optionally separated by dots, at most 127 characters'
+                  rule: self.all(k, size(k) <= 127 && k.matches('^[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)*$'))
+                - message: settings values must be at most 4096 characters
+                  rule: self.all(k, size(self[k]) <= 4096)
             required:
             - clusterRef
             type: object
@@ -242,6 +315,48 @@ spec:
                 items:
                   type: string
                 type: array
+              managedGrants:
+                description: |-
+                  managedGrants lists the database privileges pgop has granted. Only
+                  these are revoked when they are removed from spec.grants.
+                items:
+                  description: ManagedDatabaseGrant records database privileges that
+                    pgop granted to a role.
+                  properties:
+                    privileges:
+                      description: |-
+                        privileges are the granted privileges, normalized (TEMP is recorded as
+                        TEMPORARY and ALL as CONNECT, CREATE and TEMPORARY).
+                      items:
+                        type: string
+                      type: array
+                      x-kubernetes-list-type: set
+                    role:
+                      description: role is the PostgreSQL role the privileges were
+                        granted to.
+                      type: string
+                    withGrantOption:
+                      description: |-
+                        withGrantOption records whether pgop granted the privileges with the
+                        grant option.
+                      type: boolean
+                  required:
+                  - privileges
+                  - role
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - role
+                x-kubernetes-list-type: map
+              managedSettings:
+                description: |-
+                  managedSettings lists the parameter names pgop has set with ALTER
+                  DATABASE ... SET (normalized to lowercase). Only these are reset when
+                  they are removed from spec.settings.
+                items:
+                  type: string
+                type: array
+                x-kubernetes-list-type: set
               ready:
                 description: ready indicates if the database has been created
                 type: boolean

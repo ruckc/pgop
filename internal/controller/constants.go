@@ -106,6 +106,11 @@ const (
 	// (postgresql.auto.conf), which takes precedence over spec.parameters.
 	ReasonOverriddenByAlterSystem = "OverriddenByAlterSystem"
 
+	// ReasonUnsupportedServerVersion: the spec uses a feature that the
+	// cluster's PostgreSQL version does not support (for example
+	// Role.spec.parameterGrants before PostgreSQL 15).
+	ReasonUnsupportedServerVersion = "UnsupportedServerVersion"
+
 	DefaultPostgresImage    = "postgres:18"
 	DefaultOperatorUsername = "pgop_operator"
 
