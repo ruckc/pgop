@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"time"
@@ -158,18 +159,13 @@ func (r *DatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	// Record the PostgreSQL name that now exists so deletion drops exactly it.
 	database.Status.DatabaseName = pgName
 
-	// Per-database parameter defaults (ALTER DATABASE ... SET/RESET). They
-	// only affect new sessions, so they are applied before the connection
-	// below is opened.
-	if err := reconcileDatabaseSettings(ctx, adminClient, database, pgName); err != nil {
-		log.Error(err, "Failed to reconcile database settings")
-		return r.updateStatus(ctx, database, false, database.Status.InstalledExtensions, database.Status.CreatedSchemas, err)
-	}
-
-	// Database-level privileges (GRANT/REVOKE ... ON DATABASE)
-	if err := reconcileDatabaseGrants(ctx, adminClient, database, pgName); err != nil {
-		log.Error(err, "Failed to reconcile database grants")
-		return r.updateStatus(ctx, database, false, database.Status.InstalledExtensions, database.Status.CreatedSchemas, err)
+	// Settings and database grants. A problem with them (a grantee that does
+	// not exist yet, a setting that is not allowed) does not hold up the
+	// extensions, schemas and credentials below: it is reported once those
+	// are done, and the Database stays not ready until it is fixed.
+	accessErr := r.reconcileSettingsAndGrants(ctx, adminClient, database, pgName)
+	if accessErr != nil {
+		log.Error(accessErr, "Failed to reconcile database settings or grants")
 	}
 
 	// Get a connection to the new database to install extensions and create schemas
@@ -213,8 +209,49 @@ func (r *DatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return r.updateStatus(ctx, database, false, installedExtensions, createdSchemas, err)
 	}
 
+	if accessErr != nil {
+		return r.updateStatus(ctx, database, false, installedExtensions, createdSchemas, accessErr)
+	}
+
 	log.Info("Database reconciled successfully")
 	return r.updateStatus(ctx, database, true, installedExtensions, createdSchemas, nil)
+}
+
+// reconcileSettingsAndGrants applies the per-database settings (ALTER
+// DATABASE ... SET/RESET; they only affect new sessions, so they are applied
+// before the database connection used for extensions is opened) and the
+// database-level grants. Both are attempted even when the other fails.
+func (r *DatabaseReconciler) reconcileSettingsAndGrants(ctx context.Context, pg databaseGrantClient,
+	database *postgresv1alpha1.Database, pgName string) error {
+	deleting, err := r.deletingRoleNames(ctx, database)
+	if err != nil {
+		return err
+	}
+	return errors.Join(
+		reconcileDatabaseSettings(ctx, pg, database, pgName),
+		reconcileDatabaseGrants(ctx, pg, database, pgName, deleting),
+	)
+}
+
+// deletingRoleNames returns the PostgreSQL names of the Roles on the
+// Database's cluster that are being deleted, so their grants are not
+// re-applied while the Role controller revokes them and drops the role.
+func (r *DatabaseReconciler) deletingRoleNames(ctx context.Context, database *postgresv1alpha1.Database) (map[string]bool, error) {
+	if len(database.Spec.Grants) == 0 {
+		return nil, nil
+	}
+	roles := &postgresv1alpha1.RoleList{}
+	if err := r.List(ctx, roles, client.InNamespace(database.Namespace)); err != nil {
+		return nil, fmt.Errorf("failed to list Roles: %w", err)
+	}
+	deleting := map[string]bool{}
+	for i := range roles.Items {
+		role := &roles.Items[i]
+		if role.DeletionTimestamp != nil && role.Spec.ClusterRef.Name == database.Spec.ClusterRef.Name {
+			deleting[role.PostgresName()] = true
+		}
+	}
+	return deleting, nil
 }
 
 // resolveOwnerRole returns the Role named by spec.owner, or nil when no owner
@@ -330,6 +367,9 @@ func (r *DatabaseReconciler) updateStatus(ctx context.Context, database *postgre
 	} else if reconcileErr != nil {
 		condition.Status = metav1.ConditionFalse
 		condition.Reason = ReasonReconcileError
+		if ce, ok := errors.AsType[*conditionError](reconcileErr); ok {
+			condition.Reason = ce.reason
+		}
 		condition.Message = reconcileErr.Error()
 	} else {
 		condition.Status = metav1.ConditionFalse

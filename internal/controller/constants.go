@@ -110,6 +110,16 @@ const (
 	// cluster's PostgreSQL version does not support (for example
 	// Role.spec.parameterGrants before PostgreSQL 15).
 	ReasonUnsupportedServerVersion = "UnsupportedServerVersion"
+	// ReasonSettingNotAllowed: Database.spec.settings names a parameter that
+	// pgop refuses to set per database (denylisted, or not a user-context
+	// parameter). The other settings are still applied.
+	ReasonSettingNotAllowed = "SettingNotAllowed"
+	// ReasonParameterNotAllowed: Role.spec.parameterGrants names a parameter
+	// that pgop refuses to grant privileges on.
+	ReasonParameterNotAllowed = "ParameterNotAllowed"
+	// ReasonRoleDropBlocked: the role cannot be dropped because objects or
+	// privileges that pgop does not manage still depend on it.
+	ReasonRoleDropBlocked = "RoleDropBlocked"
 
 	DefaultPostgresImage    = "postgres:18"
 	DefaultOperatorUsername = "pgop_operator"

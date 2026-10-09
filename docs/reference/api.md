@@ -151,7 +151,11 @@ spec:
   # Privileges on configuration parameters (GRANT SET ON PARAMETER).
   # PostgreSQL 15+. pgop-granted entries removed from the spec are revoked.
   parameterGrants:         # max 256, each parameter at most once
-    - parameter: string    # Parameter name, e.g. log_statement or myapp.tenant_id
+    - parameter: string    # Parameter name, e.g. log_statement or myapp.tenant_id.
+                           # Not allowed: role, session_authorization,
+                           # *_preload_libraries, dynamic_library_path,
+                           # jit_provider, session_replication_role,
+                           # pgaudit.*, set_user.*, anon.*, sepgsql.*
       privileges:          # Only SET (the default); ALTER SYSTEM is not offered
         - SET
       withGrantOption: boolean # WITH GRANT OPTION (default: false)
@@ -190,7 +194,10 @@ The `Available` condition is `False` with reason `PasswordSecretNotFound` when
 `PasswordSecretInvalid` when the value is not valid UTF-8, contains a NUL byte
 or is already a password hash (`SCRAM-SHA-256$...` or `md5` + 32 hex digits),
 `UnsupportedServerVersion` when `parameterGrants` is set on a server older
-than PostgreSQL 15, and `ReconcileError` for other failures (errors from `CREATE`/`ALTER ROLE` are
+than PostgreSQL 15, `ParameterNotAllowed` when `parameterGrants` names a
+denylisted parameter, `RoleDropBlocked` while a deleted Role cannot be dropped
+because objects or privileges pgop does not manage depend on it (the message
+lists them), and `ReconcileError` for other failures (errors from `CREATE`/`ALTER ROLE` are
 redacted). A rotation emits a `PasswordRotated` Event on the Role.
 
 The role credentials Secret carries a `pgop.ruck.io/password-fingerprint`
@@ -245,11 +252,12 @@ spec:
       grants:
         - role: string     # PostgreSQL role to grant to
           privileges:
-            - string       # USAGE, CREATE or ALL
+            - string       # USAGE, CREATE, ALL or ALL PRIVILEGES (any case; max 8)
           withGrantOption: boolean
 
   # Database-level privileges (GRANT ... ON DATABASE). pgop-granted
-  # privileges removed from the spec are revoked.
+  # privileges removed from the spec are revoked (with CASCADE when they were
+  # granted WITH GRANT OPTION).
   grants:                  # max 256, each role at most once
     - role: string         # PostgreSQL role name (must exist)
       privileges:
@@ -259,9 +267,20 @@ spec:
   # Per-database parameter defaults (ALTER DATABASE ... SET name TO 'value').
   # Keys: parameter names (identifiers, optionally dotted, max 127 chars).
   # Values: max 4096 chars. pgop-set keys removed from the spec are RESET.
+  # Only "user"-context and custom parameters are applied; superuser-only
+  # parameters and role, session_authorization, *_preload_libraries,
+  # dynamic_library_path, jit_provider, session_replication_role, pgaudit.*,
+  # set_user.*, anon.*, sepgsql.* are refused (reason SettingNotAllowed).
+  # search_path/temp_tablespaces take a postgresql.conf list ("$user", app);
+  # an empty list is rejected.
   settings:
     string: string
 ```
+
+The `Available` condition is `False` with reason `SettingNotAllowed` when a
+setting is refused (the other settings, grants, extensions and schemas are
+still reconciled) and `ReconcileError` for other failures, such as a grantee
+role that does not exist yet.
 
 ### DatabaseStatus
 

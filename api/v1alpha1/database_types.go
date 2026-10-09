@@ -70,14 +70,20 @@ type DatabaseSpec struct {
 	// Settings that pgop applied (tracked in status.managedSettings) are reset
 	// (ALTER DATABASE ... RESET name) once they are removed from the spec.
 	// Keys are parameter names (for example work_mem or myapp.tenant); values
-	// are written as SQL string literals. For list parameters (search_path,
-	// temp_tablespaces, session_preload_libraries, local_preload_libraries)
-	// the value is a comma-separated list as in postgresql.conf, for example
-	// '"$user", public'.
+	// are written as SQL string literals. For the list parameters search_path
+	// and temp_tablespaces the value is a comma-separated list as in
+	// postgresql.conf (the YAML string "$user", public with the double quotes
+	// kept); an empty list is rejected.
+	// Only parameters that any user may set (context "user" in pg_settings)
+	// and custom parameters are accepted; superuser-only parameters and a
+	// denylist of identity-switching, code-loading and safeguard-bypassing
+	// parameters are refused (reason SettingNotAllowed), because pgop runs
+	// ALTER DATABASE as a superuser.
 	// +optional
 	// +kubebuilder:validation:MaxProperties=256
 	// +kubebuilder:validation:XValidation:rule="self.all(k, size(k) <= 127 && k.matches('^[A-Za-z_][A-Za-z0-9_]*(\\\\.[A-Za-z_][A-Za-z0-9_]*)*$'))",message="settings keys must be parameter names: identifiers ([A-Za-z_][A-Za-z0-9_]*) optionally separated by dots, at most 127 characters"
 	// +kubebuilder:validation:XValidation:rule="self.all(k, size(self[k]) <= 4096)",message="settings values must be at most 4096 characters"
+	// +kubebuilder:validation:XValidation:rule="!self.exists(k, k.lowerAscii() in ['role', 'session_authorization', 'session_preload_libraries', 'local_preload_libraries', 'shared_preload_libraries', 'dynamic_library_path', 'jit_provider', 'session_replication_role'] || k.lowerAscii().startsWith('pgaudit.') || k.lowerAscii().startsWith('set_user.') || k.lowerAscii().startsWith('anon.') || k.lowerAscii().startsWith('sepgsql.'))",message="settings must not include role, session_authorization, *_preload_libraries, dynamic_library_path, jit_provider, session_replication_role or pgaudit.*, set_user.*, anon.*, sepgsql.* parameters"
 	Settings map[string]string `json:"settings,omitempty"`
 }
 
@@ -160,11 +166,13 @@ type GrantSpec struct {
 	// +kubebuilder:validation:Required
 	Role string `json:"role"`
 
-	// privileges lists the schema privileges to grant: USAGE, CREATE or ALL.
+	// privileges lists the schema privileges to grant: USAGE, CREATE or ALL
+	// (also written ALL PRIVILEGES), in any letter case.
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:MinItems=1
-	// +kubebuilder:validation:MaxItems=3
-	// +kubebuilder:validation:items:Enum=USAGE;CREATE;ALL
+	// +kubebuilder:validation:MaxItems=8
+	// +kubebuilder:validation:items:MaxLength=32
+	// +kubebuilder:validation:items:Pattern=`^(?i:usage|create|all|all privileges)$`
 	Privileges []string `json:"privileges"`
 
 	// withGrantOption allows the grantee to grant the same privileges to others

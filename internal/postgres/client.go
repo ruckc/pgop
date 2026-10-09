@@ -334,6 +334,9 @@ func (c *Client) DropRole(ctx context.Context, name string) error {
 	query := fmt.Sprintf("DROP ROLE IF EXISTS %s", quoteIdent(name))
 	_, err := c.db.ExecContext(ctx, query)
 	if err != nil {
+		if depErr := dependentObjectsError(name, err); depErr != nil {
+			return depErr
+		}
 		return fmt.Errorf("failed to drop role: %w", err)
 	}
 	return nil

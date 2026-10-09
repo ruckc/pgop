@@ -172,15 +172,14 @@ spec:
                         description: GrantSpec defines privileges to grant to a role
                         properties:
                           privileges:
-                            description: 'privileges lists the schema privileges to
-                              grant: USAGE, CREATE or ALL.'
+                            description: |-
+                              privileges lists the schema privileges to grant: USAGE, CREATE or ALL
+                              (also written ALL PRIVILEGES), in any letter case.
                             items:
-                              enum:
-                              - USAGE
-                              - CREATE
-                              - ALL
+                              maxLength: 32
+                              pattern: ^(?i:usage|create|all|all privileges)$
                               type: string
-                            maxItems: 3
+                            maxItems: 8
                             minItems: 1
                             type: array
                           role:
@@ -216,10 +215,15 @@ spec:
                   Settings that pgop applied (tracked in status.managedSettings) are reset
                   (ALTER DATABASE ... RESET name) once they are removed from the spec.
                   Keys are parameter names (for example work_mem or myapp.tenant); values
-                  are written as SQL string literals. For list parameters (search_path,
-                  temp_tablespaces, session_preload_libraries, local_preload_libraries)
-                  the value is a comma-separated list as in postgresql.conf, for example
-                  '"$user", public'.
+                  are written as SQL string literals. For the list parameters search_path
+                  and temp_tablespaces the value is a comma-separated list as in
+                  postgresql.conf (the YAML string "$user", public with the double quotes
+                  kept); an empty list is rejected.
+                  Only parameters that any user may set (context "user" in pg_settings)
+                  and custom parameters are accepted; superuser-only parameters and a
+                  denylist of identity-switching, code-loading and safeguard-bypassing
+                  parameters are refused (reason SettingNotAllowed), because pgop runs
+                  ALTER DATABASE as a superuser.
                 maxProperties: 256
                 type: object
                 x-kubernetes-validations:
@@ -228,6 +232,14 @@ spec:
                   rule: self.all(k, size(k) <= 127 && k.matches('^[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)*$'))
                 - message: settings values must be at most 4096 characters
                   rule: self.all(k, size(self[k]) <= 4096)
+                - message: settings must not include role, session_authorization,
+                    *_preload_libraries, dynamic_library_path, jit_provider, session_replication_role
+                    or pgaudit.*, set_user.*, anon.*, sepgsql.* parameters
+                  rule: '!self.exists(k, k.lowerAscii() in [''role'', ''session_authorization'',
+                    ''session_preload_libraries'', ''local_preload_libraries'', ''shared_preload_libraries'',
+                    ''dynamic_library_path'', ''jit_provider'', ''session_replication_role'']
+                    || k.lowerAscii().startsWith(''pgaudit.'') || k.lowerAscii().startsWith(''set_user.'')
+                    || k.lowerAscii().startsWith(''anon.'') || k.lowerAscii().startsWith(''sepgsql.''))'
             required:
             - clusterRef
             type: object

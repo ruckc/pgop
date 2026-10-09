@@ -17,9 +17,13 @@ limitations under the License.
 package postgres
 
 import (
+	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/lib/pq"
 )
 
 // injectionPrivileges are privilege values that try to smuggle SQL into a
@@ -28,7 +32,7 @@ var injectionPrivileges = []string{
 	"USAGE; DROP DATABASE postgres; --",
 	"CONNECT ON DATABASE postgres TO public; --",
 	"SET ON PARAMETER x TO y; ALTER SYSTEM",
-	"ALL PRIVILEGES",
+	"ALL PRIVILEGES; DROP DATABASE x",
 	"ALTER SYSTEM",
 	"SELECT",
 	"",
@@ -74,13 +78,13 @@ func TestPrivilegeBuildersRejectInjection(t *testing.T) {
 		if _, err := buildGrantDatabasePrivilegesQuery("d", "r", privs, false); err == nil {
 			t.Errorf("database grant accepted privilege %q", p)
 		}
-		if _, err := buildRevokeDatabasePrivilegesQuery("d", "r", privs, false); err == nil {
+		if _, err := buildRevokeDatabasePrivilegesQuery("d", "r", privs, RevokeMode{}); err == nil {
 			t.Errorf("database revoke accepted privilege %q", p)
 		}
 		if _, err := buildGrantParameterQuery("work_mem", "r", privs, false); err == nil {
 			t.Errorf("parameter grant accepted privilege %q", p)
 		}
-		if _, err := buildRevokeParameterQuery("work_mem", "r", privs, false); err == nil {
+		if _, err := buildRevokeParameterQuery("work_mem", "r", privs, RevokeMode{}); err == nil {
 			t.Errorf("parameter revoke accepted privilege %q", p)
 		}
 		// A valid privilege next to a hostile one must not slip through.
@@ -115,18 +119,18 @@ func TestBuildDatabasePrivilegeQueries(t *testing.T) {
 	if want := `GRANT ALL ON DATABASE "d""b" TO "r""x" WITH GRANT OPTION`; got != want {
 		t.Errorf("grant: got %q, want %q", got, want)
 	}
-	got, err = buildRevokeDatabasePrivilegesQuery("app_db", testMember, []string{PrivilegeCreate, PrivilegeTemporary}, false)
+	got, err = buildRevokeDatabasePrivilegesQuery("app_db", testMember, []string{PrivilegeCreate, PrivilegeTemporary}, RevokeMode{Cascade: true})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := `REVOKE CREATE, TEMPORARY ON DATABASE "app_db" FROM "app"`; got != want {
+	if want := `REVOKE CREATE, TEMPORARY ON DATABASE "app_db" FROM "app" CASCADE`; got != want {
 		t.Errorf("revoke: got %q, want %q", got, want)
 	}
-	got, err = buildRevokeDatabasePrivilegesQuery("app_db", testMember, []string{PrivilegeConnect}, true)
+	got, err = buildRevokeDatabasePrivilegesQuery("app_db", testMember, []string{PrivilegeConnect}, RevokeMode{GrantOptionOnly: true, Cascade: true})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := `REVOKE GRANT OPTION FOR CONNECT ON DATABASE "app_db" FROM "app"`; got != want {
+	if want := `REVOKE GRANT OPTION FOR CONNECT ON DATABASE "app_db" FROM "app" CASCADE`; got != want {
 		t.Errorf("revoke grant option: got %q, want %q", got, want)
 	}
 }
@@ -228,14 +232,14 @@ func TestBuildParameterQueries(t *testing.T) {
 	if want := `GRANT SET ON PARAMETER "myapp"."tenant" TO "a""b" WITH GRANT OPTION`; got != want {
 		t.Errorf("got %q, want %q", got, want)
 	}
-	got, err = buildRevokeParameterQuery("log_statement", "auditor", []string{PrivilegeSet}, true)
+	got, err = buildRevokeParameterQuery("log_statement", "auditor", []string{PrivilegeSet}, RevokeMode{GrantOptionOnly: true})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if want := `REVOKE GRANT OPTION FOR SET ON PARAMETER "log_statement" FROM "auditor"`; got != want {
 		t.Errorf("got %q, want %q", got, want)
 	}
-	got, err = buildRevokeParameterQuery("log_statement", "auditor", []string{PrivilegeSet}, false)
+	got, err = buildRevokeParameterQuery("log_statement", "auditor", []string{PrivilegeSet}, RevokeMode{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -257,7 +261,8 @@ func TestBuildAlterDatabaseSetQuery(t *testing.T) {
 		{paramSearchPath, `"$user", public`, `ALTER DATABASE "db" SET "search_path" TO '$user', 'public'`},
 		{paramSearchPath, `App, "My Schema", "a""b"`, `ALTER DATABASE "db" SET "search_path" TO 'app', 'My Schema', 'a"b'`},
 		{paramSearchPath, "public", `ALTER DATABASE "db" SET "search_path" TO 'public'`},
-		{paramSearchPath, "", `ALTER DATABASE "db" SET "search_path" TO ''`},
+		{paramSearchPath, "", ""},
+		{paramSearchPath, "  ", ""},
 		{paramSearchPath, `x'); DROP DATABASE db; --`, ""},
 		{"temp_tablespaces", `"a"x`, ""},
 		{paramSearchPath, `a,,b`, ""},
@@ -286,5 +291,61 @@ func TestBuildAlterDatabaseSetQuery(t *testing.T) {
 	}
 	if want := `ALTER DATABASE "d""b" RESET "work_mem"`; got != want {
 		t.Errorf("reset: got %q, want %q", got, want)
+	}
+}
+
+func TestAllPrivilegesAndCase(t *testing.T) {
+	got, err := buildGrantSchemaPrivilegesQuery("s", "r", []string{"all  privileges", "usage"}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := `GRANT ALL, USAGE ON SCHEMA "s" TO "r"`; got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+	privs, err := NormalizeDatabasePrivileges([]string{"All Privileges"})
+	if err != nil || !slices.Equal(privs, []string{PrivilegeConnect, PrivilegeCreate, PrivilegeTemporary}) {
+		t.Errorf("got %v, %v", privs, err)
+	}
+	if _, err := NormalizeParameterPrivileges([]string{"ALL PRIVILEGES"}); err == nil {
+		t.Error("parameter grant accepted ALL PRIVILEGES")
+	}
+}
+
+func TestDeniedParameter(t *testing.T) {
+	for _, name := range []string{
+		"role", "ROLE", "session_authorization", "session_preload_libraries", "local_preload_libraries",
+		"shared_preload_libraries", "dynamic_library_path", "jit_provider", "session_replication_role",
+		"pgaudit.log", "PgAudit.Role", "set_user.block_alter_system", "anon.salt", "sepgsql.permissive",
+	} {
+		if !DeniedParameter(name) {
+			t.Errorf("%q should be denied", name)
+		}
+	}
+	for _, name := range []string{"maintenance_work_mem", paramSearchPath, "statement_timeout", "myapp.tenant", "rolex", "pgauditx"} {
+		if DeniedParameter(name) {
+			t.Errorf("%q should not be denied", name)
+		}
+	}
+}
+
+func TestDependentObjectsError(t *testing.T) {
+	pqErr := &pq.Error{Code: sqlStateDependentObjects, Message: "role cannot be dropped", Detail: "privileges for database d"}
+	err := dependentObjectsError("app", fmt.Errorf("wrapped: %w", pqErr))
+	depErr, ok := errors.AsType[*DependentObjectsError](err)
+	if !ok {
+		t.Fatalf("expected a DependentObjectsError, got %v", err)
+	}
+	if depErr.Detail != "privileges for database d" || !strings.Contains(depErr.Error(), `role "app"`) {
+		t.Errorf("unexpected error %q", depErr.Error())
+	}
+	if !errors.Is(err, pqErr) {
+		t.Error("the PostgreSQL error is not wrapped")
+	}
+	if dependentObjectsError("app", &pq.Error{Code: "42704"}) != nil {
+		t.Error("a different SQLSTATE was converted")
+	}
+	long := &pq.Error{Code: sqlStateDependentObjects, Detail: strings.Repeat("x", 5000)}
+	if de, _ := errors.AsType[*DependentObjectsError](dependentObjectsError("app", long)); len(de.Detail) > maxDetailLength+3 {
+		t.Errorf("detail not truncated: %d", len(de.Detail))
 	}
 }

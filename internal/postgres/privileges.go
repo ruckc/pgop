@@ -18,6 +18,7 @@ package postgres
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"regexp"
@@ -66,16 +67,19 @@ var parameterNameRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-
 // maxParameterNameLength bounds parameter names (two 63-byte identifiers).
 const maxParameterNameLength = 127
 
-// checkPrivileges upper-cases privs and checks each against allowed. It
-// returns the upper-cased privileges in their original order, without
-// duplicates.
+// checkPrivileges upper-cases privs (ALL PRIVILEGES is read as ALL) and
+// checks each against allowed. It returns the upper-cased privileges in their
+// original order, without duplicates.
 func checkPrivileges(kind string, privs, allowed []string) ([]string, error) {
 	if len(privs) == 0 {
 		return nil, fmt.Errorf("no %s privileges given", kind)
 	}
 	out := make([]string, 0, len(privs))
 	for _, p := range privs {
-		u := strings.ToUpper(strings.TrimSpace(p))
+		u := strings.ToUpper(strings.Join(strings.Fields(p), " "))
+		if u == "ALL PRIVILEGES" {
+			u = PrivilegeAll
+		}
 		if !slices.Contains(allowed, u) {
 			return nil, fmt.Errorf("invalid %s privilege %q (allowed: %s)", kind, p, strings.Join(allowed, ", "))
 		}
@@ -158,14 +162,29 @@ func buildGrantQuery(privs []string, object, role string, withGrantOption bool) 
 	return query
 }
 
+// RevokeMode selects the form of a REVOKE statement.
+type RevokeMode struct {
+	// GrantOptionOnly revokes only the grant option (REVOKE GRANT OPTION FOR).
+	GrantOptionOnly bool
+	// Cascade also revokes privileges the grantee passed on to others. Use
+	// it when the privileges were granted WITH GRANT OPTION: without it the
+	// REVOKE fails with "dependent privileges exist".
+	Cascade bool
+}
+
 // buildRevokeQuery builds REVOKE [GRANT OPTION FOR] <privs> ON <object> FROM
-// <role>. object must already be quoted; privs must already be checked.
-func buildRevokeQuery(privs []string, object, role string, grantOptionOnly bool) string {
+// <role> [CASCADE]. object must already be quoted; privs must already be
+// checked.
+func buildRevokeQuery(privs []string, object, role string, mode RevokeMode) string {
 	prefix := "REVOKE "
-	if grantOptionOnly {
+	if mode.GrantOptionOnly {
 		prefix += "GRANT OPTION FOR "
 	}
-	return fmt.Sprintf("%s%s ON %s FROM %s", prefix, strings.Join(privs, ", "), object, quoteIdent(role))
+	query := fmt.Sprintf("%s%s ON %s FROM %s", prefix, strings.Join(privs, ", "), object, quoteIdent(role))
+	if mode.Cascade {
+		query += " CASCADE"
+	}
+	return query
 }
 
 func buildGrantSchemaPrivilegesQuery(schema, role string, privileges []string, withGrantOption bool) (string, error) {
@@ -184,12 +203,12 @@ func buildGrantDatabasePrivilegesQuery(database, role string, privileges []strin
 	return buildGrantQuery(privs, "DATABASE "+quoteIdent(database), role, withGrantOption), nil
 }
 
-func buildRevokeDatabasePrivilegesQuery(database, role string, privileges []string, grantOptionOnly bool) (string, error) {
+func buildRevokeDatabasePrivilegesQuery(database, role string, privileges []string, mode RevokeMode) (string, error) {
 	privs, err := checkPrivileges("database", privileges, databasePrivileges)
 	if err != nil {
 		return "", err
 	}
-	return buildRevokeQuery(privs, "DATABASE "+quoteIdent(database), role, grantOptionOnly), nil
+	return buildRevokeQuery(privs, "DATABASE "+quoteIdent(database), role, mode), nil
 }
 
 func buildGrantParameterQuery(parameter, role string, privileges []string, withGrantOption bool) (string, error) {
@@ -204,7 +223,7 @@ func buildGrantParameterQuery(parameter, role string, privileges []string, withG
 	return buildGrantQuery(privs, "PARAMETER "+name, role, withGrantOption), nil
 }
 
-func buildRevokeParameterQuery(parameter, role string, privileges []string, grantOptionOnly bool) (string, error) {
+func buildRevokeParameterQuery(parameter, role string, privileges []string, mode RevokeMode) (string, error) {
 	privs, err := checkPrivileges("parameter", privileges, parameterPrivileges)
 	if err != nil {
 		return "", err
@@ -213,7 +232,7 @@ func buildRevokeParameterQuery(parameter, role string, privileges []string, gran
 	if err != nil {
 		return "", err
 	}
-	return buildRevokeQuery(privs, "PARAMETER "+name, role, grantOptionOnly), nil
+	return buildRevokeQuery(privs, "PARAMETER "+name, role, mode), nil
 }
 
 // GrantDatabasePrivileges grants database-level privileges on database to
@@ -230,9 +249,9 @@ func (c *Client) GrantDatabasePrivileges(ctx context.Context, database, role str
 }
 
 // RevokeDatabasePrivileges revokes database-level privileges (or, with
-// grantOptionOnly, only their grant option) on database from role.
-func (c *Client) RevokeDatabasePrivileges(ctx context.Context, database, role string, privileges []string, grantOptionOnly bool) error {
-	query, err := buildRevokeDatabasePrivilegesQuery(database, role, privileges, grantOptionOnly)
+// mode.GrantOptionOnly, only their grant option) on database from role.
+func (c *Client) RevokeDatabasePrivileges(ctx context.Context, database, role string, privileges []string, mode RevokeMode) error {
+	query, err := buildRevokeDatabasePrivilegesQuery(database, role, privileges, mode)
 	if err != nil {
 		return err
 	}
@@ -255,10 +274,11 @@ func (c *Client) GrantParameterPrivileges(ctx context.Context, parameter, role s
 	return nil
 }
 
-// RevokeParameterPrivileges revokes privileges (or, with grantOptionOnly,
-// only their grant option) on a configuration parameter from role.
-func (c *Client) RevokeParameterPrivileges(ctx context.Context, parameter, role string, privileges []string, grantOptionOnly bool) error {
-	query, err := buildRevokeParameterQuery(parameter, role, privileges, grantOptionOnly)
+// RevokeParameterPrivileges revokes privileges (or, with
+// mode.GrantOptionOnly, only their grant option) on a configuration parameter
+// from role.
+func (c *Client) RevokeParameterPrivileges(ctx context.Context, parameter, role string, privileges []string, mode RevokeMode) error {
+	query, err := buildRevokeParameterQuery(parameter, role, privileges, mode)
 	if err != nil {
 		return err
 	}
@@ -271,9 +291,9 @@ func (c *Client) RevokeParameterPrivileges(ctx context.Context, parameter, role 
 // listQuoteParameters are the parameters whose SET values are lists of
 // identifiers (GUC_LIST_QUOTE): PostgreSQL quotes each SET argument as an
 // identifier, so a list must be passed as separate arguments.
-var listQuoteParameters = []string{
-	paramSearchPath, "temp_tablespaces", "session_preload_libraries", "local_preload_libraries",
-}
+// (session_preload_libraries and local_preload_libraries are list
+// parameters too, but they are denied by DeniedParameter.)
+var listQuoteParameters = []string{paramSearchPath, "temp_tablespaces"}
 
 // errUnterminatedQuote reports a list element with an unterminated quote.
 var errUnterminatedQuote = errors.New("unterminated quoted identifier")
@@ -341,10 +361,14 @@ func splitIdentifierList(s string) ([]string, error) {
 
 // formatSettingValue renders value as the argument list of SET for
 // parameter: one string literal, or for list parameters one literal per
-// element.
+// element. An empty list cannot be expressed this way (SET search_path TO ”
+// stores a schema literally named ""), so it is rejected.
 func formatSettingValue(parameter, value string) (string, error) {
-	if !slices.Contains(listQuoteParameters, parameter) || strings.TrimSpace(value) == "" {
+	if !slices.Contains(listQuoteParameters, parameter) {
 		return quoteLiteral(value), nil
+	}
+	if strings.TrimSpace(value) == "" {
+		return "", fmt.Errorf("%s: an empty list is not supported; remove the key to reset the parameter", parameter)
 	}
 	elems, err := splitIdentifierList(value)
 	if err != nil {
@@ -402,4 +426,52 @@ func (c *Client) ResetDatabaseParameter(ctx context.Context, database, parameter
 		return fmt.Errorf("failed to reset %s on database %q: %w", parameter, database, err)
 	}
 	return nil
+}
+
+// deniedParameters are parameters that pgop never sets per database and
+// never grants SET on, whatever their context: they switch the session's
+// identity (role, session_authorization), load code into sessions
+// (*_preload_libraries, dynamic_library_path, jit_provider) or bypass
+// triggers, foreign keys and replication safeguards
+// (session_replication_role).
+var deniedParameters = []string{
+	"role", "session_authorization",
+	"session_preload_libraries", "local_preload_libraries", "shared_preload_libraries",
+	"dynamic_library_path", "jit_provider",
+	"session_replication_role",
+}
+
+// deniedParameterPrefixes are custom parameter namespaces that pgop never
+// sets or grants, because they control auditing or security extensions that
+// may only be loaded later (when the parameter is still a placeholder and its
+// context cannot be checked).
+var deniedParameterPrefixes = []string{"pgaudit.", "set_user.", "anon.", "sepgsql."}
+
+// DeniedParameter reports whether pgop refuses to set or grant the parameter
+// name (case-insensitive) regardless of the server's view of it.
+func DeniedParameter(name string) bool {
+	n := strings.ToLower(name)
+	if slices.Contains(deniedParameters, n) {
+		return true
+	}
+	for _, p := range deniedParameterPrefixes {
+		if strings.HasPrefix(n, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// ParameterContext returns the context of a configuration parameter as
+// reported by pg_settings (user, superuser, postmaster, ...). found is false
+// for parameters the server does not know (custom placeholders).
+func (c *Client) ParameterContext(ctx context.Context, name string) (pgContext string, found bool, err error) {
+	err = c.db.QueryRowContext(ctx, "SELECT context FROM pg_settings WHERE lower(name) = lower($1)", name).Scan(&pgContext)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("failed to look up parameter %q: %w", name, err)
+	}
+	return pgContext, true, nil
 }

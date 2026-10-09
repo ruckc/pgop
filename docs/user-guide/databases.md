@@ -170,8 +170,8 @@ spec:
 ## Grants and DDL
 
 - `schemas[].grants` grant **schema-level** privileges (`USAGE`, `CREATE`,
-  `ALL`) via `GRANT ... ON SCHEMA`. Table privileges such as `SELECT` are not
-  schema privileges and are rejected.
+  `ALL`/`ALL PRIVILEGES`, in any letter case) via `GRANT ... ON SCHEMA`. Table
+  privileges such as `SELECT` are not schema privileges and are rejected.
 - `grants` grant **database-level** privileges (`CONNECT`, `CREATE`,
   `TEMPORARY`) via `GRANT ... ON DATABASE`; see
   [Database Grants](#database-grants).
@@ -181,6 +181,17 @@ spec:
   role the `owner` if it needs to create tables at runtime.
 - Arbitrary SQL (event triggers, setup that depends on an extension) is not
   supported yet; an `initSQL` escape hatch is tracked in issue #24.
+
+!!! note "Upgrade note: schema privileges are validated"
+    Earlier versions passed `schemas[].grants[].privileges` into the `GRANT`
+    statement unchecked (a SQL injection path). They are now limited to
+    `USAGE`, `CREATE`, `ALL` and `ALL PRIVILEGES` (case-insensitive, at most 8
+    entries of at most 32 characters), both by the API server and by the
+    operator. Anything else, such as `SELECT` (which PostgreSQL rejects on a
+    schema anyway), makes the Database invalid: fix the spec before upgrading.
+    On Kubernetes older than 1.30 (no CRD validation ratcheting) an existing
+    object with such a value cannot be updated at all, not even to remove its
+    finalizer, until the value is corrected.
 
 ## Database Grants
 
@@ -197,26 +208,33 @@ spec:
 ```
 
 - `privileges` may only contain `CONNECT`, `CREATE`, `TEMPORARY`, `TEMP` (an
-  alias of `TEMPORARY`) or `ALL` (all three). Anything else is rejected by the
-  API server, and again by the operator before any SQL is built.
+  alias of `TEMPORARY`) or `ALL` (all three), in upper case. Anything else is
+  rejected by the API server, and again by the operator before any SQL is
+  built.
 - Each `role` may appear once. The role must exist; until it does, the Database
   reports `Available=False` with a message naming the missing role and retries
   (it also reconciles as soon as a Role resource with that PostgreSQL name
-  changes).
+  changes). A missing grantee or a refused setting does not hold up the rest
+  of the Database: extensions, schemas and the credentials Secret are still
+  reconciled, and the Database stays not ready until the problem is fixed.
 - Grants are re-applied on every reconcile, so privileges revoked by hand are
   restored.
 - pgop records what it granted in `status.managedGrants`. When a role is removed
   from `grants`, or a privilege from its list, pgop **revokes exactly what it
   had granted**. Turning `withGrantOption` off revokes the grant option it
-  granted. Privileges granted outside pgop are never revoked. Revoking a
-  privilege the grantee has passed on to others fails (PostgreSQL requires
-  `CASCADE`, which pgop never uses); the error is reported in the `Available`
-  condition.
+  granted. Privileges granted outside pgop are never revoked.
+- When pgop granted a privilege `WITH GRANT OPTION`, its revoke uses
+  `CASCADE`: privileges the grantee passed on to other roles are revoked too
+  (otherwise PostgreSQL refuses with "dependent privileges exist").
 - PostgreSQL grants `CONNECT` and `TEMPORARY` on every new database to `PUBLIC`
   by default, so revoking `CONNECT` from a role does not stop it connecting
   unless `PUBLIC`'s privilege is revoked as well (not managed by pgop).
-- A role that holds privileges on a database cannot be dropped. Delete the
-  Database, or remove the grant, before deleting the grantee's Role.
+- Deleting the grantee's Role works while a Database still grants to it: the
+  Database stops granting to a Role that is being deleted (reported as
+  "paused" in its condition), and the Role controller revokes the role's
+  database and schema privileges before dropping it (see
+  [Roles: deletion](roles.md#deletion)). Remove the entry from `grants`
+  afterwards, or the Database reports the missing role.
 
 ## Database Settings
 
@@ -227,6 +245,8 @@ after the change.
 ```yaml
 spec:
   settings:
+    # The YAML single quotes only quote the string; the value is
+    # "$user", app, public (with the double quotes).
     search_path: '"$user", app, public'
     statement_timeout: 30s
     work_mem: 64MB
@@ -239,22 +259,49 @@ spec:
 - Values are always sent as SQL string literals (quotes and backslashes are
   escaped), at most 4096 characters. PostgreSQL validates them: an unknown
   parameter or an invalid value is reported in the `Available` condition.
-- For list parameters (`search_path`, `temp_tablespaces`,
-  `session_preload_libraries`, `local_preload_libraries`) write the value as in
-  `postgresql.conf`: a comma-separated list where unquoted names are
-  lowercased and double-quoted names keep their case, e.g.
-  `'"$user", app, public'`.
+- For the list parameters `search_path` and `temp_tablespaces`, write the value
+  as in `postgresql.conf`: a comma-separated list where unquoted names are
+  lowercased and double-quoted names keep their case. In YAML, quote the whole
+  value when it starts with a double quote, as above. An empty list (`""`)
+  is rejected, because `SET search_path TO ''` would store a schema literally
+  named `""`; remove the key instead to fall back to the server default.
 - Settings are re-applied on every reconcile. pgop records the names it set in
   `status.managedSettings` and runs `ALTER DATABASE ... RESET <name>` for any
   of them removed from `settings`. Settings made outside pgop are never reset.
 
-!!! warning "Settings run as the superuser"
-    The operator applies settings as the cluster superuser, so a Database author
-    can set superuser-only parameters for every session in that database. For
-    example `session_preload_libraries` loads any shared library present in the
-    image into every session, and `default_transaction_read_only` also affects
-    the operator's own connections to the database. Restrict who may create or
-    edit Database resources accordingly.
+### Which parameters may be set
+
+The operator runs `ALTER DATABASE ... SET` as the cluster superuser, so it
+restricts what a Database author can set:
+
+- Only parameters with context `user` in `pg_settings` (those any role may set
+  in its own session) and custom parameters the server does not know yet (such
+  as `myapp.tenant`) are applied. Superuser-only parameters (for example
+  `log_statement`, `session_preload_libraries`), and parameters that cannot be
+  set per database anyway (`postmaster`, `sighup`, `internal`, `backend`), are
+  refused.
+- These parameters are always refused, whatever their context: `role`,
+  `session_authorization` (they would switch the identity of every session,
+  the operator's included), `session_preload_libraries`,
+  `local_preload_libraries`, `shared_preload_libraries`,
+  `dynamic_library_path`, `jit_provider` (code loading),
+  `session_replication_role` (disables triggers and foreign keys), and the
+  `pgaudit.*`, `set_user.*`, `anon.*` and `sepgsql.*` namespaces (security
+  extensions, which may not be loaded yet when the setting is checked). The
+  API server rejects these names directly.
+- A refused setting is skipped, the others are applied, and the Database
+  reports `Available=False` with reason `SettingNotAllowed` naming the
+  parameter. A setting pgop applied earlier that is no longer allowed is
+  reset.
+
+!!! warning "Remaining risk"
+    User-context parameters still affect every session in the database,
+    including the operator's own connection used for extensions and schemas
+    (for example `default_transaction_read_only=on` makes `CREATE EXTENSION`
+    fail). Custom placeholder parameters are accepted without a context check;
+    if an extension that defines them is loaded later, their value applies
+    with that extension's rules. Restrict who may create or edit Database
+    resources accordingly.
 
 ## Ordering & Dependencies
 

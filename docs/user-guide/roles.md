@@ -11,7 +11,7 @@ The Role controller:
 3. Auto-generates a password and creates a credentials Secret
 4. Manages role memberships (GRANT, option changes, and REVOKE of memberships it granted)
 5. Grants privileges on configuration parameters (`parameterGrants`, PostgreSQL 15+)
-6. Cleans up the role on deletion (revoking its parameter grants first)
+6. Cleans up the role on deletion, revoking its privileges first (see [Deletion](#deletion))
 
 ## Example
 
@@ -239,9 +239,43 @@ spec:
   reason `UnsupportedServerVersion`; nothing is granted.
 - pgop records what it granted in `status.managedParameterGrants`. Removing a
   parameter (or turning `withGrantOption` off) revokes what pgop granted;
-  privileges granted outside pgop are never revoked.
-- When the Role is deleted, pgop revokes its managed parameter grants before
-  dropping the role (PostgreSQL refuses to drop a role that holds them).
+  privileges granted outside pgop are never revoked. A revoke of privileges
+  granted with `withGrantOption` uses `CASCADE`, so grants the role passed on
+  are revoked too.
+- Some parameters can never be granted, because SET on them lets the role
+  switch identity, load code or bypass safeguards: `role`,
+  `session_authorization`, `session_preload_libraries`,
+  `local_preload_libraries`, `shared_preload_libraries`,
+  `dynamic_library_path`, `jit_provider`, `session_replication_role` and the
+  `pgaudit.*`, `set_user.*`, `anon.*` and `sepgsql.*` namespaces. The API
+  server rejects them; a Role that still lists one (or an older object) gets
+  `Available=False` with reason `ParameterNotAllowed`, the other grants are
+  applied, and a managed grant on such a parameter is revoked.
+- Granting SET on any other superuser-only parameter is a real privilege
+  escalation for that role: for example SET on `log_statement` lets it turn
+  statement logging off for its own sessions. Grant only what the role
+  needs.
+
+## Deletion
+
+When a Role is deleted, pgop drops the PostgreSQL role. PostgreSQL refuses to
+drop a role that still holds privileges, so pgop first revokes:
+
+- the parameter privileges it granted (`status.managedParameterGrants`),
+- every database-level privilege the role holds on any database of the
+  cluster, and
+- every schema privilege the role holds, in every database,
+
+all with `CASCADE` (privileges the role passed on go with it, as with
+`DROP OWNED`). Databases whose `grants` list the role stop granting to it while
+it is being deleted, so they do not undo this.
+
+Anything else that depends on the role, such as objects it owns or privileges
+on tables, is left alone. The drop then fails, and the Role reports
+`Available=False` with reason `RoleDropBlocked` and PostgreSQL's list of
+dependents. pgop retries every 30 seconds until you resolve them (for
+example with `REASSIGN OWNED BY ... TO ...` and `DROP OWNED BY ...` in each
+database), after which the finalizer is removed.
 
 ## Role Types
 

@@ -131,16 +131,30 @@ spec:
 				g.Expect(settings).To(ContainSubstring(`myapp.note=it's \ quoted`))
 			}).Should(Succeed())
 
-			By("narrowing the grant and dropping a setting")
+			By("letting the grantee pass its privileges on (dependent privileges)")
+			_, err := psql(`CREATE ROLE grant_dep NOLOGIN`)
+			Expect(err).NotTo(HaveOccurred())
+			DeferCleanup(func() { _, _ = psql(`DROP ROLE IF EXISTS grant_dep`) })
+			_, err = psql(`SET ROLE grant_app; GRANT CREATE, CONNECT ON DATABASE grant_db TO grant_dep`)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("narrowing the grant, dropping settings and asking for a superuser-only one")
 			patch("database.pgop.ruck.io/grant-db",
-				`{"spec":{"grants":[{"role":"grant_app","privileges":["CONNECT"]}],"settings":{"search_path":null,"myapp.note":null,"work_mem":"32MB"}}}`)
+				`{"spec":{"grants":[{"role":"grant_app","privileges":["CONNECT"]}],`+
+					`"settings":{"search_path":null,"myapp.note":null,"work_mem":"32MB","log_statement":"none"}}}`)
 			Eventually(func(g Gomega) {
 				acl := query(g, dbACL)
 				g.Expect(acl).To(ContainSubstring("grant_app=c/"), "CONNECT without grant option expected, got %s", acl)
 				g.Expect(acl).NotTo(ContainSubstring("grant_app=c*"))
 				g.Expect(query(g, `SELECT has_database_privilege('grant_app', 'grant_db', 'CREATE')`)).To(Equal("f"))
-				settings := query(g, dbSettings)
-				g.Expect(settings).To(Equal("work_mem=32MB"))
+				// The revokes cascaded to what grant_app had passed on.
+				g.Expect(acl).NotTo(ContainSubstring("grant_dep="))
+				// log_statement is refused; the other settings are applied.
+				g.Expect(query(g, dbSettings)).To(Equal("work_mem=32MB"))
+				reason, err := utils.Run(exec.Command("kubectl", "get", "database.pgop.ruck.io/grant-db", "-n", namespace,
+					"-o", `jsonpath={.status.conditions[?(@.type=="Available")].reason}`))
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(strings.TrimSpace(reason)).To(Equal("SettingNotAllowed"))
 			}).Should(Succeed())
 
 			By("removing the grants and settings entirely")
@@ -152,6 +166,22 @@ spec:
 					"-o", "jsonpath={.status.managedGrants}{.status.managedSettings}"))
 				g.Expect(err).NotTo(HaveOccurred())
 				g.Expect(strings.TrimSpace(out)).To(BeEmpty())
+			}).Should(Succeed())
+			waitReady("database.pgop.ruck.io/grant-db")
+		})
+
+		It("drops a Role that a Database still grants privileges to", func() {
+			patch("database.pgop.ruck.io/grant-db", `{"spec":{"grants":[{"role":"grant_app","privileges":["CONNECT","CREATE"]}]}}`)
+			Eventually(func(g Gomega) {
+				g.Expect(query(g, dbACL)).To(ContainSubstring("grant_app="))
+			}).Should(Succeed())
+
+			By("deleting the grantee Role")
+			_, err := utils.Run(exec.Command("kubectl", "delete", "-n", namespace, "--wait=true", "--timeout=2m",
+				"role.pgop.ruck.io/grant-app"))
+			Expect(err).NotTo(HaveOccurred())
+			Eventually(func(g Gomega) {
+				g.Expect(query(g, `SELECT count(*) FROM pg_roles WHERE rolname = 'grant_app'`)).To(Equal("0"))
 			}).Should(Succeed())
 		})
 

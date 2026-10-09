@@ -18,9 +18,11 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"slices"
+	"strings"
 
 	postgresv1alpha1 "github.com/ruckc/pgop/api/v1alpha1"
 	"github.com/ruckc/pgop/internal/postgres"
@@ -32,9 +34,10 @@ import (
 type databaseGrantClient interface {
 	RoleExists(ctx context.Context, name string) (bool, error)
 	GrantDatabasePrivileges(ctx context.Context, database, role string, privileges []string, withGrantOption bool) error
-	RevokeDatabasePrivileges(ctx context.Context, database, role string, privileges []string, grantOptionOnly bool) error
+	RevokeDatabasePrivileges(ctx context.Context, database, role string, privileges []string, mode postgres.RevokeMode) error
 	SetDatabaseParameter(ctx context.Context, database, parameter, value string) error
 	ResetDatabaseParameter(ctx context.Context, database, parameter string) error
+	ParameterContext(ctx context.Context, name string) (pgContext string, found bool, err error)
 }
 
 var _ databaseGrantClient = (*postgres.Client)(nil)
@@ -60,17 +63,33 @@ func desiredDatabaseGrants(grants []postgresv1alpha1.DatabaseGrantSpec) ([]privi
 // reconcileDatabaseGrants brings the database-level privileges on pgName to
 // the state declared by database.Spec.Grants and records the grants pgop
 // manages in database.Status.ManagedGrants (the caller persists the status).
-func reconcileDatabaseGrants(ctx context.Context, pg databaseGrantClient, database *postgresv1alpha1.Database, pgName string) error {
-	desired, err := desiredDatabaseGrants(database.Spec.Grants)
+// Grantees in deleting (PostgreSQL names of Roles being deleted) are not
+// granted anything, so the Role controller can drop them; the Database
+// reports them until the grant is removed from the spec.
+func reconcileDatabaseGrants(ctx context.Context, pg databaseGrantClient, database *postgresv1alpha1.Database, pgName string, deleting map[string]bool) error {
+	all, err := desiredDatabaseGrants(database.Spec.Grants)
 	if err != nil {
 		return err
+	}
+	desired := make([]privilegeGrant, 0, len(all))
+	var paused []string
+	for _, g := range all {
+		if deleting[g.Key] {
+			paused = append(paused, g.Key)
+			continue
+		}
+		desired = append(desired, g)
+	}
+	var pausedErr error
+	if len(paused) > 0 {
+		pausedErr = fmt.Errorf("grants to %s are paused: the Role is being deleted", strings.Join(paused, ", "))
 	}
 	managed := make([]privilegeGrant, 0, len(database.Status.ManagedGrants))
 	for _, m := range database.Status.ManagedGrants {
 		managed = append(managed, privilegeGrant{Key: m.Role, Privileges: m.Privileges, WithGrantOption: m.WithGrantOption})
 	}
 	if len(desired) == 0 && len(managed) == 0 {
-		return nil
+		return pausedErr
 	}
 
 	ops := privilegeOps{
@@ -84,13 +103,13 @@ func reconcileDatabaseGrants(ctx context.Context, pg databaseGrantClient, databa
 			}
 			return pg.GrantDatabasePrivileges(ctx, pgName, g.Key, g.Privileges, g.WithGrantOption)
 		},
-		revoke: func(ctx context.Context, g privilegeGrant, grantOptionOnly bool) error {
+		revoke: func(ctx context.Context, g privilegeGrant, mode postgres.RevokeMode) error {
 			// A role that was dropped holds no privileges any more.
 			exists, err := pg.RoleExists(ctx, g.Key)
 			if err != nil || !exists {
 				return err
 			}
-			return pg.RevokeDatabasePrivileges(ctx, pgName, g.Key, g.Privileges, grantOptionOnly)
+			return pg.RevokeDatabasePrivileges(ctx, pgName, g.Key, g.Privileges, mode)
 		},
 	}
 
@@ -101,7 +120,7 @@ func reconcileDatabaseGrants(ctx context.Context, pg databaseGrantClient, databa
 			Role: g.Key, Privileges: g.Privileges, WithGrantOption: g.WithGrantOption,
 		})
 	}
-	return err
+	return errors.Join(err, pausedErr)
 }
 
 // desiredDatabaseSettings returns spec.settings keyed by normalized
@@ -121,9 +140,33 @@ func desiredDatabaseSettings(settings map[string]string) (map[string]string, err
 	return out, nil
 }
 
+// settingAllowed reports why pgop refuses to set parameter name per database,
+// or "" when it may. Parameters on the static denylist are refused, and so is
+// every parameter the server knows with a context other than "user" (only
+// superusers may set superuser-context parameters, and postmaster, sighup,
+// internal and backend parameters cannot be set per database at all): pgop
+// runs ALTER DATABASE as a superuser, so without this check a Database author
+// could set superuser-only parameters for every session. Unknown parameters
+// are custom placeholders (or typos, which PostgreSQL then rejects).
+func settingAllowed(ctx context.Context, pg databaseGrantClient, name string) (string, error) {
+	if postgres.DeniedParameter(name) {
+		return "is on pgop's denylist", nil
+	}
+	pgContext, found, err := pg.ParameterContext(ctx, name)
+	if err != nil {
+		return "", err
+	}
+	if found && pgContext != "user" {
+		return fmt.Sprintf("has context %q (only %q parameters may be set per database)", pgContext, "user"), nil
+	}
+	return "", nil
+}
+
 // reconcileDatabaseSettings applies spec.settings with ALTER DATABASE ... SET,
-// resets the settings pgop applied that were removed from the spec, and
-// records the settings pgop manages in database.Status.ManagedSettings.
+// resets the settings pgop applied that were removed from the spec (or are no
+// longer allowed), and records the settings pgop manages in
+// database.Status.ManagedSettings. Settings that are not allowed are skipped
+// and reported with reason SettingNotAllowed after the others are applied.
 func reconcileDatabaseSettings(ctx context.Context, pg databaseGrantClient, database *postgresv1alpha1.Database, pgName string) error {
 	desired, err := desiredDatabaseSettings(database.Spec.Settings)
 	if err != nil {
@@ -132,6 +175,18 @@ func reconcileDatabaseSettings(ctx context.Context, pg databaseGrantClient, data
 	managed := database.Status.ManagedSettings
 	if len(desired) == 0 && len(managed) == 0 {
 		return nil
+	}
+
+	var refused []string
+	for _, name := range slices.Sorted(maps.Keys(desired)) {
+		reason, err := settingAllowed(ctx, pg, name)
+		if err != nil {
+			return err
+		}
+		if reason != "" {
+			refused = append(refused, name+" "+reason)
+			delete(desired, name)
+		}
 	}
 
 	tracked := make(map[string]bool, len(managed)+len(desired))
@@ -159,5 +214,9 @@ func reconcileDatabaseSettings(ctx context.Context, pg databaseGrantClient, data
 		delete(tracked, name)
 	}
 	record()
+	if len(refused) > 0 {
+		return &conditionError{reason: ReasonSettingNotAllowed,
+			err: fmt.Errorf("settings not allowed: %s", strings.Join(refused, "; "))}
+	}
 	return nil
 }

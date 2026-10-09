@@ -20,6 +20,8 @@ import (
 	"context"
 	"slices"
 	"strings"
+
+	"github.com/ruckc/pgop/internal/postgres"
 )
 
 // privilegeGrant is a set of privileges on one object, identified by Key:
@@ -42,6 +44,8 @@ type privilegePlan struct {
 	// option pgop granted and is no longer desired.
 	RevokeGrantOption []privilegeGrant
 	// Revoke lists privileges pgop granted that are no longer desired.
+	// WithGrantOption is set when pgop granted them with the grant option,
+	// so the REVOKE must cascade to privileges the grantee passed on.
 	Revoke []privilegeGrant
 }
 
@@ -90,7 +94,7 @@ func diffPrivilegeGrants(desired, managed []privilegeGrant) privilegePlan {
 			continue
 		}
 		if removed := subtract(m.Privileges, d.Privileges); len(removed) > 0 {
-			plan.Revoke = append(plan.Revoke, privilegeGrant{Key: m.Key, Privileges: removed})
+			plan.Revoke = append(plan.Revoke, privilegeGrant{Key: m.Key, Privileges: removed, WithGrantOption: m.WithGrantOption})
 		}
 		if m.WithGrantOption && !d.WithGrantOption {
 			if kept := intersect(m.Privileges, d.Privileges); len(kept) > 0 {
@@ -104,7 +108,7 @@ func diffPrivilegeGrants(desired, managed []privilegeGrant) privilegePlan {
 // privilegeOps issues the GRANT and REVOKE statements for one object type.
 type privilegeOps struct {
 	grant  func(ctx context.Context, g privilegeGrant) error
-	revoke func(ctx context.Context, g privilegeGrant, grantOptionOnly bool) error
+	revoke func(ctx context.Context, g privilegeGrant, mode postgres.RevokeMode) error
 }
 
 // applyPrivilegeGrants brings the managed grants to desired and returns the
@@ -132,7 +136,9 @@ func applyPrivilegeGrants(ctx context.Context, desired, managed []privilegeGrant
 		}
 	}
 	for _, g := range plan.RevokeGrantOption {
-		if err := ops.revoke(ctx, g, true); err != nil {
+		// The grant option was granted by pgop, so the grantee may have
+		// passed the privileges on: cascade, or the REVOKE fails forever.
+		if err := ops.revoke(ctx, g, postgres.RevokeMode{GrantOptionOnly: true, Cascade: true}); err != nil {
 			return snapshot(), err
 		}
 		t := tracked[g.Key]
@@ -140,7 +146,7 @@ func applyPrivilegeGrants(ctx context.Context, desired, managed []privilegeGrant
 		tracked[g.Key] = t
 	}
 	for _, g := range plan.Revoke {
-		if err := ops.revoke(ctx, g, false); err != nil {
+		if err := ops.revoke(ctx, g, postgres.RevokeMode{Cascade: g.WithGrantOption}); err != nil {
 			return snapshot(), err
 		}
 		t := tracked[g.Key]

@@ -36,11 +36,20 @@ import (
 
 // Names used by the grant tests.
 const (
-	grantTestRole       = "app"
-	grantTestParam      = "myapp.tenant"
-	grantTestMixedCase  = "Work_Mem"
-	grantTestAdmin      = "admin"
-	grantTestSearchPath = "search_path"
+	grantTestRole            = "app"
+	grantTestParam           = "myapp.tenant"
+	grantTestMixedCase       = "Work_Mem"
+	grantTestAdmin           = "admin"
+	grantTestSearchPath      = "search_path"
+	grantTestValue           = "64MB"
+	grantTestSuperuserParam  = "log_statement"
+	grantTestAuditParam      = "pgaudit.log"
+	grantTestReplicationRole = "session_replication_role"
+	grantTestOther           = "other"
+	grantTestTenant          = "acme"
+	grantTestPostmasterParam = "shared_buffers"
+	grantTestRoleParam       = "role"
+	grantTestLeaving         = "leaving"
 )
 
 // fakeGrantClient records statements issued for database grants, database
@@ -48,8 +57,11 @@ const (
 type fakeGrantClient struct {
 	version int
 	roles   map[string]bool // existing roles; nil means every role exists
-	failOn  string          // substring of a recorded call that fails
-	calls   []string
+	// contexts maps parameter names to their pg_settings context; missing
+	// names are unknown (custom placeholders).
+	contexts map[string]string
+	failOn   string // substring of a recorded call that fails
+	calls    []string
 }
 
 func (f *fakeGrantClient) record(call string) error {
@@ -70,8 +82,14 @@ func (f *fakeGrantClient) GrantDatabasePrivileges(_ context.Context, db, role st
 	return f.record(fmt.Sprintf("grant %s on %s to %s wgo=%t", strings.Join(privs, ","), db, role, wgo))
 }
 
-func (f *fakeGrantClient) RevokeDatabasePrivileges(_ context.Context, db, role string, privs []string, gOnly bool) error {
-	return f.record(fmt.Sprintf("revoke %s on %s from %s optionOnly=%t", strings.Join(privs, ","), db, role, gOnly))
+func (f *fakeGrantClient) RevokeDatabasePrivileges(_ context.Context, db, role string, privs []string, mode postgres.RevokeMode) error {
+	return f.record(fmt.Sprintf("revoke %s on %s from %s optionOnly=%t cascade=%t",
+		strings.Join(privs, ","), db, role, mode.GrantOptionOnly, mode.Cascade))
+}
+
+func (f *fakeGrantClient) ParameterContext(_ context.Context, name string) (string, bool, error) {
+	c, ok := f.contexts[name]
+	return c, ok, nil
 }
 
 func (f *fakeGrantClient) SetDatabaseParameter(_ context.Context, db, name, value string) error {
@@ -86,8 +104,9 @@ func (f *fakeGrantClient) GrantParameterPrivileges(_ context.Context, param, rol
 	return f.record(fmt.Sprintf("grant %s on parameter %s to %s wgo=%t", strings.Join(privs, ","), param, role, wgo))
 }
 
-func (f *fakeGrantClient) RevokeParameterPrivileges(_ context.Context, param, role string, privs []string, gOnly bool) error {
-	return f.record(fmt.Sprintf("revoke %s on parameter %s from %s optionOnly=%t", strings.Join(privs, ","), param, role, gOnly))
+func (f *fakeGrantClient) RevokeParameterPrivileges(_ context.Context, param, role string, privs []string, mode postgres.RevokeMode) error {
+	return f.record(fmt.Sprintf("revoke %s on parameter %s from %s optionOnly=%t cascade=%t",
+		strings.Join(privs, ","), param, role, mode.GrantOptionOnly, mode.Cascade))
 }
 
 var _ = Describe("Privilege grants", func() {
@@ -121,7 +140,33 @@ var _ = Describe("Privilege grants", func() {
 				[]pg{{Key: "a", Privileges: []string{postgres.PrivilegeConnect}}},
 				[]pg{{Key: "a", Privileges: []string{postgres.PrivilegeConnect, postgres.PrivilegeCreate}, WithGrantOption: true}})
 			Expect(plan.RevokeGrantOption).To(Equal([]pg{{Key: "a", Privileges: []string{postgres.PrivilegeConnect}}}))
-			Expect(plan.Revoke).To(Equal([]pg{{Key: "a", Privileges: []string{postgres.PrivilegeCreate}}}))
+			// Granted with the grant option: the revoke must cascade.
+			Expect(plan.Revoke).To(Equal([]pg{{Key: "a", Privileges: []string{postgres.PrivilegeCreate}, WithGrantOption: true}}))
+		})
+
+		It("cascades every revoke of privileges granted with the grant option", func() {
+			var modes []postgres.RevokeMode
+			ops := privilegeOps{
+				grant: func(context.Context, privilegeGrant) error { return nil },
+				revoke: func(_ context.Context, _ privilegeGrant, mode postgres.RevokeMode) error {
+					modes = append(modes, mode)
+					return nil
+				},
+			}
+			_, err := applyPrivilegeGrants(ctx,
+				[]pg{{Key: "a", Privileges: []string{postgres.PrivilegeConnect}}},
+				[]pg{
+					{Key: "a", Privileges: []string{postgres.PrivilegeConnect, postgres.PrivilegeCreate}, WithGrantOption: true},
+					{Key: "b", Privileges: []string{postgres.PrivilegeConnect}, WithGrantOption: true},
+					{Key: "c", Privileges: []string{postgres.PrivilegeConnect}},
+				}, ops)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(modes).To(Equal([]postgres.RevokeMode{
+				{GrantOptionOnly: true, Cascade: true}, // a: CONNECT keeps, grant option goes
+				{Cascade: true},                        // a: CREATE
+				{Cascade: true},                        // b
+				{},                                     // c: never had the grant option
+			}))
 		})
 
 		It("never revokes privileges it did not grant", func() {
@@ -141,7 +186,7 @@ var _ = Describe("Privilege grants", func() {
 		It("is a no-op without grants", func() {
 			f := &fakeGrantClient{}
 			db := newDB(nil)
-			Expect(reconcileDatabaseGrants(ctx, f, db, "app_db")).To(Succeed())
+			Expect(reconcileDatabaseGrants(ctx, f, db, "app_db", nil)).To(Succeed())
 			Expect(f.calls).To(BeEmpty())
 			Expect(db.Status.ManagedGrants).To(BeNil())
 		})
@@ -152,7 +197,7 @@ var _ = Describe("Privilege grants", func() {
 				{Role: grantTestRole, Privileges: []string{postgres.PrivilegeConnect, postgres.PrivilegeTemp}},
 				{Role: grantTestAdmin, Privileges: []string{postgres.PrivilegeAll}, WithGrantOption: true},
 			})
-			Expect(reconcileDatabaseGrants(ctx, f, db, "app_db")).To(Succeed())
+			Expect(reconcileDatabaseGrants(ctx, f, db, "app_db", nil)).To(Succeed())
 			Expect(f.calls).To(Equal([]string{
 				"grant CONNECT,TEMPORARY on app_db to app wgo=false",
 				"grant CONNECT,CREATE,TEMPORARY on app_db to admin wgo=true",
@@ -168,12 +213,12 @@ var _ = Describe("Privilege grants", func() {
 			db := newDB([]postgresv1alpha1.DatabaseGrantSpec{{Role: grantTestRole, Privileges: []string{postgres.PrivilegeConnect}}},
 				postgresv1alpha1.ManagedDatabaseGrant{Role: grantTestRole, Privileges: []string{postgres.PrivilegeConnect, postgres.PrivilegeCreate}, WithGrantOption: true},
 				postgresv1alpha1.ManagedDatabaseGrant{Role: "old", Privileges: []string{postgres.PrivilegeConnect}})
-			Expect(reconcileDatabaseGrants(ctx, f, db, "app_db")).To(Succeed())
+			Expect(reconcileDatabaseGrants(ctx, f, db, "app_db", nil)).To(Succeed())
 			Expect(f.calls).To(Equal([]string{
 				"grant CONNECT on app_db to app wgo=false",
-				"revoke CONNECT on app_db from app optionOnly=true",
-				"revoke CREATE on app_db from app optionOnly=false",
-				"revoke CONNECT on app_db from old optionOnly=false",
+				"revoke CONNECT on app_db from app optionOnly=true cascade=true",
+				"revoke CREATE on app_db from app optionOnly=false cascade=true",
+				"revoke CONNECT on app_db from old optionOnly=false cascade=false",
 			}))
 			Expect(db.Status.ManagedGrants).To(Equal([]postgresv1alpha1.ManagedDatabaseGrant{
 				{Role: grantTestRole, Privileges: []string{postgres.PrivilegeConnect}},
@@ -186,7 +231,7 @@ var _ = Describe("Privilege grants", func() {
 				{Role: grantTestRole, Privileges: []string{postgres.PrivilegeConnect}},
 				{Role: "later", Privileges: []string{postgres.PrivilegeConnect}},
 			})
-			err := reconcileDatabaseGrants(ctx, f, db, "app_db")
+			err := reconcileDatabaseGrants(ctx, f, db, "app_db", nil)
 			Expect(err).To(MatchError(ContainSubstring(`PostgreSQL role "later" does not exist yet`)))
 			Expect(db.Status.ManagedGrants).To(Equal([]postgresv1alpha1.ManagedDatabaseGrant{
 				{Role: grantTestRole, Privileges: []string{postgres.PrivilegeConnect}},
@@ -196,7 +241,7 @@ var _ = Describe("Privilege grants", func() {
 		It("forgets a managed grant whose role was dropped without revoking", func() {
 			f := &fakeGrantClient{roles: map[string]bool{}}
 			db := newDB(nil, postgresv1alpha1.ManagedDatabaseGrant{Role: "dropped", Privileges: []string{postgres.PrivilegeConnect}})
-			Expect(reconcileDatabaseGrants(ctx, f, db, "app_db")).To(Succeed())
+			Expect(reconcileDatabaseGrants(ctx, f, db, "app_db", nil)).To(Succeed())
 			Expect(f.calls).To(BeEmpty())
 			Expect(db.Status.ManagedGrants).To(BeNil())
 		})
@@ -204,7 +249,7 @@ var _ = Describe("Privilege grants", func() {
 		It("keeps a pending revoke tracked when it fails", func() {
 			f := &fakeGrantClient{failOn: "from old"}
 			db := newDB(nil, postgresv1alpha1.ManagedDatabaseGrant{Role: "old", Privileges: []string{postgres.PrivilegeConnect}})
-			Expect(reconcileDatabaseGrants(ctx, f, db, "app_db")).NotTo(Succeed())
+			Expect(reconcileDatabaseGrants(ctx, f, db, "app_db", nil)).NotTo(Succeed())
 			Expect(db.Status.ManagedGrants).To(HaveLen(1))
 		})
 
@@ -213,8 +258,25 @@ var _ = Describe("Privilege grants", func() {
 			db := newDB([]postgresv1alpha1.DatabaseGrantSpec{
 				{Role: grantTestRole, Privileges: []string{"CONNECT; DROP DATABASE app_db"}},
 			})
-			Expect(reconcileDatabaseGrants(ctx, f, db, "app_db")).To(MatchError(ContainSubstring("invalid database privilege")))
+			Expect(reconcileDatabaseGrants(ctx, f, db, "app_db", nil)).To(MatchError(ContainSubstring("invalid database privilege")))
 			Expect(f.calls).To(BeEmpty())
+		})
+
+		It("pauses grants to roles that are being deleted", func() {
+			f := &fakeGrantClient{}
+			db := newDB([]postgresv1alpha1.DatabaseGrantSpec{
+				{Role: grantTestRole, Privileges: []string{postgres.PrivilegeConnect}},
+				{Role: grantTestLeaving, Privileges: []string{postgres.PrivilegeConnect}},
+			}, postgresv1alpha1.ManagedDatabaseGrant{Role: grantTestLeaving, Privileges: []string{postgres.PrivilegeConnect}})
+			err := reconcileDatabaseGrants(ctx, f, db, "app_db", map[string]bool{grantTestLeaving: true})
+			Expect(err).To(MatchError(ContainSubstring("grants to leaving are paused")))
+			Expect(f.calls).To(Equal([]string{
+				"grant CONNECT on app_db to app wgo=false",
+				"revoke CONNECT on app_db from leaving optionOnly=false cascade=false",
+			}))
+			Expect(db.Status.ManagedGrants).To(Equal([]postgresv1alpha1.ManagedDatabaseGrant{
+				{Role: grantTestRole, Privileges: []string{postgres.PrivilegeConnect}},
+			}))
 		})
 	})
 
@@ -222,7 +284,7 @@ var _ = Describe("Privilege grants", func() {
 		It("sets desired settings, resets removed managed ones and records them", func() {
 			f := &fakeGrantClient{}
 			db := &postgresv1alpha1.Database{Spec: postgresv1alpha1.DatabaseSpec{
-				Settings: map[string]string{testWorkMem: "64MB", "MyApp.Tenant": "acme"},
+				Settings: map[string]string{testWorkMem: grantTestValue, "MyApp.Tenant": grantTestTenant},
 			}}
 			db.Status.ManagedSettings = []string{"statement_timeout", testWorkMem}
 			Expect(reconcileDatabaseSettings(ctx, f, db, "app_db")).To(Succeed())
@@ -252,6 +314,32 @@ var _ = Describe("Privilege grants", func() {
 			Expect(reconcileDatabaseSettings(ctx, f, db, "app_db")).To(MatchError(ContainSubstring("more than once")))
 			Expect(f.calls).To(BeEmpty())
 		})
+
+		It("refuses denylisted and superuser-only parameters but applies the rest", func() {
+			f := &fakeGrantClient{contexts: map[string]string{
+				testWorkMem: "user", grantTestSuperuserParam: "superuser", grantTestPostmasterParam: "postmaster",
+			}}
+			db := &postgresv1alpha1.Database{Spec: postgresv1alpha1.DatabaseSpec{Settings: map[string]string{
+				testWorkMem: grantTestValue, grantTestSuperuserParam: "none", grantTestPostmasterParam: "1GB",
+				"Session_Replication_Role": "replica", grantTestRoleParam: "postgres", grantTestAuditParam: "none",
+				grantTestParam: grantTestTenant,
+			}}}
+			// A setting applied before it became disallowed is reset.
+			db.Status.ManagedSettings = []string{grantTestReplicationRole}
+			err := reconcileDatabaseSettings(ctx, f, db, "app_db")
+			ce, ok := errors.AsType[*conditionError](err)
+			Expect(ok).To(BeTrue(), "expected a conditionError, got %v", err)
+			Expect(ce.reason).To(Equal(ReasonSettingNotAllowed))
+			for _, name := range []string{grantTestSuperuserParam, grantTestPostmasterParam, grantTestReplicationRole, grantTestRoleParam, grantTestAuditParam} {
+				Expect(err.Error()).To(ContainSubstring(name))
+			}
+			Expect(f.calls).To(Equal([]string{
+				"set myapp.tenant on app_db to acme",
+				"set work_mem on app_db to 64MB",
+				"reset session_replication_role on app_db",
+			}))
+			Expect(db.Status.ManagedSettings).To(Equal([]string{grantTestParam, testWorkMem}))
+		})
 	})
 
 	Describe("reconcileParameterGrants", func() {
@@ -277,10 +365,10 @@ var _ = Describe("Privilege grants", func() {
 			Expect(f.calls).To(Equal([]string{
 				"grant SET on parameter log_statement to app wgo=false",
 				"grant SET on parameter myapp.tenant to app wgo=true",
-				"revoke SET on parameter work_mem from app optionOnly=false",
+				"revoke SET on parameter work_mem from app optionOnly=false cascade=false",
 			}))
 			Expect(role.Status.ManagedParameterGrants).To(Equal([]postgresv1alpha1.ManagedParameterGrant{
-				{Parameter: "log_statement", Privileges: []string{postgres.PrivilegeSet}},
+				{Parameter: grantTestSuperuserParam, Privileges: []string{postgres.PrivilegeSet}},
 				{Parameter: grantTestParam, Privileges: []string{postgres.PrivilegeSet}, WithGrantOption: true},
 			}))
 		})
@@ -303,12 +391,31 @@ var _ = Describe("Privilege grants", func() {
 			Expect(f.calls).To(BeEmpty())
 		})
 
+		It("refuses denylisted parameters, grants the rest and revokes a managed denied grant", func() {
+			f := &fakeGrantClient{version: 180001}
+			role := newRole([]postgresv1alpha1.ParameterGrantSpec{
+				{Parameter: grantTestRoleParam}, {Parameter: "Session_Authorization"}, {Parameter: testWorkMem},
+			}, postgresv1alpha1.ManagedParameterGrant{Parameter: grantTestReplicationRole, Privileges: []string{postgres.PrivilegeSet}})
+			err := reconcileParameterGrants(ctx, f, role, grantTestRole)
+			ce, ok := errors.AsType[*conditionError](err)
+			Expect(ok).To(BeTrue(), "expected a conditionError, got %v", err)
+			Expect(ce.reason).To(Equal(ReasonParameterNotAllowed))
+			Expect(err.Error()).To(ContainSubstring("role, session_authorization"))
+			Expect(f.calls).To(Equal([]string{
+				"grant SET on parameter work_mem to app wgo=false",
+				"revoke SET on parameter session_replication_role from app optionOnly=false cascade=false",
+			}))
+			Expect(role.Status.ManagedParameterGrants).To(Equal([]postgresv1alpha1.ManagedParameterGrant{
+				{Parameter: testWorkMem, Privileges: []string{postgres.PrivilegeSet}},
+			}))
+		})
+
 		It("revokes every managed grant before the role is dropped", func() {
 			f := &fakeGrantClient{version: 180001}
 			role := newRole([]postgresv1alpha1.ParameterGrantSpec{{Parameter: testWorkMem}},
 				postgresv1alpha1.ManagedParameterGrant{Parameter: testWorkMem, Privileges: []string{postgres.PrivilegeSet}})
 			Expect(revokeManagedParameterGrants(ctx, f, role, grantTestRole)).To(Succeed())
-			Expect(f.calls).To(Equal([]string{"revoke SET on parameter work_mem from app optionOnly=false"}))
+			Expect(f.calls).To(Equal([]string{"revoke SET on parameter work_mem from app optionOnly=false cascade=false"}))
 			Expect(role.Status.ManagedParameterGrants).To(BeNil())
 		})
 	})
@@ -348,7 +455,7 @@ var _ = Describe("Grant and settings CRD validation", func() {
 				{Role: grantTestRole, Privileges: []string{postgres.PrivilegeConnect, postgres.PrivilegeTemp}},
 				{Role: grantTestAdmin, Privileges: []string{postgres.PrivilegeAll}, WithGrantOption: true},
 			},
-			Settings: map[string]string{testWorkMem: "64MB", grantTestParam: "acme", grantTestSearchPath: `"$user", app, public`},
+			Settings: map[string]string{testWorkMem: grantTestValue, grantTestParam: grantTestTenant, grantTestSearchPath: `"$user", app, public`},
 			Schemas: []postgresv1alpha1.SchemaSpec{{
 				Name:   grantTestRole,
 				Grants: []postgresv1alpha1.GrantSpec{{Role: grantTestRole, Privileges: []string{postgres.PrivilegeUsage, postgres.PrivilegeCreate}}},
@@ -420,7 +527,7 @@ var _ = Describe("Grant and settings CRD validation", func() {
 
 	It("accepts parameter grants and defaults privileges to SET", func() {
 		role := newRole([]postgresv1alpha1.ParameterGrantSpec{
-			{Parameter: "log_statement"},
+			{Parameter: grantTestSuperuserParam},
 			{Parameter: "myapp.tenant_id", Privileges: []string{postgres.PrivilegeSet}, WithGrantOption: true},
 		})
 		Expect(k8sClient.Create(ctx, role)).To(Succeed())
@@ -440,5 +547,38 @@ var _ = Describe("Grant and settings CRD validation", func() {
 		Entry("injection in privilege", postgresv1alpha1.ParameterGrantSpec{Parameter: testWorkMem, Privileges: []string{"SET; DROP ROLE x"}}),
 		Entry("injection in parameter", postgresv1alpha1.ParameterGrantSpec{Parameter: "work_mem TO x; --"}),
 		Entry("empty parameter", postgresv1alpha1.ParameterGrantSpec{Parameter: ""}),
+		Entry(grantTestRoleParam, postgresv1alpha1.ParameterGrantSpec{Parameter: grantTestRoleParam}),
+		Entry("session_authorization", postgresv1alpha1.ParameterGrantSpec{Parameter: "Session_Authorization"}),
+		Entry(grantTestReplicationRole, postgresv1alpha1.ParameterGrantSpec{Parameter: grantTestReplicationRole}),
+		Entry("preload libraries", postgresv1alpha1.ParameterGrantSpec{Parameter: "session_preload_libraries"}),
+		Entry("pgaudit", postgresv1alpha1.ParameterGrantSpec{Parameter: grantTestAuditParam}),
+	)
+
+	It("accepts schema privileges in any case and ALL PRIVILEGES", func() {
+		db := newDatabase(postgresv1alpha1.DatabaseSpec{
+			Schemas: []postgresv1alpha1.SchemaSpec{{
+				Name: grantTestRole,
+				Grants: []postgresv1alpha1.GrantSpec{
+					{Role: grantTestRole, Privileges: []string{"usage", "Create"}},
+					{Role: grantTestAdmin, Privileges: []string{"ALL PRIVILEGES"}},
+					{Role: grantTestOther, Privileges: []string{"all"}},
+				},
+			}},
+		})
+		Expect(k8sClient.Create(ctx, db)).To(Succeed())
+		_ = k8sClient.Delete(ctx, db)
+	})
+
+	DescribeTable("rejects denylisted settings keys",
+		func(key string) {
+			expectInvalid(newDatabase(postgresv1alpha1.DatabaseSpec{Settings: map[string]string{key: "x"}}))
+		},
+		Entry(grantTestRoleParam, grantTestRoleParam),
+		Entry("session_authorization", "SESSION_AUTHORIZATION"),
+		Entry("session_preload_libraries", "session_preload_libraries"),
+		Entry("local_preload_libraries", "local_preload_libraries"),
+		Entry("dynamic_library_path", "dynamic_library_path"),
+		Entry(grantTestReplicationRole, grantTestReplicationRole),
+		Entry("pgaudit", grantTestAuditParam),
 	)
 })
