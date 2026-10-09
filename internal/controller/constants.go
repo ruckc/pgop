@@ -135,6 +135,21 @@ const (
 	// pod was recreated while the operator was not running.
 	LabelStatefulSetPodName = "statefulset.kubernetes.io/pod-name"
 
+	// LabelStreaming is set by the operator on standby pods: "true" while the
+	// standby streams from the primary (pg_stat_replication). The
+	// "<cluster>-ro" Service only selects streaming standbys.
+	LabelStreaming = "pgop.ruck.io/streaming"
+	labelValueTrue = "true"
+
+	// AnnotationPasswordSyncRestart on the credentials Secret records that
+	// the primary was restarted once because it rejected the operator
+	// password (value: fingerprint of that password).
+	AnnotationPasswordSyncRestart = "pgop.ruck.io/password-sync-restart"
+	// AnnotationAllowPrimaryInit on a Cluster ("true") allows the primary to
+	// initialize an empty data directory although the Cluster held data
+	// before (see initializedMarkerKey).
+	AnnotationAllowPrimaryInit = "pgop.ruck.io/allow-primary-init"
+
 	// ReplicationUsername is the role standbys use for streaming replication.
 	ReplicationUsername = "pgop_replicator"
 	// SecretKeyReplicationPassword is the credentials Secret key holding the

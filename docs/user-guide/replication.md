@@ -55,10 +55,16 @@ Requires Kubernetes 1.27 or later (the documented minimum for pgop).
 - The read-write Service selects the primary pod by its StatefulSet pod name
   (`statefulset.kubernetes.io/pod-name: <cluster>-0`), so it never routes to a
   standby, and keeps working while the operator is not running.
-- The read-only Service selects `pgop.ruck.io/role: replica`. The operator
-  sets the role labels (the StatefulSet pod template cannot carry per-pod
-  labels); a standby pod that was recreated joins `<cluster>-ro` once the
-  operator has labelled it.
+- The read-only Service selects `pgop.ruck.io/role: replica` **and**
+  `pgop.ruck.io/streaming: "true"`. The operator sets both labels (the
+  StatefulSet pod template cannot carry per-pod labels) from
+  `pg_stat_replication` on the primary: a standby joins `<cluster>-ro` once it
+  streams, and leaves it when it stops streaming (it is cloning or catching
+  up, its slot was invalidated, it holds data of another primary, or it cannot
+  authenticate), so it does not serve stale data indefinitely. While the
+  primary is down the labels are left as they are, so the standbys keep
+  serving (possibly stale) reads. Labels are updated within about 30 seconds,
+  and only while the operator runs.
 - `<cluster>-ro` exists only while `replicas` is greater than 1. Writes
   through it fail (`cannot execute INSERT in a read-only transaction`).
 - The operator, Role and Database reconciles, backups and restores all go
@@ -142,11 +148,29 @@ to override it (`-1` = unlimited). When a slot exceeds it, PostgreSQL
 invalidates the slot and that standby must be re-cloned (see
 [Re-cloning a standby](#re-cloning-a-standby)).
 
+The slot of a standby is created when its pod is created, not ahead of time,
+so a slot never holds back WAL for a standby that is still waiting for its
+predecessors to start. While a standby clones, its WAL stream uses the slot,
+so the slot keeps up during a normal clone.
+
+If a slot is invalidated anyway (`wal_status = 'lost'`, the standby was down
+or behind by more than `max_slot_wal_keep_size`), the operator drops and
+re-creates it once it is not in use, records a `ReplicationSlotInvalidated`
+Warning event, names the standby in the `ReplicationHealthy` message and takes
+it out of `<cluster>-ro`. The standby itself cannot catch up any more and must
+be [re-cloned](#re-cloning-a-standby).
+
 `wal_level`, `max_wal_senders`, `max_replication_slots`, `hot_standby`,
 `primary_conninfo` and `primary_slot_name` are reserved and cannot be set in
-`spec.parameters`. The PostgreSQL defaults (`replica`, 10, 10, `on`) are
-enough for up to 10 instances. All other parameters, and TLS settings, apply
-to every instance.
+`spec.parameters`. `wal_level` stays `replica` and `hot_standby` `on`;
+`max_wal_senders` and `max_replication_slots` are set to 32 (fixed, so
+scaling never restarts the pods; enough for two concurrent clones per standby
+at 10 instances). All other parameters, and TLS settings, apply to every
+instance.
+
+The default `max_slot_wal_keep_size` is a server option in the pod template:
+changing `storage.size` (without setting `max_slot_wal_keep_size` in
+`spec.parameters`) restarts the pods once.
 
 ### Synchronous replication
 
@@ -197,12 +221,16 @@ read-write outage; the standbys keep serving reads and reconnect afterwards.
 
 ## Monitoring
 
+- `status.ready` and the `Available` condition follow the **primary only**: a
+  standby that is cloning, down or stuck never makes the Cluster unavailable,
+  never turns `TLSReady` off or downgrades the `sslmode` published to clients
+  from `verify-full`, and never blocks Role and Database reconciles.
 - `status.readyInstances`, `status.currentPrimary`, `status.readOnlyEndpoint`.
 - The `ReplicationHealthy` condition is `True` (reason `Streaming`) when every
   standby streams. Otherwise it is `False` with reason `StandbyNotStreaming`
   (naming the standbys that are not streaming: still cloning, catching up or
   disconnected), `WaitingForPrimary` or `ReplicationError`. It never affects
-  `Available`, which is `True` once every instance is ready.
+  `Available`.
 - On the primary:
 
   ```sql
@@ -236,11 +264,57 @@ promotion.
 
 ### Primary volume lost
 
-If `data-<cluster>-0` is lost while standbys are still running, the primary's
-init container refuses to run `initdb` (the pod stays in `Init` with a message
-in the `pgop-bootstrap` logs), because an empty new primary would discard the
-data the standbys hold. Recover the primary's volume from a backup, or, to
-start over, scale the Cluster to 1 instance (removing the standbys) first.
+Once the operator has reached the primary of a Cluster with standbys, it
+records in the ConfigMap `<cluster>-hba` (key `pgop-initialized`, mounted into
+the init container) that the Cluster holds data. The same happens when
+standby volumes exist but the primary's does not (for example a Cluster
+recreated after only `data-<cluster>-0` was deleted). From then on, if
+`data-<cluster>-0` is lost or replaced by an empty volume, the primary's init
+container **refuses to run `initdb`**: the pod stays in `Init` with a message
+in the `pgop-bootstrap` logs, instead of starting a new, empty database next
+to standbys (or retained volumes) holding the real data. Independently, it
+also refuses while standbys answer on `<cluster>-ro`.
+
+Recover the primary's volume from a backup. To deliberately start over with an
+empty database, set the annotation `pgop.ruck.io/allow-primary-init: "true"`
+on the Cluster (the operator removes the marker), let the primary initialize,
+and remove the annotation again. Standbys that hold data of the old primary
+then cannot stream (they stay out of `<cluster>-ro`) and must be re-cloned.
+
+### Changing the replication password
+
+Editing `replication-password` in `<cluster>-credentials` sets the new
+password on the primary and restarts the standby pods (not the primary) so
+they read it; the standbys reconnect within seconds and `<cluster>-ro` is
+briefly unavailable.
+
+### Manual scaling of the StatefulSet
+
+The operator owns `spec.replicas` of the StatefulSet: a manual
+`kubectl scale statefulset` is reverted on the next reconcile (also from 0).
+
+### Restores and the password-sync hook
+
+Every pod runs a postStart hook that sets the operator's password in the
+database to the one in `<cluster>-credentials`. On Clusters with standbys the
+hook skips instances in recovery (standbys, and a server recovering a
+physical backup), where `ALTER ROLE` would fail. Known limitations:
+
+- **Single-instance Clusters** (that never had standbys) keep the original
+  hook, which does not skip recovery, so their pod template stays unchanged
+  on operator upgrade. A [physical restore](restores.md) to a point in time
+  leaves the server paused in recovery (pgBackRest `--target-action=pause`),
+  the hook fails and the container is restarted in a loop. Workaround: finish
+  recovery before starting the pod normally (restore with
+  `--target-action=promote`, or remove `recovery.signal` / run
+  `SELECT pg_wal_replay_resume()` in a debug pod), or temporarily scale the
+  Cluster to 2 instances so the recovery-aware hook is used. A fix is tracked
+  separately.
+- **Clusters with standbys:** after a restore, the hook skipped the password
+  sync while the server was recovering, so the primary may reject the
+  operator password (`28P01`) once recovery ends. The operator then restarts
+  the primary pod once per password value, which syncs it. If the server
+  stays paused in recovery, resume or promote it first.
 
 ## Backups and restores
 

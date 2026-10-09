@@ -64,7 +64,7 @@ spec:
 
 | Field | Description |
 |-------|-------------|
-| `ready` | Whether the cluster is ready to accept connections |
+| `ready` | Whether the cluster is ready to accept connections: the primary pod is ready (standbys never affect it) |
 | `endpoint` | Read-write Service endpoint (hostname:port); always the primary |
 | `readOnlyEndpoint` | Read-only Service endpoint `<cluster>-ro` (hostname:port); only with `replicas` > 1 |
 | `readyInstances` | Number of ready PostgreSQL pods |
@@ -149,7 +149,7 @@ updated:
 | `include`, `include_dir`, `include_if_exists` | Would read arbitrary files |
 | `ssl`, `ssl_cert_file`, `ssl_key_file`, `ssl_min_protocol_version` | Controlled by [`spec.tls`](#tls) |
 | `archive_mode`, `archive_command`, `archive_library`, `restore_command` | Reserved for operator-managed WAL archiving (physical backups) |
-| `wal_level`, `max_wal_senders`, `max_replication_slots`, `hot_standby` | Streaming [replication](replication.md) depends on them; they keep the PostgreSQL defaults (`replica`, `10`, `10`, `on`) |
+| `wal_level`, `max_wal_senders`, `max_replication_slots`, `hot_standby` | Streaming [replication](replication.md) depends on them: `wal_level` stays `replica`, `hot_standby` stays `on`, and Clusters that have had standbys run with `max_wal_senders` and `max_replication_slots` set to `32` |
 | `primary_conninfo`, `primary_slot_name` | Set by the operator for standbys |
 
 `max_slot_wal_keep_size` can be set; with standbys it otherwise defaults to a

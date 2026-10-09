@@ -265,6 +265,7 @@ var _ = Describe("Self-managed TLS", func() {
 			sts.Status.Replicas = 1
 			sts.Status.ReadyReplicas = 1
 			Expect(k8sClient.Status().Update(ctx, sts)).To(Succeed())
+			ensureSTSPod(sts, 0, true)
 		}
 
 		It("accepts spec.tls without secretName or issuerRef", func() {

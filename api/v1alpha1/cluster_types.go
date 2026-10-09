@@ -49,7 +49,10 @@ type ClusterSpec struct {
 	// Pod <cluster>-0 is the primary. The other pods clone it with
 	// pg_basebackup and stream from it over a dedicated replication slot. The
 	// Service "<cluster>" always routes to the primary; with more than one
-	// instance the Service "<cluster>-ro" routes to the standbys (read-only).
+	// instance the Service "<cluster>-ro" routes to the standbys that stream
+	// (read-only). status.ready and the Available condition follow the
+	// primary only; standby health is reported by status.readyInstances and
+	// the ReplicationHealthy condition.
 	// There is no automated failover: when the primary is down, writes are
 	// unavailable until it is back.
 	//
@@ -118,10 +121,11 @@ type ClusterSpec struct {
 // locations; include directives (which would read arbitrary files); the TLS
 // settings controlled by spec.tls; WAL archiving / restore_command, which
 // are reserved for operator-managed physical backups; and the settings
-// streaming replication (spec.replicas > 1) depends on: wal_level,
-// max_wal_senders and max_replication_slots keep their defaults (replica,
-// 10, 10), hot_standby stays on so standbys serve reads, and
-// primary_conninfo / primary_slot_name are set by the operator.
+// streaming replication (spec.replicas > 1) depends on: wal_level keeps its
+// default (replica), max_wal_senders and max_replication_slots are set to 32
+// by the operator once the Cluster has had standbys, hot_standby stays on so
+// standbys serve reads, and primary_conninfo / primary_slot_name are set by
+// the operator.
 //
 // This is the single list to change when relaxing a reservation. The CEL rule
 // on ClusterSpec.Parameters must list exactly these names (lower case); a

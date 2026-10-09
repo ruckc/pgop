@@ -33,7 +33,10 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	"github.com/lib/pq"
 
 	postgresv1alpha1 "github.com/ruckc/pgop/api/v1alpha1"
 	"github.com/ruckc/pgop/internal/postgres"
@@ -175,6 +178,10 @@ var _ = Describe("Replication helpers", func() {
 		sts.Spec.Replicas = new(int32(2))
 		Expect(statefulSetReplicas(c, sts)).To(Equal(int32(3)))
 		Expect(statefulSetReplicas(cluster(1, nil), sts)).To(Equal(int32(1)))
+
+		By("a StatefulSet scaled to 0 by hand is restored")
+		sts.Spec.Replicas = new(int32(0))
+		Expect(statefulSetReplicas(c, sts)).To(Equal(int32(1)))
 	})
 
 	It("adds -ro names to operator-requested certificates only with standbys", func() {
@@ -183,6 +190,44 @@ var _ = Describe("Replication helpers", func() {
 		Expect(serverDNSNames(cluster(2, nil))[0]).To(Equal("pg.ns.svc.cluster.local"))
 	})
 })
+
+// ensureSTSPod creates (or updates) pod <sts>-<ordinal> owned by the
+// StatefulSet, as the StatefulSet controller and kubelet would, ready or not.
+func ensureSTSPod(sts *appsv1.StatefulSet, ordinal int, ready bool) *corev1.Pod {
+	name := fmt.Sprintf("%s-%d", sts.Name, ordinal)
+	pod := &corev1.Pod{}
+	err := k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: sts.Namespace}, pod)
+	if apierrors.IsNotFound(err) {
+		pod = &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
+				Namespace: sts.Namespace,
+				Labels: map[string]string{
+					LabelAppName:            AppNamePostgresql,
+					LabelAppInstance:        sts.Name,
+					LabelAppManagedBy:       LabelValuePgop,
+					LabelStatefulSetPodName: name,
+				},
+				OwnerReferences: []metav1.OwnerReference{{
+					APIVersion: "apps/v1", Kind: "StatefulSet", Name: sts.Name, UID: sts.UID,
+					Controller: new(true),
+				}},
+			},
+			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: AppNamePostgresql, Image: DefaultPostgresImage}}},
+		}
+		Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+	} else {
+		Expect(err).NotTo(HaveOccurred())
+	}
+	status := corev1.ConditionFalse
+	if ready {
+		status = corev1.ConditionTrue
+	}
+	pod.Status.PodIP = fmt.Sprintf("10.0.0.%d", ordinal+10)
+	pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: status}}
+	Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+	return pod
+}
 
 // fakeReplicationServer stands in for the primary in envtest.
 type fakeReplicationServer struct {
@@ -309,31 +354,8 @@ var _ = Describe("Cluster replication", func() {
 	// createPod creates pod <name>-<ordinal> owned by the StatefulSet, as the
 	// StatefulSet controller would.
 	createPod := func(ordinal int, ready bool) *corev1.Pod {
-		sts := getSTS()
-		pod := &corev1.Pod{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      fmt.Sprintf("%s-%d", name, ordinal),
-				Namespace: testReplicationNamespace,
-				Labels: map[string]string{
-					LabelAppName:            AppNamePostgresql,
-					LabelAppInstance:        name,
-					LabelAppManagedBy:       LabelValuePgop,
-					LabelStatefulSetPodName: fmt.Sprintf("%s-%d", name, ordinal),
-				},
-				OwnerReferences: []metav1.OwnerReference{{
-					APIVersion: "apps/v1", Kind: "StatefulSet", Name: sts.Name, UID: sts.UID,
-					Controller: new(true),
-				}},
-			},
-			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: AppNamePostgresql, Image: DefaultPostgresImage}}},
-		}
-		Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+		pod := ensureSTSPod(getSTS(), ordinal, ready)
 		DeferCleanup(func() { _ = k8sClient.Delete(ctx, pod, client.GracePeriodSeconds(0)) })
-		if ready {
-			pod.Status.PodIP = fmt.Sprintf("10.0.0.%d", ordinal+10)
-			pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
-			Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
-		}
 		return pod
 	}
 	createPVC := func(ordinal int) *corev1.PersistentVolumeClaim {
@@ -757,6 +779,211 @@ var _ = Describe("Cluster replication", func() {
 				}}
 			Expect(r.reloadForParameters(ctx, getCluster(), pods)).To(Succeed())
 			Expect(dialed).To(Equal([]string{"", testStandby1Addr, testStandby2Addr}))
+		})
+	})
+
+	Context("review fixes", func() {
+		It("keeps the Cluster ready and TLS verify-full while a standby is down or not serving TLS", func() {
+			host := name + ".default.svc.cluster.local"
+			data := newTestCA().issueFor(host)
+			tlsSecret := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: name + "-tls", Namespace: testReplicationNamespace},
+				Type:       corev1.SecretTypeTLS,
+				Data:       data,
+			}
+			Expect(k8sClient.Create(ctx, tlsSecret)).To(Succeed())
+			DeferCleanup(func() { _ = k8sClient.Delete(ctx, tlsSecret) })
+			c := newCluster(2)
+			c.Spec.TLS = &postgresv1alpha1.ClusterTLSSpec{SecretName: name + "-tls"}
+			create(c)
+
+			r := newReconciler()
+			standbyProbeErr := errors.New("connection refused")
+			r.ProbeServerCertificate = func(_ context.Context, addr, _ string) ([]byte, error) {
+				if strings.HasPrefix(addr, "10.0.0.11:") {
+					return nil, standbyProbeErr
+				}
+				return leafDER(data), nil
+			}
+			r.ReloadServerConfig = func(context.Context, postgres.ConnectionConfig) error { return nil }
+			reconcileOnce(r)
+			markRolledOut()
+			sts := getSTS()
+			sts.Status.ReadyReplicas = 1 // only the primary
+			Expect(k8sClient.Status().Update(ctx, sts)).To(Succeed())
+			ensureSTSPod(sts, 0, true)
+			standby := createPod(1, false)
+
+			check := func() {
+				reconcileOnce(r)
+				got := getCluster()
+				Expect(got.Status.Ready).To(BeTrue())
+				Expect(got.Status.ReadyInstances).To(Equal(int32(1)))
+				Expect(meta.IsStatusConditionTrue(got.Status.Conditions, ConditionTypeAvailable)).To(BeTrue())
+				Expect(meta.IsStatusConditionTrue(got.Status.Conditions, ConditionTypeTLSReady)).To(BeTrue())
+				secret := &corev1.Secret{}
+				Expect(k8sClient.Get(ctx, key(name+"-credentials"), secret)).To(Succeed())
+				Expect(string(secret.Data[SecretKeySSLMode])).To(Equal(postgres.SSLModeVerifyFull))
+			}
+			By("the standby is not ready (cloning, down)")
+			check()
+			By("the standby is ready but not serving TLS")
+			ensureSTSPod(sts, 1, true)
+			check()
+			By("the primary goes down")
+			ensureSTSPod(sts, 0, false)
+			reconcileOnce(r)
+			Expect(getCluster().Status.Ready).To(BeFalse())
+			_ = standby
+		})
+
+		It("creates a standby's slot only once its pod exists and re-creates invalidated slots", func() {
+			create(newCluster(3))
+			r := newReconciler()
+			reconcileOnce(r)
+			createPod(0, true)
+			createPod(1, false)
+			reconcileOnce(r)
+			Expect(fake.created).To(ConsistOf("pgop_replica_1"))
+
+			By("an invalidated slot that is not in use is dropped and re-created")
+			fake.slots[0].WALStatus = postgres.WALStatusLost
+			recorder := events.NewFakeRecorder(10)
+			r.Recorder = recorder
+			reconcileOnce(r)
+			Expect(fake.dropped).To(ConsistOf("pgop_replica_1"))
+			Expect(fake.created).To(Equal([]string{"pgop_replica_1", "pgop_replica_1"}))
+			Expect(condition().Message).To(ContainSubstring("re-clone"))
+			Expect(recorder.Events).To(Receive(ContainSubstring("ReplicationSlotInvalidated")))
+
+			By("an invalidated slot still in use is left alone")
+			fake.slots[0].WALStatus = postgres.WALStatusLost
+			fake.slots[0].Active = true
+			reconcileOnce(r)
+			Expect(fake.dropped).To(HaveLen(1))
+		})
+
+		It("skips slot drops when the PVC listing is incomplete", func() {
+			f := &fakeReplicationServer{slots: []postgres.ReplicationSlot{{Name: "pgop_replica_3", Physical: true}}}
+			r := newReconciler()
+			_, err := r.reconcileReplicationSlots(ctx, newCluster(2), f, 2, map[int]bool{}, map[int]bool{}, false)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(f.dropped).To(BeEmpty())
+			_, err = r.reconcileReplicationSlots(ctx, newCluster(2), f, 2, map[int]bool{}, map[int]bool{}, true)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(f.dropped).To(ConsistOf("pgop_replica_3"))
+		})
+
+		It("keeps only streaming standbys in the read-only Service", func() {
+			create(newCluster(3))
+			r := newReconciler()
+			reconcileOnce(r)
+			createPod(0, true)
+			createPod(1, true)
+			createPod(2, true)
+			fake.standbys = []postgres.StandbyStatus{{ApplicationName: name + "-1", State: walSenderStreaming},
+				{ApplicationName: name + "-2", State: "catchup"}}
+			reconcileOnce(r)
+
+			ro, err := getService(name + "-ro")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(ro.Spec.Selector).To(HaveKeyWithValue(LabelStreaming, "true"))
+			label := func(pod string) string {
+				p := &corev1.Pod{}
+				Expect(k8sClient.Get(ctx, key(pod), p)).To(Succeed())
+				return p.Labels[LabelStreaming]
+			}
+			Expect(label(name + "-1")).To(Equal("true"))
+			Expect(label(name + "-2")).To(Equal("false"))
+			Expect(label(name + "-0")).To(BeEmpty())
+
+			fake.standbys = nil
+			reconcileOnce(r)
+			Expect(label(name + "-1")).To(Equal("false"))
+		})
+
+		It("refuses an empty primary once the Cluster held data", func() {
+			create(newCluster(2))
+			r := newReconciler()
+			reconcileOnce(r)
+			cm := func() *corev1.ConfigMap {
+				got := &corev1.ConfigMap{}
+				Expect(k8sClient.Get(ctx, key(name+"-hba"), got)).To(Succeed())
+				return got
+			}
+			Expect(cm().Data).NotTo(HaveKey(initializedMarkerKey))
+			init := getSTS().Spec.Template.Spec.InitContainers[0]
+			Expect(init.VolumeMounts).To(ContainElement(HaveField("Name", hbaVolumeName)))
+			Expect(bootstrapScript).To(ContainSubstring(`[ -e "$PGOP_INITIALIZED_MARKER" ]`))
+
+			createPod(0, true)
+			reconcileOnce(r)
+			Expect(cm().Data).To(HaveKey(initializedMarkerKey))
+			Expect(cm().Data).To(HaveKey(hbaFileName))
+			reconcileOnce(r)
+			Expect(cm().Data).To(HaveKey(initializedMarkerKey), "the marker is kept")
+
+			By("the annotation allows starting over")
+			c := getCluster()
+			c.Annotations = map[string]string{AnnotationAllowPrimaryInit: labelValueTrue}
+			Expect(k8sClient.Update(ctx, c)).To(Succeed())
+			reconcileOnce(r)
+			Expect(cm().Data).NotTo(HaveKey(initializedMarkerKey))
+		})
+
+		It("marks the Cluster initialized when standby volumes exist without the primary's", func() {
+			createPVC(1)
+			create(newCluster(2))
+			reconcileOnce(newReconciler())
+			got := &corev1.ConfigMap{}
+			Expect(k8sClient.Get(ctx, key(name+"-hba"), got)).To(Succeed())
+			Expect(got.Data).To(HaveKey(initializedMarkerKey))
+		})
+
+		It("restarts only the standbys when the replication password changes", func() {
+			create(newCluster(3))
+			r := newReconciler()
+			reconcileOnce(r)
+			p0, p1, p2 := createPod(0, true), createPod(1, true), createPod(2, true)
+			reconcileOnce(r)
+			Expect(fake.createdRole).To(HaveLen(1))
+			gone := func(p *corev1.Pod) bool {
+				got := &corev1.Pod{}
+				err := k8sClient.Get(ctx, key(p.Name), got)
+				return apierrors.IsNotFound(err) || (err == nil && got.UID != p.UID)
+			}
+			Expect(gone(p1)).To(BeFalse(), "creating the role does not restart standbys")
+
+			secret := &corev1.Secret{}
+			Expect(k8sClient.Get(ctx, key(name+"-credentials"), secret)).To(Succeed())
+			secret.Data[SecretKeyReplicationPassword] = []byte("rotated")
+			Expect(k8sClient.Update(ctx, secret)).To(Succeed())
+			reconcileOnce(r)
+			Expect(fake.createdRole).To(HaveLen(2))
+			Expect(gone(p0)).To(BeFalse())
+			Eventually(func() bool { return gone(p1) && gone(p2) }).Should(BeTrue())
+		})
+
+		It("restarts the primary once when it rejects the operator password", func() {
+			create(newCluster(2))
+			r := newReconciler()
+			connectErr := &pq.Error{Code: pqCodeInvalidPassword, Message: "password authentication failed"}
+			r.ConnectReplicationServer = func(context.Context, postgres.ConnectionConfig) (ReplicationServer, error) {
+				return nil, fmt.Errorf("failed to ping database: %w", connectErr)
+			}
+			reconcileOnce(r)
+			p0 := createPod(0, true)
+			reconcileOnce(r)
+			Eventually(func() bool {
+				return apierrors.IsNotFound(k8sClient.Get(ctx, key(p0.Name), &corev1.Pod{}))
+			}).Should(BeTrue())
+			Expect(condition().Reason).To(Equal(ReasonReplicationError))
+
+			By("not again for the same password")
+			p0 = createPod(0, true)
+			reconcileOnce(r)
+			Consistently(func() error { return k8sClient.Get(ctx, key(p0.Name), &corev1.Pod{}) },
+				time.Second, 200*time.Millisecond).Should(Succeed())
 		})
 	})
 })

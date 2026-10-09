@@ -10,7 +10,7 @@ rules:
   verbs: [create, delete, get, list, patch, update, watch]
 - apiGroups: [""]
   resources: [pods]
-  verbs: [get, list, patch, watch]
+  verbs: [delete, get, list, patch, watch]
 - apiGroups: [apps]
   resources: [statefulsets]
   verbs: [create, delete, get, list, patch, update, watch]

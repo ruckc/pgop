@@ -114,7 +114,7 @@ func (r *ClusterReconciler) now() time.Time {
 // +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=configmaps,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch;patch
+// +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch;patch;delete
 // +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=cert-manager.io,resources=certificates,verbs=get;list;watch;create;update;patch;delete
 
@@ -458,14 +458,18 @@ func (r *ClusterReconciler) reconcileTLSState(ctx context.Context, cluster *post
 	}
 
 	if bytes.Equal(presented, material.Leaf.Raw) {
-		if pending, msg := r.reconcileStandbyCertificates(ctx, cluster, material, pods, probe); pending {
-			r.setTLSCondition(cluster, metav1.ConditionFalse, ReasonCertificateReloading, msg)
-			return true
-		}
+		// TLSReady reflects the primary, which every writing client and the
+		// operator use. Standbys are reloaded in the background; one that is
+		// down or lagging never downgrades the sslmode clients are told to
+		// use.
 		r.setTLSCondition(cluster, metav1.ConditionTrue, ReasonTLSActive,
 			fmt.Sprintf("Server presents the certificate from Secret %q", tlsSecretName(cluster)))
 		cluster.Status.TLSSecretHash = material.Hash
-		return false
+		pending, msg := r.reconcileStandbyCertificates(ctx, cluster, material, pods, probe)
+		if pending {
+			logf.FromContext(ctx).Info("Standby certificates pending", "detail", msg)
+		}
+		return pending
 	}
 
 	// The server presents a different (older) certificate.
@@ -596,18 +600,36 @@ func (r *ClusterReconciler) reconcileHBAConfigMap(ctx context.Context, cluster *
 	if !tlsRequired(cluster) && !replication {
 		return nil
 	}
-	hba := renderPgHBA(cluster, replication)
+	data := map[string]string{hbaFileName: renderPgHBA(cluster, replication)}
 	cm := &corev1.ConfigMap{}
 	err := r.Get(ctx, types.NamespacedName{Name: hbaConfigMapName(cluster), Namespace: cluster.Namespace}, cm)
-	if err == nil {
-		if cm.Data[hbaFileName] == hba {
+	if err != nil && !apierrors.IsNotFound(err) {
+		return err
+	}
+	exists := err == nil
+
+	// The initialized marker (replication only) is kept once set, set when
+	// standby volumes exist without the primary's, and removed on request.
+	if replication && cluster.Annotations[AnnotationAllowPrimaryInit] != labelValueTrue {
+		marked := exists && cm.Data[initializedMarkerKey] != ""
+		if !marked {
+			missing, err := r.primaryVolumeMissing(ctx, cluster)
+			if err != nil {
+				return err
+			}
+			marked = missing
+		}
+		if marked {
+			data[initializedMarkerKey] = initializedMarkerValue
+		}
+	}
+
+	if exists {
+		if maps.Equal(cm.Data, data) {
 			return nil
 		}
-		cm.Data = map[string]string{hbaFileName: hba}
+		cm.Data = data
 		return r.Update(ctx, cm)
-	}
-	if !apierrors.IsNotFound(err) {
-		return err
 	}
 	cm = &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
@@ -619,7 +641,7 @@ func (r *ClusterReconciler) reconcileHBAConfigMap(ctx context.Context, cluster *
 				LabelAppManagedBy: LabelValuePgop,
 			},
 		},
-		Data: map[string]string{hbaFileName: hba},
+		Data: data,
 	}
 	if err := controllerutil.SetControllerReference(cluster, cm, r.Scheme); err != nil {
 		return err
@@ -1222,21 +1244,26 @@ func operatorPasswordSyncLifecycle() *corev1.Lifecycle {
 	}
 }
 
+// isStatefulSetReady reports whether the Cluster accepts connections: its
+// primary pod is ready. Standbys never affect it (a standby that is cloning,
+// down or stuck must not mark the Cluster unavailable, downgrade the TLS
+// state clients are told to use, or stop Role and Database reconciles);
+// their health is reported by status.readyInstances and ReplicationHealthy.
 func (r *ClusterReconciler) isStatefulSetReady(ctx context.Context, cluster *postgresv1alpha1.Cluster) (bool, error) {
-	sts := &appsv1.StatefulSet{}
-	err := r.Get(ctx, types.NamespacedName{Name: cluster.Name, Namespace: cluster.Namespace}, sts)
-	if err != nil {
-		if apierrors.IsNotFound(err) {
-			return false, nil
-		}
+	sts, err := r.getStatefulSet(ctx, cluster)
+	if err != nil || sts == nil {
 		return false, err
 	}
-
 	cluster.Status.ReadyInstances = sts.Status.ReadyReplicas
 	cluster.Status.CurrentPrimary = primaryPodName(cluster)
 
-	replicas := desiredReplicas(cluster)
-	return sts.Status.ReadyReplicas == replicas && (sts.Spec.Replicas == nil || *sts.Spec.Replicas == replicas), nil
+	pods, err := r.listClusterPods(ctx, cluster)
+	if err != nil {
+		return false, err
+	}
+	return slices.ContainsFunc(pods, func(p corev1.Pod) bool {
+		return p.Name == primaryPodName(cluster) && isPodReady(&p)
+	}), nil
 }
 
 func (r *ClusterReconciler) updateStatus(ctx context.Context, cluster *postgresv1alpha1.Cluster, ready bool, reconcileErr error) (ctrl.Result, error) {
@@ -1264,7 +1291,7 @@ func (r *ClusterReconciler) updateStatus(ctx context.Context, cluster *postgresv
 	if ready {
 		condition.Status = metav1.ConditionTrue
 		condition.Reason = "ClusterReady"
-		condition.Message = "PostgreSQL cluster is ready"
+		condition.Message = "The PostgreSQL primary is ready"
 	} else if reconcileErr != nil {
 		condition.Status = metav1.ConditionFalse
 		condition.Reason = ReasonReconcileError

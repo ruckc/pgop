@@ -27,7 +27,14 @@ type ReplicationSlot struct {
 	Name     string
 	Physical bool
 	Active   bool
+	// WALStatus is pg_replication_slots.wal_status: reserved, extended,
+	// unreserved or lost (the WAL the slot needs was removed; the slot is
+	// unusable).
+	WALStatus string
 }
+
+// WALStatusLost is the wal_status of an invalidated slot.
+const WALStatusLost = "lost"
 
 // StandbyStatus is a row of pg_stat_replication: a WAL sender serving a
 // standby (or a base backup).
@@ -52,7 +59,7 @@ func (c *Client) InRecovery(ctx context.Context) (bool, error) {
 // ReplicationSlots returns all replication slots.
 func (c *Client) ReplicationSlots(ctx context.Context) ([]ReplicationSlot, error) {
 	rows, err := c.db.QueryContext(ctx,
-		"SELECT slot_name, slot_type = 'physical', active FROM pg_replication_slots ORDER BY slot_name")
+		"SELECT slot_name, slot_type = 'physical', active, COALESCE(wal_status, '') FROM pg_replication_slots ORDER BY slot_name")
 	if err != nil {
 		return nil, fmt.Errorf("failed to read pg_replication_slots: %w", err)
 	}
@@ -60,7 +67,7 @@ func (c *Client) ReplicationSlots(ctx context.Context) ([]ReplicationSlot, error
 	var out []ReplicationSlot
 	for rows.Next() {
 		var s ReplicationSlot
-		if err := rows.Scan(&s.Name, &s.Physical, &s.Active); err != nil {
+		if err := rows.Scan(&s.Name, &s.Physical, &s.Active, &s.WALStatus); err != nil {
 			return nil, fmt.Errorf("failed to scan pg_replication_slots: %w", err)
 		}
 		out = append(out, s)

@@ -20,6 +20,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"slices"
@@ -40,6 +41,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
+	"github.com/lib/pq"
 
 	postgresv1alpha1 "github.com/ruckc/pgop/api/v1alpha1"
 	"github.com/ruckc/pgop/internal/postgres"
@@ -101,6 +104,23 @@ const (
 	// replicationRetryInterval is the retry delay while replication cannot be
 	// set up or is not streaming yet.
 	replicationRetryInterval = 10 * time.Second
+
+	// maxWALSenders and maxReplicationSlots are set on every
+	// replication-enabled instance (standbys need at least the primary's
+	// values). They are fixed, not derived from spec.replicas, so scaling
+	// never restarts the pods, and leave room for two concurrent clones per
+	// standby at the maximum of 10 instances.
+	maxWALSenders       = 32
+	maxReplicationSlots = 32
+
+	// initializedMarkerKey is a key of the pg_hba ConfigMap, mounted into the
+	// bootstrap init container: once present, the primary refuses to
+	// initialize an empty data directory (see markInitialized).
+	initializedMarkerKey   = "pgop-initialized"
+	initializedMarkerValue = "The Cluster holds data; pgop refuses to initialize an empty primary data directory.\n"
+
+	// pqCodeInvalidPassword is SQLSTATE 28P01 (invalid_password).
+	pqCodeInvalidPassword = "28P01"
 )
 
 // desiredReplicas returns spec.replicas, defaulting to 1.
@@ -254,7 +274,10 @@ func replicationServerArgs(cluster *postgresv1alpha1.Cluster) []string {
 	if !tlsRequired(cluster) {
 		args = append(args, "-c", hbaFileArg())
 	}
-	args = append(args, "-c", "primary_conninfo="+primaryConnInfo(cluster))
+	args = append(args,
+		"-c", "primary_conninfo="+primaryConnInfo(cluster),
+		"-c", fmt.Sprintf("max_wal_senders=%d", maxWALSenders),
+		"-c", fmt.Sprintf("max_replication_slots=%d", maxReplicationSlots))
 	if !hasParameter(cluster.Spec.Parameters, "max_slot_wal_keep_size") {
 		args = append(args, "-c", "max_slot_wal_keep_size="+defaultMaxSlotWALKeepSize(cluster))
 	}
@@ -361,6 +384,11 @@ if [ -s "$PGDATA/PG_VERSION" ]; then
   exit 0
 fi
 if [ "$ordinal" = 0 ]; then
+  if [ -e "$PGOP_INITIALIZED_MARKER" ]; then
+    echo "pgop: refusing to initialize an empty primary data directory: this Cluster already held data, so the primary's volume was lost or replaced." >&2
+    echo "pgop: restore the primary's volume, or set the annotation pgop.ruck.io/allow-primary-init=true on the Cluster to start over with an empty database" >&2
+    exit 1
+  fi
   if PGSSLMODE=prefer pg_isready -q -h "$PGOP_READ_ONLY_HOST" -p "$PGPORT" -t 5; then
     echo "pgop: refusing to initialize an empty primary data directory while standbys of this Cluster are running;" >&2
     echo "pgop: restore the primary's volume, or scale the Cluster to 1 instance to start over" >&2
@@ -399,13 +427,14 @@ func bootstrapInitContainer(cluster *postgresv1alpha1.Cluster, secretName string
 		{Name: "PGAPPNAME", Value: "pgop-bootstrap"},
 		{Name: "PGOP_READ_ONLY_HOST", Value: readOnlyHost(cluster)},
 		{Name: "PGOP_PASSFILE", Value: replicationPassFile},
+		{Name: "PGOP_INITIALIZED_MARKER", Value: hbaMountPath + "/" + initializedMarkerKey},
 	}
 	mounts := []corev1.VolumeMount{{Name: dataVolumeName, MountPath: layout.MountPath}}
 	if cluster.Spec.TLS != nil {
 		env = append(env, corev1.EnvVar{Name: "PGSSLROOTCERT", Value: tlsMountPath + "/" + TLSSecretKeyCA})
 		mounts = append(mounts, tlsVolumeMount())
 	}
-	mounts = append(mounts, runVolumeMount())
+	mounts = append(mounts, hbaVolumeMount(), runVolumeMount())
 	return corev1.Container{
 		Name:            bootstrapContainerName,
 		Image:           main.Image,
@@ -476,7 +505,8 @@ func statefulSetReplicas(cluster *postgresv1alpha1.Cluster, existing *appsv1.Sta
 	}
 	cur := *existing.Spec.Replicas
 	if cur <= 1 && !replicationRolledOut(existing) {
-		return cur
+		// max: also restores a StatefulSet scaled to 0 by hand.
+		return max(cur, 1)
 	}
 	return want
 }
@@ -498,6 +528,7 @@ func readOnlyServiceSelector(cluster *postgresv1alpha1.Cluster) map[string]strin
 		LabelAppName:     AppNamePostgresql,
 		LabelAppInstance: cluster.Name,
 		LabelRole:        LabelRoleReplica,
+		LabelStreaming:   labelValueTrue,
 	}
 }
 
@@ -678,11 +709,14 @@ func setReplicationCondition(cluster *postgresv1alpha1.Cluster, status metav1.Co
 
 // reconcileReplication manages replication for a replication-enabled
 // Cluster: it removes the data PVCs of scaled-away standbys, and on the
-// primary converges the replication role and password, creates the
-// replication slot of every standby, drops the slots of scaled-away
-// standbys, and reports whether every standby streams (ReplicationHealthy).
-// Problems are reported in the condition and never fail the reconcile.
-// Returns when to check again (0: no need).
+// primary records that the Cluster holds data (see initializedMarkerKey),
+// converges the replication role and password, creates the replication slot
+// of every standby pod (re-creating invalidated ones), drops the slots of
+// scaled-away standbys, labels the standbys by whether they stream (only
+// streaming standbys are in the read-only Service), and reports whether every
+// standby streams (ReplicationHealthy). Problems are reported in the
+// condition and never fail the reconcile. Returns when to check again (0: no
+// need).
 func (r *ClusterReconciler) reconcileReplication(ctx context.Context, cluster *postgresv1alpha1.Cluster,
 	secret *corev1.Secret, sts *appsv1.StatefulSet, pods []corev1.Pod) time.Duration {
 	want := desiredReplicas(cluster)
@@ -694,15 +728,21 @@ func (r *ClusterReconciler) reconcileReplication(ctx context.Context, cluster *p
 	}
 	log := logf.FromContext(ctx)
 
+	// Slots are only dropped when the PVC listing is complete: a partial
+	// result could drop the slot of a standby whose volume still exists.
 	pvcs, err := r.cleanupStandbyVolumes(ctx, cluster, sts, pods)
+	allowSlotDrops := err == nil
 	if err != nil {
 		log.Error(err, "Failed to clean up the volumes of removed standbys")
 	}
 
-	primaryReady := slices.ContainsFunc(pods, func(p corev1.Pod) bool {
-		return p.Name == primaryPodName(cluster) && isPodReady(&p)
-	})
-	if !primaryReady {
+	var primary *corev1.Pod
+	for i := range pods {
+		if pods[i].Name == primaryPodName(cluster) {
+			primary = &pods[i]
+		}
+	}
+	if primary == nil || !isPodReady(primary) {
 		if want > 1 {
 			setReplicationCondition(cluster, metav1.ConditionFalse, ReasonWaitingForPrimary,
 				"Waiting for the primary pod to become ready")
@@ -718,16 +758,7 @@ func (r *ClusterReconciler) reconcileReplication(ctx context.Context, cluster *p
 		return replicationRetryInterval
 	}
 
-	cluster.Status.SecretName = cluster.Name + "-credentials"
-	cfg, err := operatorConnectionConfig(ctx, r.Client, cluster, defaultDatabaseName)
-	if err != nil {
-		return fail("Cannot connect to the primary", err)
-	}
-	connect := r.ConnectReplicationServer
-	if connect == nil {
-		connect = connectReplicationServer
-	}
-	srv, err := connect(ctx, cfg)
+	srv, err := r.connectPrimary(ctx, cluster, secret, primary)
 	if err != nil {
 		return fail("Cannot connect to the primary", err)
 	}
@@ -740,11 +771,21 @@ func (r *ClusterReconciler) reconcileReplication(ctx context.Context, cluster *p
 	} else if inRecovery {
 		return fail("Cannot manage replication", fmt.Errorf("the instance behind Service %q is in recovery", cluster.Name))
 	}
+	if err := r.markInitialized(ctx, cluster); err != nil {
+		return fail("Cannot record that the Cluster is initialized", err)
+	}
 
-	if err := r.ensureReplicationRole(ctx, cluster, secret, srv); err != nil {
+	if err := r.ensureReplicationRole(ctx, cluster, secret, srv, pods); err != nil {
 		return fail("Cannot set up the replication role", err)
 	}
-	if err := r.reconcileReplicationSlots(ctx, srv, want, pvcs); err != nil {
+	podExists := map[int]bool{}
+	for _, p := range pods {
+		if ordinal, ok := podOrdinal(cluster, p.Name); ok {
+			podExists[ordinal] = true
+		}
+	}
+	recreated, err := r.reconcileReplicationSlots(ctx, cluster, srv, want, podExists, pvcs, allowSlotDrops)
+	if err != nil {
 		return fail("Cannot manage replication slots", err)
 	}
 
@@ -761,6 +802,15 @@ func (r *ClusterReconciler) reconcileReplication(ctx context.Context, cluster *p
 			streaming[s.ApplicationName] = true
 		}
 	}
+	if err := r.labelStreaming(ctx, cluster, pods, streaming); err != nil {
+		return fail("Cannot label the standbys", err)
+	}
+	return reportStreaming(cluster, want, streaming, recreated)
+}
+
+// reportStreaming sets ReplicationHealthy from the standbys that stream and
+// returns when to check again.
+func reportStreaming(cluster *postgresv1alpha1.Cluster, want int32, streaming map[string]bool, recreated []string) time.Duration {
 	var missing []string
 	for i := 1; i < int(want); i++ {
 		if name := fmt.Sprintf("%s-%d", cluster.Name, i); !streaming[name] {
@@ -768,9 +818,13 @@ func (r *ClusterReconciler) reconcileReplication(ctx context.Context, cluster *p
 		}
 	}
 	if len(missing) > 0 {
-		setReplicationCondition(cluster, metav1.ConditionFalse, ReasonStandbyNotStreaming,
-			fmt.Sprintf("%d of %d standbys streaming; not streaming: %s", int(want)-1-len(missing), want-1,
-				strings.Join(missing, ", ")))
+		msg := fmt.Sprintf("%d of %d standbys streaming; not streaming: %s", int(want)-1-len(missing), want-1,
+			strings.Join(missing, ", "))
+		if len(recreated) > 0 {
+			msg += fmt.Sprintf("; the replication slots of %s were invalidated (max_slot_wal_keep_size) and "+
+				"re-created: re-clone these standbys by deleting their data PVC and pod", strings.Join(recreated, ", "))
+		}
+		setReplicationCondition(cluster, metav1.ConditionFalse, ReasonStandbyNotStreaming, msg)
 		return replicationRetryInterval
 	}
 	setReplicationCondition(cluster, metav1.ConditionTrue, ReasonStreaming,
@@ -778,13 +832,146 @@ func (r *ClusterReconciler) reconcileReplication(ctx context.Context, cluster *p
 	return replicationCheckInterval
 }
 
+// connectPrimary connects to the primary as the operator. When the primary
+// rejects the operator password, it is restarted once (see
+// restartPrimaryForPasswordSync).
+func (r *ClusterReconciler) connectPrimary(ctx context.Context, cluster *postgresv1alpha1.Cluster,
+	secret *corev1.Secret, primary *corev1.Pod) (ReplicationServer, error) {
+	cluster.Status.SecretName = cluster.Name + "-credentials"
+	cfg, err := operatorConnectionConfig(ctx, r.Client, cluster, defaultDatabaseName)
+	if err != nil {
+		return nil, err
+	}
+	connect := r.ConnectReplicationServer
+	if connect == nil {
+		connect = connectReplicationServer
+	}
+	srv, err := connect(ctx, cfg)
+	if err != nil {
+		if pqErr, ok := errors.AsType[*pq.Error](err); ok && pqErr.Code == pqCodeInvalidPassword {
+			r.restartPrimaryForPasswordSync(ctx, cluster, secret, primary)
+		}
+		return nil, err
+	}
+	return srv, nil
+}
+
+// labelStreaming sets pgop.ruck.io/streaming on the standby pods from
+// pg_stat_replication. The read-only Service only selects standbys that
+// stream, so a standby that fell out of replication (an invalidated slot,
+// data from another primary, a wrong password) stops serving reads instead
+// of serving stale data indefinitely.
+func (r *ClusterReconciler) labelStreaming(ctx context.Context, cluster *postgresv1alpha1.Cluster,
+	pods []corev1.Pod, streaming map[string]bool) error {
+	for i := range pods {
+		pod := &pods[i]
+		if ordinal, _ := podOrdinal(cluster, pod.Name); ordinal == 0 || pod.DeletionTimestamp != nil {
+			continue
+		}
+		want := strconv.FormatBool(streaming[pod.Name])
+		if pod.Labels[LabelStreaming] == want {
+			continue
+		}
+		base := pod.DeepCopy()
+		if pod.Labels == nil {
+			pod.Labels = map[string]string{}
+		}
+		pod.Labels[LabelStreaming] = want
+		if err := r.Patch(ctx, pod, client.MergeFrom(base)); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("failed to label pod %s: %w", pod.Name, err)
+		}
+	}
+	return nil
+}
+
+// restartPrimaryForPasswordSync deletes the primary pod once when the
+// operator's password is rejected (28P01) by a primary that is not in
+// recovery: the recovery-aware postStart hook skips the password sync while
+// a restored server is still recovering, so after a restore the password is
+// only synced on the next start. At most one restart per operator password,
+// recorded on the credentials Secret, so a password that keeps failing does
+// not cause a restart loop.
+func (r *ClusterReconciler) restartPrimaryForPasswordSync(ctx context.Context, cluster *postgresv1alpha1.Cluster,
+	secret *corev1.Secret, primary *corev1.Pod) {
+	fp := replicationPasswordFingerprint(cluster, "operator\x00"+string(secret.Data[SecretKeyPassword]))
+	if secret.Annotations[AnnotationPasswordSyncRestart] == fp {
+		return
+	}
+	log := logf.FromContext(ctx)
+	if secret.Annotations == nil {
+		secret.Annotations = map[string]string{}
+	}
+	secret.Annotations[AnnotationPasswordSyncRestart] = fp
+	if err := r.Update(ctx, secret); err != nil {
+		log.Error(err, "Failed to record the password-sync restart")
+		return
+	}
+	if err := r.Delete(ctx, primary, client.Preconditions{UID: &primary.UID}); err != nil && !apierrors.IsNotFound(err) {
+		log.Error(err, "Failed to restart the primary to sync the operator password")
+		return
+	}
+	log.Info("Restarted the primary: it rejects the operator password, which is synced on start")
+	if r.Recorder != nil {
+		r.Recorder.Eventf(cluster, primary, corev1.EventTypeWarning, "OperatorPasswordRejected", "RestartPrimary",
+			"The primary rejects the operator password; restarting it once so the postStart hook syncs the password")
+	}
+}
+
+// markInitialized records in the pg_hba ConfigMap (mounted into the
+// bootstrap init container) that the Cluster holds data, once the operator
+// reached a primary that is not in recovery. From then on the primary's
+// bootstrap refuses to initialize an empty data directory (its volume was
+// lost) instead of silently starting a new, empty database. The annotation
+// AnnotationAllowPrimaryInit on the Cluster removes the marker.
+func (r *ClusterReconciler) markInitialized(ctx context.Context, cluster *postgresv1alpha1.Cluster) error {
+	if cluster.Annotations[AnnotationAllowPrimaryInit] == labelValueTrue {
+		return nil
+	}
+	cm := &corev1.ConfigMap{}
+	if err := r.Get(ctx, types.NamespacedName{Name: hbaConfigMapName(cluster), Namespace: cluster.Namespace}, cm); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+	if _, ok := cm.Data[initializedMarkerKey]; ok || !metav1.IsControlledBy(cm, cluster) {
+		return nil
+	}
+	if cm.Data == nil {
+		cm.Data = map[string]string{}
+	}
+	cm.Data[initializedMarkerKey] = initializedMarkerValue
+	return r.Update(ctx, cm)
+}
+
+// primaryVolumeMissing reports whether standby data PVCs exist while the
+// primary's does not: starting the primary on a new, empty volume would
+// initialize a new database next to standbys holding the real data.
+func (r *ClusterReconciler) primaryVolumeMissing(ctx context.Context, cluster *postgresv1alpha1.Cluster) (bool, error) {
+	pvcs := &corev1.PersistentVolumeClaimList{}
+	if err := r.List(ctx, pvcs, client.InNamespace(cluster.Namespace), client.MatchingLabels{
+		LabelAppName:     AppNamePostgresql,
+		LabelAppInstance: cluster.Name,
+	}); err != nil {
+		return false, err
+	}
+	primary, standby := false, false
+	for _, pvc := range pvcs.Items {
+		if ordinal, ok := pvcOrdinal(cluster, pvc.Name); ok {
+			primary = primary || ordinal == 0
+			standby = standby || (ordinal > 0 && pvc.DeletionTimestamp == nil)
+		}
+	}
+	return standby && !primary, nil
+}
+
 // ensureReplicationRole creates pgop_replicator (LOGIN REPLICATION) on the
 // primary and converges its password to the credentials Secret. The password
 // is sent as a SCRAM verifier and only when the role is missing or the
 // Secret's fingerprint annotation does not match, so it is not re-sent on
-// every reconcile.
+// every reconcile. When the password changed, the standby pods are deleted:
+// their bootstrap init container writes the password file the WAL receiver
+// uses, so they pick up the new password on restart. The primary is not
+// restarted.
 func (r *ClusterReconciler) ensureReplicationRole(ctx context.Context, cluster *postgresv1alpha1.Cluster,
-	secret *corev1.Secret, srv ReplicationServer) error {
+	secret *corev1.Secret, srv ReplicationServer, pods []corev1.Pod) error {
 	password := string(secret.Data[SecretKeyReplicationPassword])
 	if password == "" {
 		return fmt.Errorf("credentials Secret %q has no %q", secret.Name, SecretKeyReplicationPassword)
@@ -794,7 +981,8 @@ func (r *ClusterReconciler) ensureReplicationRole(ctx context.Context, cluster *
 		return err
 	}
 	fingerprint := replicationPasswordFingerprint(cluster, password)
-	if exists && secret.Annotations[AnnotationReplicationPasswordFingerprint] == fingerprint {
+	recorded := secret.Annotations[AnnotationReplicationPasswordFingerprint]
+	if exists && recorded == fingerprint {
 		return nil
 	}
 	if err := srv.CreateRole(ctx, ReplicationUsername, postgres.RoleOptions{
@@ -805,6 +993,11 @@ func (r *ClusterReconciler) ensureReplicationRole(ctx context.Context, cluster *
 	}); err != nil {
 		return err
 	}
+	if exists && recorded != "" {
+		if err := r.restartStandbys(ctx, cluster, pods); err != nil {
+			return err
+		}
+	}
 	if secret.Annotations == nil {
 		secret.Annotations = map[string]string{}
 	}
@@ -812,36 +1005,87 @@ func (r *ClusterReconciler) ensureReplicationRole(ctx context.Context, cluster *
 	return r.Update(ctx, secret)
 }
 
-// reconcileReplicationSlots creates the slot of every standby (ordinals
-// 1..want-1) and drops the operator's slots of scaled-away standbys once they
-// are no longer in use and their data PVC is gone or being deleted (a standby
-// scaled back up before its PVC was removed resumes from its slot). pvcs is
-// the set of ordinals whose data PVC is kept.
-func (r *ClusterReconciler) reconcileReplicationSlots(ctx context.Context, srv ReplicationServer, want int32, pvcs map[int]bool) error {
-	slots, err := srv.ReplicationSlots(ctx)
-	if err != nil {
-		return err
-	}
-	existing := map[string]bool{}
-	for _, s := range slots {
-		existing[s.Name] = true
-		ordinal, ok := slotOrdinal(s.Name)
-		if !ok || !s.Physical || ordinal < int(want) || ordinal == 0 || s.Active || pvcs[ordinal] {
+// restartStandbys deletes the standby pods so the StatefulSet recreates
+// them (with a fresh replication password file).
+func (r *ClusterReconciler) restartStandbys(ctx context.Context, cluster *postgresv1alpha1.Cluster, pods []corev1.Pod) error {
+	for i := range pods {
+		pod := &pods[i]
+		if ordinal, _ := podOrdinal(cluster, pod.Name); ordinal == 0 || pod.DeletionTimestamp != nil {
 			continue
 		}
-		if err := srv.DropReplicationSlot(ctx, s.Name); err != nil {
-			return err
+		if err := r.Delete(ctx, pod, client.Preconditions{UID: &pod.UID}); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("failed to restart standby %s: %w", pod.Name, err)
 		}
-		logf.FromContext(ctx).Info("Dropped the replication slot of a removed standby", "slot", s.Name)
+		logf.FromContext(ctx).Info("Restarted a standby for the new replication password", "pod", pod.Name)
+	}
+	if r.Recorder != nil {
+		r.Recorder.Eventf(cluster, nil, corev1.EventTypeNormal, "ReplicationPasswordChanged", "RestartStandbys",
+			"The replication password changed; restarted the standbys to load it")
+	}
+	return nil
+}
+
+// reconcileReplicationSlots manages the operator's slots on the primary:
+//
+//   - the slot of a standby (ordinal 1..want-1) is created once its pod
+//     exists, not ahead of time, so a slot never holds back WAL for a standby
+//     that is still waiting for its predecessors to start;
+//   - an invalidated slot (wal_status "lost") that is not in use is dropped
+//     and re-created, so re-cloning the standby works; its pod names are
+//     returned (the standby itself must be re-cloned);
+//   - the slots of scaled-away standbys are dropped once they are not in use
+//     and their data PVC is gone or being deleted (a standby scaled back up
+//     before its PVC was removed resumes from its slot). pvcs is the set of
+//     ordinals whose data PVC is kept; drops are skipped unless allowDrops.
+func (r *ClusterReconciler) reconcileReplicationSlots(ctx context.Context, cluster *postgresv1alpha1.Cluster,
+	srv ReplicationServer, want int32, podExists, pvcs map[int]bool, allowDrops bool) ([]string, error) {
+	log := logf.FromContext(ctx)
+	slots, err := srv.ReplicationSlots(ctx)
+	if err != nil {
+		return nil, err
+	}
+	existing := map[string]bool{}
+	var recreated []string
+	for _, s := range slots {
+		ordinal, ok := slotOrdinal(s.Name)
+		if !ok || !s.Physical || ordinal == 0 {
+			existing[s.Name] = true
+			continue
+		}
+		switch {
+		case ordinal >= int(want):
+			if !allowDrops || s.Active || pvcs[ordinal] {
+				existing[s.Name] = true
+				continue
+			}
+			if err := srv.DropReplicationSlot(ctx, s.Name); err != nil {
+				return nil, err
+			}
+			log.Info("Dropped the replication slot of a removed standby", "slot", s.Name)
+		case s.WALStatus == postgres.WALStatusLost && !s.Active:
+			if err := srv.DropReplicationSlot(ctx, s.Name); err != nil {
+				return nil, err
+			}
+			pod := fmt.Sprintf("%s-%d", cluster.Name, ordinal)
+			recreated = append(recreated, pod)
+			log.Info("Dropped an invalidated replication slot", "slot", s.Name)
+			if r.Recorder != nil {
+				r.Recorder.Eventf(cluster, nil, corev1.EventTypeWarning, "ReplicationSlotInvalidated", "RecreateSlot",
+					"Replication slot %s was invalidated (max_slot_wal_keep_size exceeded) and is re-created; "+
+						"standby %s must be re-cloned: delete PVC data-%s and pod %s", s.Name, pod, pod, pod)
+			}
+		default:
+			existing[s.Name] = true
+		}
 	}
 	for i := 1; i < int(want); i++ {
-		if name := replicationSlotName(i); !existing[name] {
+		if name := replicationSlotName(i); !existing[name] && podExists[i] {
 			if err := srv.CreatePhysicalReplicationSlot(ctx, name); err != nil {
-				return err
+				return recreated, err
 			}
 		}
 	}
-	return nil
+	return recreated, nil
 }
 
 // cleanupStandbyVolumes deletes the data PVCs of standbys that were scaled

@@ -147,7 +147,10 @@ spec:
                   Pod <cluster>-0 is the primary. The other pods clone it with
                   pg_basebackup and stream from it over a dedicated replication slot. The
                   Service "<cluster>" always routes to the primary; with more than one
-                  instance the Service "<cluster>-ro" routes to the standbys (read-only).
+                  instance the Service "<cluster>-ro" routes to the standbys that stream
+                  (read-only). status.ready and the Available condition follow the
+                  primary only; standby health is reported by status.readyInstances and
+                  the ReplicationHealthy condition.
                   There is no automated failover: when the primary is down, writes are
                   unavailable until it is back.
 

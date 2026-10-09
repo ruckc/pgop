@@ -90,9 +90,18 @@ func RegisterReplicationTests() {
 		podIP := func(g Gomega, pod string) string {
 			return get(g, "pod", pod, "-o", "jsonpath={.status.podIP}")
 		}
+		// endpoints returns the ready addresses behind a Service (a jsonpath
+		// filter fails on a slice without endpoints, so filter here).
 		endpoints := func(g Gomega, svc string) string {
-			return get(g, "endpointslices", "-l", "kubernetes.io/service-name="+svc,
-				"-o", "jsonpath={.items[*].endpoints[?(@.conditions.ready==true)].addresses[*]}")
+			out := get(g, "endpointslices", "-l", "kubernetes.io/service-name="+svc,
+				"-o", `jsonpath={range .items[*].endpoints[*]}{.conditions.ready}={.addresses[0]}{"\n"}{end}`)
+			var ready []string
+			for line := range strings.Lines(out) {
+				if addr, ok := strings.CutPrefix(strings.TrimSpace(line), "true="); ok {
+					ready = append(ready, addr)
+				}
+			}
+			return strings.Join(ready, " ")
 		}
 		// waitHealthy waits until the Cluster is ready with n instances and,
 		// with standbys, every standby streams.
@@ -112,6 +121,20 @@ func RegisterReplicationTests() {
 			out, err := local(name+"-0", "SELECT string_agg(slot_name, ',' ORDER BY slot_name) FROM pg_replication_slots")
 			g.Expect(err).NotTo(HaveOccurred())
 			return out
+		}
+		streamingLabel := func(g Gomega, pod string) string {
+			return get(g, "pod", pod, "-o", `jsonpath={.metadata.labels.pgop\.ruck\.io/streaming}`)
+		}
+		// primaryUsable checks what clients and Role/Database reconciles
+		// depend on: the Cluster is ready, TLS is active and the credentials
+		// Secret tells clients to verify the server.
+		primaryUsable := func(g Gomega) {
+			g.Expect(get(g, "cluster", name, "-o", "jsonpath={.status.ready}")).To(Equal("true"))
+			g.Expect(get(g, "cluster", name, "-o",
+				`jsonpath={.status.conditions[?(@.type=="TLSReady")].status}`)).To(Equal("True"))
+			sslmode, err := base64.StdEncoding.DecodeString(get(g, "secret", name+"-credentials", "-o", "jsonpath={.data.sslmode}"))
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(string(sslmode)).To(Equal("verify-full"))
 		}
 		exists := func(kind, n string) bool {
 			out, err := kubectl("get", kind, n, "--ignore-not-found", "-o", "name")
@@ -137,11 +160,13 @@ spec:
   tls: {}
   parameters:
     work_mem: 8MB
+    max_slot_wal_keep_size: 64MB
 `, name))
 			waitHealthy(2)
 
 			Expect(get(Default, "pod", name+"-0", "-o", `jsonpath={.metadata.labels.pgop\.ruck\.io/role}`)).To(Equal("primary"))
 			Expect(get(Default, "pod", name+"-1", "-o", `jsonpath={.metadata.labels.pgop\.ruck\.io/role}`)).To(Equal("replica"))
+			Expect(streamingLabel(Default, name+"-1")).To(Equal("true"))
 			Expect(get(Default, "cluster", name, "-o", "jsonpath={.status.currentPrimary}")).To(Equal(name + "-0"))
 			Expect(get(Default, "cluster", name, "-o", "jsonpath={.status.readOnlyEndpoint}")).To(Equal(roHost + ":5432"))
 
@@ -266,10 +291,13 @@ spec:
 			}).Should(Succeed())
 		})
 
-		It("rejoins a standby whose pod was deleted", func() {
+		It("rejoins a standby whose pod was deleted, without affecting the primary's clients", func() {
 			uid1 := podUID(Default, name+"-1")
-			_, err := kubectl("delete", "pod", name+"-1", "--wait=true")
+			_, err := kubectl("delete", "pod", name+"-1", "--wait=false")
 			Expect(err).NotTo(HaveOccurred())
+			// While the standby is down and restarting, the Cluster stays
+			// ready and clients keep verify-full.
+			Consistently(primaryUsable).WithTimeout(20 * time.Second).WithPolling(2 * time.Second).Should(Succeed())
 			Eventually(func(g Gomega) {
 				g.Expect(podUID(g, name+"-1")).NotTo(Equal(uid1))
 			}).Should(Succeed())
@@ -280,6 +308,68 @@ spec:
 				out, err := local(name+"-1", "SELECT v FROM repl_e2e WHERE id = 4")
 				g.Expect(err).NotTo(HaveOccurred())
 				g.Expect(out).To(Equal("after-rejoin"))
+			}).Should(Succeed())
+		})
+
+		It("takes a standby with an invalidated slot out of -ro and re-clones it", func() {
+			By("cutting the standby off and generating more WAL than max_slot_wal_keep_size")
+			_, err := local(name+"-0", "ALTER ROLE pgop_replicator NOLOGIN")
+			Expect(err).NotTo(HaveOccurred())
+			Eventually(func(g Gomega) {
+				_, err := local(name+"-0",
+					"SELECT pg_terminate_backend(pid) FROM pg_stat_replication WHERE application_name = '"+name+"-1'")
+				g.Expect(err).NotTo(HaveOccurred())
+				out, err := local(name+"-0", "SELECT count(*) FROM pg_stat_replication WHERE application_name = '"+name+"-1'")
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(out).To(Equal("0"))
+			}).Should(Succeed())
+			_, err = local(name+"-0", "CREATE TABLE repl_big AS SELECT g, repeat('x', 1000) AS v FROM generate_series(1, 150000) g")
+			Expect(err).NotTo(HaveOccurred())
+			_, err = local(name+"-0", "SELECT pg_switch_wal(); CHECKPOINT")
+			Expect(err).NotTo(HaveOccurred())
+
+			By("the operator re-creates the slot, reports it, and removes the standby from -ro")
+			Eventually(func(g Gomega) {
+				g.Expect(get(g, "events", "--field-selector", "reason=ReplicationSlotInvalidated,involvedObject.name="+name,
+					"-o", "name")).NotTo(BeEmpty())
+				g.Expect(streamingLabel(g, name+"-1")).To(Equal("false"))
+				g.Expect(endpoints(g, name+"-ro")).To(BeEmpty())
+				primaryUsable(g)
+			}).Should(Succeed())
+			_, err = local(name+"-0", "ALTER ROLE pgop_replicator LOGIN")
+			Expect(err).NotTo(HaveOccurred())
+			Consistently(func(g Gomega) {
+				g.Expect(streamingLabel(g, name+"-1")).To(Equal("false"))
+			}).WithTimeout(20 * time.Second).WithPolling(5 * time.Second).Should(Succeed())
+
+			By("re-cloning the standby")
+			_, err = kubectl("delete", "pvc", "data-"+name+"-1", "--wait=false")
+			Expect(err).NotTo(HaveOccurred())
+			_, err = kubectl("delete", "pod", name+"-1")
+			Expect(err).NotTo(HaveOccurred())
+			waitHealthy(2)
+			Eventually(func(g Gomega) {
+				g.Expect(streamingLabel(g, name+"-1")).To(Equal("true"))
+				out, err := local(name+"-1", "SELECT count(*) FROM repl_big")
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(out).To(Equal("150000"))
+				g.Expect(endpoints(g, name+"-ro")).To(Equal(podIP(g, name+"-1")))
+			}).Should(Succeed())
+		})
+
+		It("restarts only the standbys when the replication password is rotated", func() {
+			uid0, uid1 := podUID(Default, name+"-0"), podUID(Default, name+"-1")
+			newPassword := base64.StdEncoding.EncodeToString([]byte("rotated-replication-password"))
+			_, err := kubectl("patch", "secret", name+"-credentials", "--type=merge",
+				"-p", fmt.Sprintf(`{"data":{"replication-password":%q}}`, newPassword))
+			Expect(err).NotTo(HaveOccurred())
+			Eventually(func(g Gomega) {
+				g.Expect(podUID(g, name+"-1")).NotTo(Equal(uid1))
+			}).Should(Succeed())
+			waitHealthy(2)
+			Expect(podUID(Default, name+"-0")).To(Equal(uid0))
+			Eventually(func(g Gomega) {
+				g.Expect(streamingLabel(g, name+"-1")).To(Equal("true"))
 			}).Should(Succeed())
 		})
 	})
