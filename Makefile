@@ -132,6 +132,17 @@ run: manifests generate fmt vet ## Run a controller from your host.
 docker-build: ## Build docker image with the manager.
 	$(CONTAINER_TOOL) build --build-arg GO_BUILD_FLAGS="${GO_BUILD_FLAGS}" -t ${IMG} .
 
+# pgBackRest images (images/pgbackrest/Dockerfile): the Job image and the
+# Postgres+pgBackRest image of PG_MAJOR, built from one pinned pgBackRest.
+PGBACKREST_IMG ?= pgop-pgbackrest:dev
+POSTGRES_PGBACKREST_IMG ?= pgop-postgres:dev
+PG_MAJOR ?= 18
+
+.PHONY: docker-build-pgbackrest
+docker-build-pgbackrest: ## Build the pgBackRest and Postgres+pgBackRest images.
+	$(CONTAINER_TOOL) build --target pgbackrest -t ${PGBACKREST_IMG} images/pgbackrest
+	$(CONTAINER_TOOL) build --target postgres --build-arg PG_MAJOR=$(PG_MAJOR) -t ${POSTGRES_PGBACKREST_IMG} images/pgbackrest
+
 .PHONY: docker-push
 docker-push: ## Push docker image with the manager.
 	$(CONTAINER_TOOL) push ${IMG}

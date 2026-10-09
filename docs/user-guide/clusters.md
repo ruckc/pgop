@@ -148,7 +148,7 @@ updated:
 | `config_file`, `data_directory`, `hba_file`, `ident_file`, `external_pid_file` | File locations set up by the operator and the image |
 | `include`, `include_dir`, `include_if_exists` | Would read arbitrary files |
 | `ssl`, `ssl_cert_file`, `ssl_key_file`, `ssl_min_protocol_version` | Controlled by [`spec.tls`](#tls) |
-| `archive_mode`, `archive_command`, `archive_library`, `restore_command` | Reserved for operator-managed WAL archiving (physical backups) |
+| `archive_mode`, `archive_command`, `archive_library`, `restore_command` | Operator-managed WAL archiving ([physical backups](backups.md#physical-backups-pgbackrest)) |
 | `wal_level`, `max_wal_senders`, `max_replication_slots`, `hot_standby` | Streaming [replication](replication.md) depends on them: `wal_level` stays `replica`, `hot_standby` stays `on`, and Clusters that have had standbys run with `max_wal_senders` and `max_replication_slots` set to `32` |
 | `primary_conninfo`, `primary_slot_name` | Set by the operator for standbys |
 
@@ -316,6 +316,12 @@ Any Docker image compatible with the official PostgreSQL image environment varia
 For extensions that ship outside the base image (e.g. PostGIS, TimescaleDB),
 set `spec.image` to an image that bundles them, such as `postgis/postgis:18-3.5`.
 See [Databases → Extensions](databases.md#common-extensions).
+
+While a [physical Backup](backups.md#physical-backups-pgbackrest) names the
+Cluster, the official `postgres:<major>` image (16, 17, 18) is replaced by
+pgop's Postgres+pgBackRest image `ghcr.io/ruckc/pgop-postgres:<major>-<pgbackrest>`;
+a custom image must contain pgBackRest itself (see
+[Backups → Images](backups.md#images)).
 
 ## Connecting: Endpoint & TLS
 
@@ -617,15 +623,15 @@ applied to its backup CronJobs. `spec.suspend` is left as you set it.
 Physical (pgBackRest) backups and restores do not use libpq over the network,
 so `spec.tls` does not change them:
 
+- The backup Job reaches the data directory through the pgBackRest TLS server
+  in the Cluster pod, with mutual TLS from a separate, operator-managed CA
+  (see [Backups → pgBackRest TLS](backups.md#pgbackrest-tls)). pgBackRest
+  itself connects to PostgreSQL over the pod's Unix socket.
 - `pgbackrest restore` writes the data directory directly and opens no
   database connection.
-- The backup Job reaches the database host through pgBackRest's own remote
-  protocol (`--pg1-host`), not through PostgreSQL. pgop does not run a
-  pgBackRest server in the Cluster pod, so this channel, and pgBackRest TLS
-  for it, is not set up by pgop.
 
-The S3 repository connection verifies the endpoint's certificate by default
-(pgBackRest `repo1-s3-verify-tls`).
+The S3 repository connection always uses HTTPS and verifies the endpoint's
+certificate (`caSecretRef` adds a private CA).
 
 ### Limitations
 

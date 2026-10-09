@@ -305,14 +305,11 @@ physical backup), where `ALTER ROLE` would fail. Known limitations:
 
 - **Single-instance Clusters** (that never had standbys) keep the original
   hook, which does not skip recovery, so their pod template stays unchanged
-  on operator upgrade. A [physical restore](restores.md) to a point in time
-  leaves the server paused in recovery (pgBackRest `--target-action=pause`),
-  the hook fails and the container is restarted in a loop. Workaround: finish
-  recovery before starting the pod normally (restore with
-  `--target-action=promote`, or remove `recovery.signal` / run
-  `SELECT pg_wal_replay_resume()` in a debug pod), or temporarily scale the
-  Cluster to 2 instances so the recovery-aware hook is used. A fix is tracked
-  separately.
+  on operator upgrade. Clusters with a
+  [physical Backup](backups.md#physical-backups-pgbackrest) (the only ones a
+  physical restore applies to) use the recovery-aware hook as well, and pgop's
+  restores promote the server once the target is reached
+  (`--target-action=promote`).
 - **Clusters with standbys:** after a restore, the hook skipped the password
   sync while the server was recovering, so the primary may reject the
   operator password (`28P01`) once recovery ends. The operator cannot tell
@@ -326,11 +323,12 @@ physical backup), where `ALTER ROLE` would fail. Known limitations:
 
 ## Backups and restores
 
-Backups always run against the primary (`<cluster>` Service). A
-[physical restore](restores.md) replaces the primary's data, which the
-standbys no longer match: scale the Cluster to 1 instance before the restore
-(this removes the standbys and their volumes), restore, then scale up again so
-the standbys are cloned from the restored primary.
+Backups always run against the primary (`<cluster>` Service; physical
+backups through its pgBackRest TLS server). A
+[physical restore](restores.md#physical-restore-pgbackrest) replaces the
+primary's data, which the standbys no longer match: the Restore deletes the
+standbys' volumes once its restore Job succeeded (a failed restore keeps them), and when the Cluster starts
+again the standbys are cloned from the restored primary.
 
 ## Limitations
 

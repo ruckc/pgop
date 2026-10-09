@@ -387,6 +387,59 @@ spec:
                 description: endpoint is the internal service endpoint for connecting
                   to PostgreSQL
                 type: string
+              lastRestore:
+                description: |-
+                  lastRestore records the last physical Restore that finished on this
+                  Cluster (succeeded, failed or interrupted). A Restore with the same
+                  name and spec within 24 hours needs a confirmation that names its UID
+                  (see the pgop.ruck.io/allow-restore annotation).
+                properties:
+                  completionTime:
+                    description: completionTime is when the Restore finished.
+                    format: date-time
+                    type: string
+                  fingerprint:
+                    description: fingerprint is a hash of the Restore spec.
+                    type: string
+                  name:
+                    description: name of the Restore.
+                    type: string
+                  result:
+                    description: result is Succeeded, Failed or Interrupted.
+                    type: string
+                  uid:
+                    description: uid of the Restore.
+                    type: string
+                required:
+                - completionTime
+                - fingerprint
+                - name
+                - result
+                - uid
+                type: object
+              lastWALDrop:
+                description: |-
+                  lastWALDrop records the last WAL segment pgBackRest dropped because
+                  the archive queue exceeded archive-push-queue-max. Point-in-time
+                  recovery across it is impossible; closedBy names the first successful
+                  backup that started after it (recovery from that backup on works).
+                properties:
+                  closedBy:
+                    description: |-
+                      closedBy is the BackupRun of the first successful backup that started
+                      after the drop; empty while no such backup exists.
+                    type: string
+                  segment:
+                    description: segment is the WAL file name.
+                    type: string
+                  time:
+                    description: time the segment was dropped.
+                    format: date-time
+                    type: string
+                required:
+                - segment
+                - time
+                type: object
               parametersHash:
                 description: |-
                   parametersHash identifies the generated configuration (spec.parameters)

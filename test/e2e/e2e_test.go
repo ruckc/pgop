@@ -700,6 +700,7 @@ spec:
 	RegisterManagedTLSTests()
 	RegisterParametersTests()
 	RegisterReplicationTests()
+	RegisterPhysicalBackupTests()
 })
 
 // serviceAccountToken returns a token for the specified service account in the given namespace.

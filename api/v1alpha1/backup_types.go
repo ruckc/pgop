@@ -18,6 +18,7 @@ package v1alpha1
 
 import (
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -49,6 +50,45 @@ type PhysicalBackupConfig struct {
 	// incrementalSchedule is the cron schedule for incremental backups
 	// +kubebuilder:default="0 2 * * 1-6"
 	IncrementalSchedule string `json:"incrementalSchedule,omitempty"`
+
+	// image is the pgBackRest container image the backup and restore Jobs
+	// run. Defaults to the image built by the pgop project
+	// (ghcr.io/ruckc/pgop-pgbackrest) for the pgBackRest version the operator
+	// ships with. pgBackRest requires the same version on both ends of its
+	// protocol, so an override must match the version in the Cluster's
+	// PostgreSQL image.
+	// +optional
+	Image string `json:"image,omitempty"`
+
+	// postgresImageIncludesPgbackrest declares that the Cluster's
+	// spec.image already contains pgBackRest (same version as the Job
+	// image, at /usr/bin/pgbackrest, postgres user uid 999), so the
+	// operator uses it as it is. Without it, physical backups are only
+	// enabled for the official Debian (trixie) postgres image of a supported
+	// major version, which the operator replaces with pgop's
+	// Postgres+pgBackRest image; any other image makes the Backup Invalid
+	// and the Cluster is left unchanged.
+	// +optional
+	PostgresImageIncludesPgbackrest bool `json:"postgresImageIncludesPgbackrest,omitempty"`
+
+	// acceptImageSwap acknowledges that the Cluster's official postgres image
+	// given by a bare tag of PostgreSQL 16 or 17 ("17", "17.2") is replaced
+	// by pgop's Debian trixie image. Those tags were Debian bookworm until
+	// August 2025, whose glibc collations can differ from trixie's: confirm
+	// that the Cluster was initialized on a trixie image (or that its text
+	// indexes were rebuilt) before setting it. Not needed for "-trixie" tags
+	// or PostgreSQL 18, whose released images were always trixie.
+	// +optional
+	AcceptImageSwap bool `json:"acceptImageSwap,omitempty"`
+
+	// archivePushQueueMax bounds the WAL that may queue up in pg_wal while
+	// archiving fails (pgBackRest archive-push-queue-max). Beyond it,
+	// pgBackRest drops WAL (and logs it) instead of filling the data
+	// volume, which breaks point-in-time recovery across the gap until the
+	// next full backup. Defaults to a quarter of the Cluster's storage size
+	// (at least 64Mi).
+	// +optional
+	ArchivePushQueueMax *resource.Quantity `json:"archivePushQueueMax,omitempty"`
 }
 
 // RetentionSpec configures how long backups are retained
@@ -90,6 +130,13 @@ type S3Destination struct {
 	// If omitted, ambient credentials (IRSA/instance profile) are used.
 	// +optional
 	CredentialsSecretRef *corev1.LocalObjectReference `json:"credentialsSecretRef,omitempty"`
+
+	// caSecretRef selects a Secret key holding the PEM CA bundle that
+	// verifies the endpoint's TLS certificate, for S3-compatible storage
+	// with a private CA. Used by physical (pgBackRest) backups, which always
+	// connect to S3 over HTTPS.
+	// +optional
+	CASecretRef *SecretKeySelector `json:"caSecretRef,omitempty"`
 }
 
 // AzureDestination configures an Azure Blob Storage backup destination

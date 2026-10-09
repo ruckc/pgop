@@ -217,6 +217,12 @@ func generateCA(commonName string, now time.Time, validity time.Duration) (*keyP
 // issueServerCert issues an ECDSA P-256 server certificate for dnsNames from
 // ca, valid until now+validity but never beyond the CA's own expiry.
 func issueServerCert(ca *keyPair, dnsNames []string, now time.Time, validity time.Duration) (*keyPair, error) {
+	return issueLeafCert(ca, commonName(dnsNames[0]), dnsNames, x509.ExtKeyUsageServerAuth, now, validity)
+}
+
+// issueLeafCert issues an ECDSA P-256 certificate for usage from ca, valid
+// until now+validity but never beyond the CA's own expiry.
+func issueLeafCert(ca *keyPair, cn string, dnsNames []string, usage x509.ExtKeyUsage, now time.Time, validity time.Duration) (*keyPair, error) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return nil, err
@@ -231,12 +237,12 @@ func issueServerCert(ca *keyPair, dnsNames []string, now time.Time, validity tim
 	}
 	tmpl := &x509.Certificate{
 		SerialNumber: serial,
-		Subject:      pkix.Name{CommonName: commonName(dnsNames[0])},
+		Subject:      pkix.Name{CommonName: cn},
 		DNSNames:     dnsNames,
 		NotBefore:    now.Add(-clockSkew),
 		NotAfter:     notAfter,
 		KeyUsage:     x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		ExtKeyUsage:  []x509.ExtKeyUsage{usage},
 	}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, ca.Cert, &key.PublicKey, ca.Key)
 	if err != nil {

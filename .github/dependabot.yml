@@ -1,0 +1,23 @@
+version: 2
+updates:
+  # Base images of the operator image.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: chore
+      include: scope
+
+  # Base images of the pgBackRest images (debian:trixie-slim and
+  # postgres:<major>-trixie, one stage per major), pinned by digest: each
+  # Dependabot digest bump is a new postgres minor release or Debian update.
+  # pgBackRest itself is pinned by PGBACKREST_VERSION and PGBACKREST_SHA256
+  # (and pgbackrestVersion in internal/controller), which are bumped by hand.
+  - package-ecosystem: docker
+    directory: /images/pgbackrest
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: chore
+      include: scope

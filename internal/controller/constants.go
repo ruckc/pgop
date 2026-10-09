@@ -206,6 +206,44 @@ const (
 	envPGHost             = "PGHOST"
 	envPGPort             = "PGPORT"
 
-	volPgbackrestConfig = "pgbackrest-config"
-	volPgbackrestTmp    = "pgbackrest-tmp"
+	volPgbackrestTmp = "pgbackrest-tmp"
+
+	// AnnotationRestoreInProgress on a Cluster names the physical Restore
+	// that stopped it (StatefulSet scaled to 0) to restore its data
+	// directory. The Cluster starts again once the annotation is removed:
+	// by the Restore when it succeeds or is deleted.
+	AnnotationRestoreInProgress = "pgop.ruck.io/restore-in-progress"
+	// ReasonPausedForRestore: the Cluster is stopped for a physical Restore.
+	ReasonPausedForRestore = "PausedForRestore"
+
+	// reasonSucceeded: a BackupRun or Restore completed successfully.
+	reasonSucceeded = "Succeeded"
+	// reasonInvalid: the spec cannot work as it is.
+	reasonInvalid = "Invalid"
+	// reasonFailed: a BackupRun or Restore failed.
+	reasonFailed = "Failed"
+
+	// ConditionTypeWALArchiving reports WAL archiving health from
+	// pg_stat_archiver while the Cluster has a physical Backup.
+	ConditionTypeWALArchiving = "WALArchiving"
+	// ConditionTypePhysicalBackup reports on the Cluster whether WAL is
+	// archived for a physical Backup: True (Enabled), False (Invalid: a
+	// physical Backup names the Cluster but cannot be used; Disabled: none,
+	// while pgop's image is kept). Absent for Clusters that never had one.
+	ConditionTypePhysicalBackup = "PhysicalBackup"
+	// ConditionTypeRestoreInterrupted is True while the Cluster is stopped
+	// because a physical restore did not complete (see
+	// AnnotationRestoreInterrupted).
+	ConditionTypeRestoreInterrupted = "RestoreInterrupted"
+
+	// AnnotationRestoreInterrupted on a Cluster names the physical Restore
+	// that failed or was deleted after it started writing the data
+	// directory. The Cluster stays stopped while it is set: run a new
+	// (confirmed) Restore, or remove the annotation to start PostgreSQL on
+	// the data directory as it is.
+	AnnotationRestoreInterrupted = "pgop.ruck.io/restore-interrupted"
+	// AnnotationAllowRestore on a Cluster confirms a physical Restore:
+	// "<restore-name>" or "<restore-name>/<restore-uid>". The operator
+	// removes it once that Restore finished.
+	AnnotationAllowRestore = "pgop.ruck.io/allow-restore"
 )

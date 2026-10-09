@@ -21,6 +21,32 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+// RestoreRecord identifies a physical Restore that finished on a Cluster.
+type RestoreRecord struct {
+	// name of the Restore.
+	Name string `json:"name"`
+	// uid of the Restore.
+	UID string `json:"uid"`
+	// fingerprint is a hash of the Restore spec.
+	Fingerprint string `json:"fingerprint"`
+	// result is Succeeded, Failed or Interrupted.
+	Result string `json:"result"`
+	// completionTime is when the Restore finished.
+	CompletionTime metav1.Time `json:"completionTime"`
+}
+
+// WALDropRecord is a WAL segment pgBackRest dropped instead of archiving.
+type WALDropRecord struct {
+	// time the segment was dropped.
+	Time metav1.Time `json:"time"`
+	// segment is the WAL file name.
+	Segment string `json:"segment"`
+	// closedBy is the BackupRun of the first successful backup that started
+	// after the drop; empty while no such backup exists.
+	// +optional
+	ClosedBy string `json:"closedBy,omitempty"`
+}
+
 // ClusterSpec defines the desired state of Cluster
 type ClusterSpec struct {
 	// image is the PostgreSQL container image to use.
@@ -257,6 +283,20 @@ func (t *ClusterTLSSpec) GetMinProtocolVersion() TLSProtocolVersion {
 
 // ClusterStatus defines the observed state of Cluster.
 type ClusterStatus struct {
+	// lastRestore records the last physical Restore that finished on this
+	// Cluster (succeeded, failed or interrupted). A Restore with the same
+	// name and spec within 24 hours needs a confirmation that names its UID
+	// (see the pgop.ruck.io/allow-restore annotation).
+	// +optional
+	LastRestore *RestoreRecord `json:"lastRestore,omitempty"`
+
+	// lastWALDrop records the last WAL segment pgBackRest dropped because
+	// the archive queue exceeded archive-push-queue-max. Point-in-time
+	// recovery across it is impossible; closedBy names the first successful
+	// backup that started after it (recovery from that backup on works).
+	// +optional
+	LastWALDrop *WALDropRecord `json:"lastWALDrop,omitempty"`
+
 	// ready indicates if the cluster is ready to accept connections
 	Ready bool `json:"ready,omitempty"`
 

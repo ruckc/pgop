@@ -32,6 +32,7 @@ const (
 )
 
 // RestoreSpec defines the desired state of Restore.
+// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="spec is immutable; create a new Restore instead"
 type RestoreSpec struct {
 	// type selects the restore strategy: logical (pg_restore from a pg_dump
 	// artifact in object storage) or physical (pgBackRest restore).
