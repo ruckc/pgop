@@ -18,6 +18,16 @@ spec:
     - jsonPath: .status.ready
       name: Ready
       type: boolean
+    - jsonPath: .spec.replicas
+      name: Instances
+      type: integer
+    - jsonPath: .status.readyInstances
+      name: Ready Instances
+      type: integer
+    - jsonPath: .status.currentPrimary
+      name: Primary
+      priority: 1
+      type: string
     - jsonPath: .status.endpoint
       name: Endpoint
       type: string
@@ -78,7 +88,8 @@ spec:
                   breaks are reported as InvalidParameter. Keys must be PostgreSQL
                   parameter names. Parameters the operator manages itself
                   (listen_addresses, port, file locations, include directives, the
-                  settings controlled by spec.tls, and WAL archiving) are rejected; see
+                  settings controlled by spec.tls, WAL archiving, and the settings
+                  streaming replication depends on) are rejected; see
                   ReservedParameters. Note that ALTER SYSTEM (postgresql.auto.conf)
                   still overrides these values; the condition reports it when it does.
 
@@ -92,15 +103,18 @@ spec:
                   rule: self.all(k, k.matches('^[a-zA-Z_][a-zA-Z0-9_.]*$'))
                 - message: parameters must not set operator-managed parameters (archive_command,
                     archive_library, archive_mode, config_file, data_directory, external_pid_file,
-                    hba_file, ident_file, include, include_dir, include_if_exists,
-                    listen_addresses, port, restore_command, ssl, ssl_cert_file, ssl_key_file,
-                    ssl_min_protocol_version, unix_socket_directories)
+                    hba_file, hot_standby, ident_file, include, include_dir, include_if_exists,
+                    listen_addresses, max_replication_slots, max_wal_senders, port,
+                    primary_conninfo, primary_slot_name, restore_command, ssl, ssl_cert_file,
+                    ssl_key_file, ssl_min_protocol_version, unix_socket_directories,
+                    wal_level)
                   rule: '!self.exists(k, k.lowerAscii() in [''archive_command'', ''archive_library'',
                     ''archive_mode'', ''config_file'', ''data_directory'', ''external_pid_file'',
-                    ''hba_file'', ''ident_file'', ''include'', ''include_dir'', ''include_if_exists'',
-                    ''listen_addresses'', ''port'', ''restore_command'', ''ssl'',
-                    ''ssl_cert_file'', ''ssl_key_file'', ''ssl_min_protocol_version'',
-                    ''unix_socket_directories''])'
+                    ''hba_file'', ''hot_standby'', ''ident_file'', ''include'', ''include_dir'',
+                    ''include_if_exists'', ''listen_addresses'', ''max_replication_slots'',
+                    ''max_wal_senders'', ''port'', ''primary_conninfo'', ''primary_slot_name'',
+                    ''restore_command'', ''ssl'', ''ssl_cert_file'', ''ssl_key_file'',
+                    ''ssl_min_protocol_version'', ''unix_socket_directories'', ''wal_level''])'
               port:
                 default: 5432
                 description: port is the port PostgreSQL listens on
@@ -127,10 +141,21 @@ spec:
               replicas:
                 default: 1
                 description: |-
-                  replicas is the number of PostgreSQL instances to run.
-                  Currently only single instance is supported.
+                  replicas is the total number of PostgreSQL instances to run: one
+                  primary plus replicas-1 asynchronous streaming hot standbys.
+
+                  Pod <cluster>-0 is the primary. The other pods clone it with
+                  pg_basebackup and stream from it over a dedicated replication slot. The
+                  Service "<cluster>" always routes to the primary; with more than one
+                  instance the Service "<cluster>-ro" routes to the standbys (read-only).
+                  There is no automated failover: when the primary is down, writes are
+                  unavailable until it is back.
+
+                  The first scale-up from 1 restarts the primary once to enable
+                  replication; later scaling does not restart it. Scaling down removes the
+                  highest pods together with their data volumes and replication slots.
                 format: int32
-                maximum: 1
+                maximum: 10
                 minimum: 1
                 type: integer
               resources:
@@ -350,6 +375,11 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              currentPrimary:
+                description: |-
+                  currentPrimary is the name of the pod running the primary (read-write)
+                  instance. The Service "<cluster>" routes to this pod only.
+                type: string
               endpoint:
                 description: endpoint is the internal service endpoint for connecting
                   to PostgreSQL
@@ -370,9 +400,21 @@ spec:
                   type: string
                 type: array
                 x-kubernetes-list-type: atomic
+              readOnlyEndpoint:
+                description: |-
+                  readOnlyEndpoint is the internal endpoint of the "<cluster>-ro"
+                  Service, which routes to the hot standbys. Only set while
+                  spec.replicas is greater than 1.
+                type: string
               ready:
                 description: ready indicates if the cluster is ready to accept connections
                 type: boolean
+              readyInstances:
+                description: |-
+                  readyInstances is the number of PostgreSQL pods (primary and standbys)
+                  that are ready.
+                format: int32
+                type: integer
               secretName:
                 description: secretName is the name of the Secret containing operator
                   credentials

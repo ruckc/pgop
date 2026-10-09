@@ -74,6 +74,13 @@ spec:
     restore command but does not automate the stop/start dance — do that as part
     of your recovery runbook.
 
+!!! warning "Clusters with standbys"
+    A physical restore only rewrites the primary's volume (`data-<cluster>-0`);
+    the standbys' copies no longer match it. Scale the Cluster to
+    `replicas: 1` before the restore (this removes the standbys and their
+    volumes), restore, then scale up again so that new standbys are cloned
+    from the restored primary. See [Replication](replication.md#backups-and-restores).
+
 ## Spec Reference
 
 | Field | Type | Default | Description |

@@ -357,7 +357,7 @@ func (r *ClusterReconciler) setParametersCondition(cluster *postgresv1alpha1.Clu
 // The outcome is reported in the ParametersApplied condition and
 // status.pendingRestart; problems never fail the reconcile or change
 // readiness. Returns when to check again (0: no need).
-func (r *ClusterReconciler) reconcileParameters(ctx context.Context, cluster *postgresv1alpha1.Cluster, ready bool) time.Duration {
+func (r *ClusterReconciler) reconcileParameters(ctx context.Context, cluster *postgresv1alpha1.Cluster, ready bool, pods []corev1.Pod) time.Duration {
 	params := cluster.Spec.Parameters
 	if len(params) == 0 {
 		meta.RemoveStatusCondition(&cluster.Status.Conditions, ConditionTypeParametersApplied)
@@ -418,7 +418,7 @@ func (r *ClusterReconciler) reconcileParameters(ctx context.Context, cluster *po
 	}
 
 	if cluster.Status.ParametersHash != hash {
-		if err := r.reloadForParameters(ctx, cluster); err != nil {
+		if err := r.reloadForParameters(ctx, cluster, pods); err != nil {
 			r.setParametersCondition(cluster, metav1.ConditionFalse, ReasonWaitingForServer,
 				fmt.Sprintf("Reloading the server configuration failed: %v", err))
 			return parametersRetryInterval
@@ -474,13 +474,15 @@ func (r *ClusterReconciler) statefulSetRolledOut(ctx context.Context, cluster *p
 	return sts.Status.UpdateRevision == sts.Status.CurrentRevision, nil
 }
 
-// connectForParameters connects to the server as the operator.
-func (r *ClusterReconciler) connectForParameters(ctx context.Context, cluster *postgresv1alpha1.Cluster) (ParameterServer, error) {
+// connectForParameters connects to the server as the operator: to the
+// primary, or, when dialAddress is set, to the instance at that pod address.
+func (r *ClusterReconciler) connectForParameters(ctx context.Context, cluster *postgresv1alpha1.Cluster, dialAddress string) (ParameterServer, error) {
 	cluster.Status.SecretName = cluster.Name + "-credentials"
 	cfg, err := operatorConnectionConfig(ctx, r.Client, cluster, defaultDatabaseName)
 	if err != nil {
 		return nil, err
 	}
+	cfg.DialAddress = dialAddress
 	connect := r.ConnectParameterServer
 	if connect == nil {
 		connect = connectParameterServer
@@ -491,7 +493,7 @@ func (r *ClusterReconciler) connectForParameters(ctx context.Context, cluster *p
 // readParameterState queries the server and assesses spec.parameters.
 func (r *ClusterReconciler) readParameterState(ctx context.Context, cluster *postgresv1alpha1.Cluster,
 	params map[string]string, layout postgresLayout) (parameterAssessment, error) {
-	srv, err := r.connectForParameters(ctx, cluster)
+	srv, err := r.connectForParameters(ctx, cluster, "")
 	if err != nil {
 		return parameterAssessment{}, err
 	}
@@ -511,14 +513,28 @@ func (r *ClusterReconciler) readParameterState(ctx context.Context, cluster *pos
 	return assessParameters(params, configFile, files, settings, layout.PGDATA+"/"+autoConfFileName), nil
 }
 
-// reloadForParameters runs pg_reload_conf() on a new connection.
-func (r *ClusterReconciler) reloadForParameters(ctx context.Context, cluster *postgresv1alpha1.Cluster) error {
-	srv, err := r.connectForParameters(ctx, cluster)
-	if err != nil {
+// reloadForParameters runs pg_reload_conf() on the primary and on every
+// ready standby (each reached by its pod address): all instances mount the
+// same generated file, but a reload only affects the server it runs on.
+func (r *ClusterReconciler) reloadForParameters(ctx context.Context, cluster *postgresv1alpha1.Cluster, pods []corev1.Pod) error {
+	reload := func(dialAddress string) error {
+		srv, err := r.connectForParameters(ctx, cluster, dialAddress)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = srv.Close() }()
+		return srv.ReloadConfig(ctx)
+	}
+	if err := reload(""); err != nil {
 		return err
 	}
-	defer func() { _ = srv.Close() }()
-	return srv.ReloadConfig(ctx)
+	standbys := readyStandbyAddresses(cluster, pods)
+	for _, name := range slices.Sorted(maps.Keys(standbys)) {
+		if err := reload(standbys[name]); err != nil {
+			return fmt.Errorf("standby %s: %w", name, err)
+		}
+	}
+	return nil
 }
 
 // restartForParameters restarts the PostgreSQL pod by setting the

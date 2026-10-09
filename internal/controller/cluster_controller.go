@@ -23,8 +23,11 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"maps"
 	"net"
+	"slices"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -37,7 +40,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -77,6 +79,11 @@ type ClusterReconciler struct {
 	// Optional; defaults to a real PostgreSQL connection. Tests override it.
 	ConnectParameterServer func(ctx context.Context, cfg postgres.ConnectionConfig) (ParameterServer, error)
 
+	// ConnectReplicationServer connects to the primary to manage
+	// replication (role, slots, pg_stat_replication). Optional; defaults to
+	// a real PostgreSQL connection. Tests override it.
+	ConnectReplicationServer func(ctx context.Context, cfg postgres.ConnectionConfig) (ReplicationServer, error)
+
 	// Now returns the current time. Optional; tests override it to exercise
 	// certificate renewal and CA rotation.
 	Now func() time.Time
@@ -107,6 +114,7 @@ func (r *ClusterReconciler) now() time.Time {
 // +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=configmaps,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch;patch
 // +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=cert-manager.io,resources=certificates,verbs=get;list;watch;create;update;patch;delete
 
@@ -156,9 +164,18 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return r.updateStatus(ctx, cluster, false, err)
 	}
 
-	// Reconcile Service
-	if err := r.reconcileService(ctx, cluster); err != nil {
-		log.Error(err, "Failed to reconcile Service")
+	// Whether the pod template carries the replication settings (see
+	// replicationEnabled) depends on the existing StatefulSet.
+	existingSts, err := r.getStatefulSet(ctx, cluster)
+	if err != nil {
+		return r.updateStatus(ctx, cluster, false, err)
+	}
+	replication := replicationEnabled(cluster, existingSts)
+
+	// Reconcile the read-write Service (primary only) before the StatefulSet,
+	// so it never selects a standby, then the read-only Service.
+	if err := r.reconcileServices(ctx, cluster); err != nil {
+		log.Error(err, "Failed to reconcile Services")
 		return r.updateStatus(ctx, cluster, false, err)
 	}
 
@@ -167,30 +184,18 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// verify-full would otherwise roll the pod into a broken (or unreachable)
 	// state. On failure the StatefulSet is left exactly as it is and
 	// TLSReady=False explains why.
-	var material *tlsMaterial
-	var tlsRecheckAt time.Time
-	if cluster.Spec.TLS != nil {
-		tlsRecheckAt, err = r.provisionTLSSecret(ctx, cluster)
-		if err == nil {
-			if material, err = loadTLSMaterial(ctx, r.Client, cluster, r.now()); err != nil {
-				err = &tlsNotReadyError{Reason: ReasonInvalidTLSSecret, Message: err.Error()}
-			}
-		}
-		if notReady, ok := errors.AsType[*tlsNotReadyError](err); ok {
-			return r.reportTLSNotReady(ctx, cluster, secret, notReady)
-		}
-		if err != nil {
-			log.Error(err, "Failed to provision the TLS Secret")
-			return r.updateStatus(ctx, cluster, false, err)
-		}
-	} else {
-		meta.RemoveStatusCondition(&cluster.Status.Conditions, ConditionTypeTLSReady)
-		cluster.Status.TLSSecretHash = ""
+	material, tlsRecheckAt, err := r.prepareTLS(ctx, cluster)
+	if notReady, ok := errors.AsType[*tlsNotReadyError](err); ok {
+		return r.reportTLSNotReady(ctx, cluster, secret, notReady)
+	}
+	if err != nil {
+		log.Error(err, "Failed to provision the TLS Secret")
+		return r.updateStatus(ctx, cluster, false, err)
 	}
 
 	// The pg_hba and configuration ConfigMaps must exist before a pod that
 	// mounts them starts.
-	if err := r.reconcileHBAConfigMap(ctx, cluster); err != nil {
+	if err := r.reconcileHBAConfigMap(ctx, cluster, replication); err != nil {
 		log.Error(err, "Failed to reconcile pg_hba ConfigMap")
 		return r.updateStatus(ctx, cluster, false, err)
 	}
@@ -202,23 +207,22 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	} // else reconcileStatefulSet reports the layout error
 
 	// Reconcile StatefulSet
-	if err := r.reconcileStatefulSet(ctx, cluster, secret); err != nil {
+	if err := r.reconcileStatefulSet(ctx, cluster, secret, replication); err != nil {
 		log.Error(err, "Failed to reconcile StatefulSet")
 		return r.updateStatus(ctx, cluster, false, err)
 	}
 
 	// Remove a no longer needed pg_hba ConfigMap and TLS resources only after
 	// the StatefulSet stopped referencing them.
-	if err := r.cleanupHBAConfigMap(ctx, cluster); err != nil {
-		log.Error(err, "Failed to clean up pg_hba ConfigMap")
+	if err := r.cleanupUnusedResources(ctx, cluster, replication); err != nil {
+		log.Error(err, "Failed to clean up resources")
 		return r.updateStatus(ctx, cluster, false, err)
 	}
-	if err := r.cleanupConfigMap(ctx, cluster); err != nil {
-		log.Error(err, "Failed to clean up configuration ConfigMap")
-		return r.updateStatus(ctx, cluster, false, err)
-	}
-	if err := r.cleanupTLSResources(ctx, cluster); err != nil {
-		log.Error(err, "Failed to clean up TLS resources")
+
+	// Label the pods primary/replica (the read-only Service selects them).
+	pods, err := r.labelClusterPods(ctx, cluster)
+	if err != nil {
+		log.Error(err, "Failed to label PostgreSQL pods")
 		return r.updateStatus(ctx, cluster, false, err)
 	}
 
@@ -231,12 +235,17 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	tlsPending := false
 	if material != nil {
-		tlsPending = r.reconcileTLSState(ctx, cluster, material, ready)
+		tlsPending = r.reconcileTLSState(ctx, cluster, material, ready, pods)
 	}
+
+	// Replication role, slots, removed standbys and ReplicationHealthy. Never
+	// fails the reconcile.
+	sts, _ := r.getStatefulSet(ctx, cluster)
+	replicationRecheck := r.reconcileReplication(ctx, cluster, secret, sts, pods)
 
 	// Apply spec.parameters once the TLS state (and so how the operator
 	// connects) is known. Never fails the reconcile.
-	parametersRecheck := r.reconcileParameters(ctx, cluster, ready)
+	parametersRecheck := r.reconcileParameters(ctx, cluster, ready, pods)
 
 	// Converge the client-facing connection info last, once the TLS state of
 	// this reconcile is known.
@@ -256,8 +265,10 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if tlsPending {
 		result.RequeueAfter = shorterRequeue(result.RequeueAfter, 10*time.Second)
 	}
-	if parametersRecheck > 0 {
-		result.RequeueAfter = shorterRequeue(result.RequeueAfter, parametersRecheck)
+	for _, recheck := range []time.Duration{parametersRecheck, replicationRecheck} {
+		if recheck > 0 {
+			result.RequeueAfter = shorterRequeue(result.RequeueAfter, recheck)
+		}
 	}
 	if !tlsRecheckAt.IsZero() {
 		// Self-managed certificates: come back when they are due for renewal.
@@ -265,6 +276,77 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			min(max(tlsRecheckAt.Sub(r.now()), time.Second), maxTLSRecheckInterval))
 	}
 	return result, nil
+}
+
+// getStatefulSet returns the Cluster's StatefulSet, or nil when it does not
+// exist.
+func (r *ClusterReconciler) getStatefulSet(ctx context.Context, cluster *postgresv1alpha1.Cluster) (*appsv1.StatefulSet, error) {
+	sts := &appsv1.StatefulSet{}
+	if err := r.Get(ctx, types.NamespacedName{Name: cluster.Name, Namespace: cluster.Namespace}, sts); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return sts, nil
+}
+
+// prepareTLS provisions (issuerRef, self-managed) and validates the TLS
+// Secret while spec.tls is set, returning its material and when self-managed
+// certificates must be looked at again. A Secret that cannot be used yet is
+// reported as a *tlsNotReadyError. Without spec.tls it clears the TLS status.
+func (r *ClusterReconciler) prepareTLS(ctx context.Context, cluster *postgresv1alpha1.Cluster) (*tlsMaterial, time.Time, error) {
+	if cluster.Spec.TLS == nil {
+		meta.RemoveStatusCondition(&cluster.Status.Conditions, ConditionTypeTLSReady)
+		cluster.Status.TLSSecretHash = ""
+		return nil, time.Time{}, nil
+	}
+	recheckAt, err := r.provisionTLSSecret(ctx, cluster)
+	if err != nil {
+		return nil, recheckAt, err
+	}
+	material, err := loadTLSMaterial(ctx, r.Client, cluster, r.now())
+	if err != nil {
+		return nil, recheckAt, &tlsNotReadyError{Reason: ReasonInvalidTLSSecret, Message: err.Error()}
+	}
+	return material, recheckAt, nil
+}
+
+// reconcileServices converges the read-write Service (primary only) and the
+// read-only Service (standbys).
+func (r *ClusterReconciler) reconcileServices(ctx context.Context, cluster *postgresv1alpha1.Cluster) error {
+	if err := r.reconcileService(ctx, cluster); err != nil {
+		return fmt.Errorf("service %q: %w", cluster.Name, err)
+	}
+	if err := r.reconcileReadOnlyService(ctx, cluster); err != nil {
+		return fmt.Errorf("service %q: %w", readOnlyServiceName(cluster), err)
+	}
+	return nil
+}
+
+// cleanupUnusedResources removes the pg_hba ConfigMap, the configuration
+// ConfigMap and the TLS resources once they are no longer needed. It runs
+// after the StatefulSet stopped referencing them.
+func (r *ClusterReconciler) cleanupUnusedResources(ctx context.Context, cluster *postgresv1alpha1.Cluster, replication bool) error {
+	if err := r.cleanupHBAConfigMap(ctx, cluster, replication); err != nil {
+		return fmt.Errorf("failed to clean up the pg_hba ConfigMap: %w", err)
+	}
+	if err := r.cleanupConfigMap(ctx, cluster); err != nil {
+		return fmt.Errorf("failed to clean up the configuration ConfigMap: %w", err)
+	}
+	if err := r.cleanupTLSResources(ctx, cluster); err != nil {
+		return fmt.Errorf("failed to clean up TLS resources: %w", err)
+	}
+	return nil
+}
+
+// labelClusterPods lists the Cluster's pods and sets their role labels.
+func (r *ClusterReconciler) labelClusterPods(ctx context.Context, cluster *postgresv1alpha1.Cluster) ([]corev1.Pod, error) {
+	pods, err := r.listClusterPods(ctx, cluster)
+	if err != nil {
+		return nil, err
+	}
+	return pods, r.labelPods(ctx, cluster, pods)
 }
 
 // maxTLSRecheckInterval caps how long the operator waits before looking at
@@ -353,7 +435,11 @@ func (r *ClusterReconciler) setTLSCondition(cluster *postgresv1alpha1.Cluster, s
 // restart. Kubelet propagates Secret updates into the pod with a delay, so this
 // is retried until the server presents the new certificate. Returns whether
 // TLS is still pending and the Cluster should be requeued.
-func (r *ClusterReconciler) reconcileTLSState(ctx context.Context, cluster *postgresv1alpha1.Cluster, material *tlsMaterial, ready bool) bool {
+//
+// With standbys, every ready standby is probed by its pod IP as well (they
+// serve the same certificate files, but a reload of the primary does not
+// reach them), and reloaded or restarted the same way.
+func (r *ClusterReconciler) reconcileTLSState(ctx context.Context, cluster *postgresv1alpha1.Cluster, material *tlsMaterial, ready bool, pods []corev1.Pod) bool {
 	if !ready {
 		r.setTLSCondition(cluster, metav1.ConditionFalse, ReasonWaitingForServer, "Waiting for the PostgreSQL pod to become ready")
 		return true
@@ -372,6 +458,10 @@ func (r *ClusterReconciler) reconcileTLSState(ctx context.Context, cluster *post
 	}
 
 	if bytes.Equal(presented, material.Leaf.Raw) {
+		if pending, msg := r.reconcileStandbyCertificates(ctx, cluster, material, pods, probe); pending {
+			r.setTLSCondition(cluster, metav1.ConditionFalse, ReasonCertificateReloading, msg)
+			return true
+		}
 		r.setTLSCondition(cluster, metav1.ConditionTrue, ReasonTLSActive,
 			fmt.Sprintf("Server presents the certificate from Secret %q", tlsSecretName(cluster)))
 		cluster.Status.TLSSecretHash = material.Hash
@@ -397,11 +487,48 @@ func (r *ClusterReconciler) reconcileTLSState(ctx context.Context, cluster *post
 
 	// Reload over a connection verified against the current CA bundle.
 	msg := "Server presents an outdated certificate; requested a configuration reload"
-	if err := r.reloadServerConfig(ctx, cluster, material.CAPEM); err != nil {
+	if err := r.reloadServerConfig(ctx, cluster, material.CAPEM, ""); err != nil {
 		msg = fmt.Sprintf("Server presents an outdated certificate and the reload failed: %v", err)
 	}
 	r.setTLSCondition(cluster, metav1.ConditionFalse, ReasonCertificateReloading, msg)
 	return true
+}
+
+// reconcileStandbyCertificates checks that every ready standby presents the
+// certificate from the TLS Secret, reloading (or, after a CA change,
+// restarting) the ones that do not. Returns whether a standby is still
+// pending, with a message for the TLSReady condition.
+func (r *ClusterReconciler) reconcileStandbyCertificates(ctx context.Context, cluster *postgresv1alpha1.Cluster,
+	material *tlsMaterial, pods []corev1.Pod, probe func(ctx context.Context, addr, serverName string) ([]byte, error)) (bool, string) {
+	host := clusterHost(cluster)
+	standbys := readyStandbyAddresses(cluster, pods)
+	var msgs []string
+	for _, name := range slices.Sorted(maps.Keys(standbys)) {
+		addr := standbys[name]
+		presented, err := probe(ctx, addr, host)
+		switch {
+		case err != nil:
+			msgs = append(msgs, fmt.Sprintf("standby %s is not serving TLS yet: %v", name, err))
+		case bytes.Equal(presented, material.Leaf.Raw):
+			continue
+		case !certVerifies(presented, material.CAPEM, host, r.now()):
+			msg := fmt.Sprintf("standby %s presents a certificate that the current CA does not verify; restarting the PostgreSQL pods", name)
+			if err := r.restartForTLS(ctx, cluster, material.Hash); err != nil {
+				msg = fmt.Sprintf("standby %s presents a certificate that the current CA does not verify and restarting the pods failed: %v", name, err)
+			}
+			msgs = append(msgs, msg)
+		default:
+			msg := fmt.Sprintf("standby %s presents an outdated certificate; requested a configuration reload", name)
+			if err := r.reloadServerConfig(ctx, cluster, material.CAPEM, addr); err != nil {
+				msg = fmt.Sprintf("standby %s presents an outdated certificate and the reload failed: %v", name, err)
+			}
+			msgs = append(msgs, msg)
+		}
+	}
+	if len(msgs) == 0 {
+		return false, ""
+	}
+	return true, "The primary presents the current certificate, but " + strings.Join(msgs, "; ")
 }
 
 // restartForTLS restarts the PostgreSQL pod by setting the tls-restart pod
@@ -434,8 +561,10 @@ func (r *ClusterReconciler) restartForTLS(ctx context.Context, cluster *postgres
 }
 
 // reloadServerConfig runs pg_reload_conf() as the operator over a verify-full
-// connection using caPEM.
-func (r *ClusterReconciler) reloadServerConfig(ctx context.Context, cluster *postgresv1alpha1.Cluster, caPEM []byte) error {
+// connection using caPEM: on the primary, or, when dialAddress is set, on the
+// instance at that pod address (the certificate is still verified for the
+// Service name).
+func (r *ClusterReconciler) reloadServerConfig(ctx context.Context, cluster *postgresv1alpha1.Cluster, caPEM []byte, dialAddress string) error {
 	secret := &corev1.Secret{}
 	if err := r.Get(ctx, types.NamespacedName{Name: cluster.Name + "-credentials", Namespace: cluster.Namespace}, secret); err != nil {
 		return fmt.Errorf("failed to get credentials secret: %w", err)
@@ -448,6 +577,7 @@ func (r *ClusterReconciler) reloadServerConfig(ctx context.Context, cluster *pos
 		Database:    defaultDatabaseName,
 		SSLMode:     postgres.SSLModeVerifyFull,
 		RootCertPEM: caPEM,
+		DialAddress: dialAddress,
 	}
 	if r.ReloadServerConfig != nil {
 		return r.ReloadServerConfig(ctx, cfg)
@@ -461,18 +591,19 @@ func (r *ClusterReconciler) reloadServerConfig(ctx context.Context, cluster *pos
 }
 
 // reconcileHBAConfigMap creates or updates the operator-managed pg_hba
-// ConfigMap while spec.tls.requireTLS is in effect.
-func (r *ClusterReconciler) reconcileHBAConfigMap(ctx context.Context, cluster *postgresv1alpha1.Cluster) error {
-	if cluster.Spec.TLS == nil || !cluster.Spec.TLS.IsRequireTLS() {
+// ConfigMap while spec.tls.requireTLS or replication is in effect.
+func (r *ClusterReconciler) reconcileHBAConfigMap(ctx context.Context, cluster *postgresv1alpha1.Cluster, replication bool) error {
+	if !tlsRequired(cluster) && !replication {
 		return nil
 	}
+	hba := renderPgHBA(cluster, replication)
 	cm := &corev1.ConfigMap{}
 	err := r.Get(ctx, types.NamespacedName{Name: hbaConfigMapName(cluster), Namespace: cluster.Namespace}, cm)
 	if err == nil {
-		if cm.Data[hbaFileName] == managedPgHBA {
+		if cm.Data[hbaFileName] == hba {
 			return nil
 		}
-		cm.Data = map[string]string{hbaFileName: managedPgHBA}
+		cm.Data = map[string]string{hbaFileName: hba}
 		return r.Update(ctx, cm)
 	}
 	if !apierrors.IsNotFound(err) {
@@ -488,7 +619,7 @@ func (r *ClusterReconciler) reconcileHBAConfigMap(ctx context.Context, cluster *
 				LabelAppManagedBy: LabelValuePgop,
 			},
 		},
-		Data: map[string]string{hbaFileName: managedPgHBA},
+		Data: map[string]string{hbaFileName: hba},
 	}
 	if err := controllerutil.SetControllerReference(cluster, cm, r.Scheme); err != nil {
 		return err
@@ -496,12 +627,12 @@ func (r *ClusterReconciler) reconcileHBAConfigMap(ctx context.Context, cluster *
 	return r.Create(ctx, cm)
 }
 
-// cleanupHBAConfigMap deletes the operator-managed pg_hba ConfigMap once TLS
-// or requireTLS is turned off. Without hba_file the server falls back to the
-// pg_hba.conf in its data directory (the image default), which was never
-// modified.
-func (r *ClusterReconciler) cleanupHBAConfigMap(ctx context.Context, cluster *postgresv1alpha1.Cluster) error {
-	if cluster.Spec.TLS != nil && cluster.Spec.TLS.IsRequireTLS() {
+// cleanupHBAConfigMap deletes the operator-managed pg_hba ConfigMap once
+// neither requireTLS nor replication needs it. Without hba_file the server
+// falls back to the pg_hba.conf in its data directory (the image default),
+// which was never modified.
+func (r *ClusterReconciler) cleanupHBAConfigMap(ctx context.Context, cluster *postgresv1alpha1.Cluster, replication bool) error {
+	if tlsRequired(cluster) || replication {
 		return nil
 	}
 	cm := &corev1.ConfigMap{}
@@ -524,23 +655,43 @@ func (r *ClusterReconciler) reconcileSecret(ctx context.Context, cluster *postgr
 	err := r.Get(ctx, types.NamespacedName{Name: secretName, Namespace: cluster.Namespace}, secret)
 	if err == nil {
 		// Connection info is converged at the end of the reconcile, once the
-		// TLS state is known (convergeSecretConnectionInfo).
+		// TLS state is known (convergeSecretConnectionInfo). Secrets created
+		// before replication existed get the replication password here.
+		if len(secret.Data[SecretKeyReplicationPassword]) > 0 {
+			return secret, nil
+		}
+		replicationPassword, err := generatePassword(32)
+		if err != nil {
+			return nil, fmt.Errorf("failed to generate password: %w", err)
+		}
+		if secret.Data == nil {
+			secret.Data = map[string][]byte{}
+		}
+		secret.Data[SecretKeyReplicationPassword] = []byte(replicationPassword)
+		if err := r.Update(ctx, secret); err != nil {
+			return nil, err
+		}
 		return secret, nil
 	}
 	if !apierrors.IsNotFound(err) {
 		return nil, err
 	}
 
-	// Generate random password
+	// Generate random passwords
 	password, err := generatePassword(32)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate password: %w", err)
+	}
+	replicationPassword, err := generatePassword(32)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate password: %w", err)
 	}
 
 	data := map[string][]byte{
-		SecretKeyUsername: []byte(DefaultOperatorUsername),
-		SecretKeyPassword: []byte(password),
-		SecretKeyDatabase: []byte(defaultDatabaseName),
+		SecretKeyUsername:            []byte(DefaultOperatorUsername),
+		SecretKeyPassword:            []byte(password),
+		SecretKeyDatabase:            []byte(defaultDatabaseName),
+		SecretKeyReplicationPassword: []byte(replicationPassword),
 	}
 	applyConnectionInfo(data, clusterHost(cluster), clusterPort(cluster), defaultDatabaseName, clientTLSFor(cluster, nil))
 
@@ -588,20 +739,19 @@ func (r *ClusterReconciler) convergeSecretConnectionInfo(ctx context.Context, cl
 	return r.Update(ctx, secret)
 }
 
+// reconcileService creates or converges the read-write Service "<cluster>",
+// which routes to the primary pod only (see primaryServiceSelector).
 func (r *ClusterReconciler) reconcileService(ctx context.Context, cluster *postgresv1alpha1.Cluster) error {
 	serviceName := cluster.Name
 	service := &corev1.Service{}
 	err := r.Get(ctx, types.NamespacedName{Name: serviceName, Namespace: cluster.Namespace}, service)
 	if err == nil {
-		return r.convergeService(ctx, cluster, service)
+		// Services created before replication existed selected every pod;
+		// the selector is narrowed to the primary in place.
+		return r.convergeServiceSpec(ctx, service, primaryServiceSelector(cluster), servicePorts(cluster))
 	}
 	if !apierrors.IsNotFound(err) {
 		return err
-	}
-
-	port := cluster.Spec.Port
-	if port == 0 {
-		port = 5432
 	}
 
 	service = &corev1.Service{
@@ -615,19 +765,9 @@ func (r *ClusterReconciler) reconcileService(ctx context.Context, cluster *postg
 			},
 		},
 		Spec: corev1.ServiceSpec{
-			Selector: map[string]string{
-				LabelAppName:     AppNamePostgresql,
-				LabelAppInstance: cluster.Name,
-			},
-			Ports: []corev1.ServicePort{
-				{
-					Name:       AppNamePostgresql,
-					Port:       port,
-					TargetPort: intstr.FromInt32(port),
-					Protocol:   corev1.ProtocolTCP,
-				},
-			},
-			Type: corev1.ServiceTypeClusterIP,
+			Selector: primaryServiceSelector(cluster),
+			Ports:    servicePorts(cluster),
+			Type:     corev1.ServiceTypeClusterIP,
 		},
 	}
 
@@ -638,33 +778,7 @@ func (r *ClusterReconciler) reconcileService(ctx context.Context, cluster *postg
 	return r.Create(ctx, service)
 }
 
-// convergeService updates an existing Service's port when the Cluster's port
-// changes. Selector and Type are fixed for the lifetime of the cluster, so
-// only Ports is compared.
-func (r *ClusterReconciler) convergeService(ctx context.Context, cluster *postgresv1alpha1.Cluster, service *corev1.Service) error {
-	port := cluster.Spec.Port
-	if port == 0 {
-		port = 5432
-	}
-
-	desiredPorts := []corev1.ServicePort{
-		{
-			Name:       AppNamePostgresql,
-			Port:       port,
-			TargetPort: intstr.FromInt32(port),
-			Protocol:   corev1.ProtocolTCP,
-		},
-	}
-
-	if apiequality.Semantic.DeepEqual(service.Spec.Ports, desiredPorts) {
-		return nil
-	}
-
-	service.Spec.Ports = desiredPorts
-	return r.Update(ctx, service)
-}
-
-func (r *ClusterReconciler) reconcileStatefulSet(ctx context.Context, cluster *postgresv1alpha1.Cluster, secret *corev1.Secret) error {
+func (r *ClusterReconciler) reconcileStatefulSet(ctx context.Context, cluster *postgresv1alpha1.Cluster, secret *corev1.Secret, replication bool) error {
 	stsName := cluster.Name
 
 	// Set defaults
@@ -680,14 +794,7 @@ func (r *ClusterReconciler) reconcileStatefulSet(ctx context.Context, cluster *p
 	if err != nil {
 		return err
 	}
-	replicas := cluster.Spec.Replicas
-	if replicas == 0 {
-		replicas = 1
-	}
-	port := cluster.Spec.Port
-	if port == 0 {
-		port = 5432
-	}
+	port := clusterPort(cluster)
 
 	labels := map[string]string{
 		LabelAppName:      AppNamePostgresql,
@@ -707,14 +814,24 @@ func (r *ClusterReconciler) reconcileStatefulSet(ctx context.Context, cluster *p
 	container.VolumeMounts = append(container.VolumeMounts, configMounts...)
 	container.Args = postgresServerArgs(cluster)
 
+	// Streaming replication: bootstrap init container, recovery-aware
+	// postStart hook, primary_conninfo and the managed pg_hba. Not added to
+	// Clusters that never had more than one instance.
+	var initContainers []corev1.Container
+	if replication {
+		initContainers, volumes = applyReplicationTemplate(cluster, secret.Name, layout, &container, volumes)
+	}
+
 	sts := &appsv1.StatefulSet{}
 	err = r.Get(ctx, types.NamespacedName{Name: stsName, Namespace: cluster.Namespace}, sts)
 	if err == nil {
-		return r.convergeStatefulSet(ctx, sts, replicas, labels, container, volumes, desiredPVCRetentionPolicy(cluster))
+		return r.convergeStatefulSet(ctx, sts, statefulSetReplicas(cluster, sts), labels, container, initContainers,
+			volumes, desiredPVCRetentionPolicy(cluster))
 	}
 	if !apierrors.IsNotFound(err) {
 		return err
 	}
+	replicas := desiredReplicas(cluster)
 
 	if err := r.detectExistingVolume(ctx, cluster); err != nil {
 		return err
@@ -722,7 +839,7 @@ func (r *ClusterReconciler) reconcileStatefulSet(ctx context.Context, cluster *p
 
 	storageSize := cluster.Spec.Storage.Size
 	if storageSize == "" {
-		storageSize = "1Gi"
+		storageSize = defaultStorageSize
 	}
 
 	sts = &appsv1.StatefulSet{
@@ -747,6 +864,7 @@ func (r *ClusterReconciler) reconcileStatefulSet(ctx context.Context, cluster *p
 				},
 				Spec: corev1.PodSpec{
 					SecurityContext: postgresPodSecurityContext(),
+					InitContainers:  initContainers,
 					Containers:      []corev1.Container{container},
 					Volumes:         volumes,
 				},
@@ -782,7 +900,9 @@ func (r *ClusterReconciler) reconcileStatefulSet(ctx context.Context, cluster *p
 // desiredPVCRetentionPolicy maps the Cluster's storage.retainPolicy onto the
 // StatefulSet persistentVolumeClaimRetentionPolicy. whenDeleted follows the
 // Cluster setting (Retain by default); whenScaled is always Retain so that a
-// scale-down can never destroy data. With whenDeleted=Delete the StatefulSet
+// scale-down (including a manual "kubectl scale" of the StatefulSet to 0) can
+// never destroy the primary's data. The volumes of scaled-away standbys are
+// removed by the operator instead (cleanupStandbyVolumes). With whenDeleted=Delete the StatefulSet
 // controller adds an ownerReference from the StatefulSet to each PVC, so the
 // existing Cluster -> StatefulSet ownership cascade removes the PVC through
 // normal garbage collection.
@@ -798,7 +918,7 @@ func desiredPVCRetentionPolicy(cluster *postgresv1alpha1.Cluster) *appsv1.Statef
 }
 
 // dataPVCName returns the name of the PVC the StatefulSet controller creates
-// for the given Cluster's first (and only) replica.
+// for the given Cluster's primary (ordinal 0).
 func dataPVCName(cluster *postgresv1alpha1.Cluster) string {
 	return fmt.Sprintf("%s-%s-0", dataVolumeName, cluster.Name)
 }
@@ -948,8 +1068,28 @@ func buildPostgresContainer(secret *corev1.Secret, image string, port int32, res
 // It only issues an Update when something actually differs, so reconciling
 // an already-converged cluster is a no-op and does not trigger spurious
 // pod rollouts.
-func (r *ClusterReconciler) convergeStatefulSet(ctx context.Context, sts *appsv1.StatefulSet, replicas int32, labels map[string]string, desired corev1.Container, volumes []corev1.Volume, retention *appsv1.StatefulSetPersistentVolumeClaimRetentionPolicy) error {
+func (r *ClusterReconciler) convergeStatefulSet(ctx context.Context, sts *appsv1.StatefulSet, replicas int32, labels map[string]string,
+	desired corev1.Container, initContainers []corev1.Container, volumes []corev1.Volume,
+	retention *appsv1.StatefulSetPersistentVolumeClaimRetentionPolicy) error {
 	changed := false
+
+	// Init containers are operator-owned (only the replication bootstrap).
+	// They are compared like the main container, so server-side defaults do
+	// not cause a perpetual diff.
+	if cur := sts.Spec.Template.Spec.InitContainers; len(cur) != len(initContainers) ||
+		slices.ContainsFunc(cur, func(c corev1.Container) bool {
+			return !slices.ContainsFunc(initContainers, func(d corev1.Container) bool { return d.Name == c.Name })
+		}) {
+		sts.Spec.Template.Spec.InitContainers = initContainers
+		changed = true
+	} else {
+		for i := range cur {
+			idx := slices.IndexFunc(initContainers, func(d corev1.Container) bool { return d.Name == cur[i].Name })
+			if convergeContainer(&cur[i], initContainers[idx]) {
+				changed = true
+			}
+		}
+	}
 
 	// Pod volumes are entirely operator-owned (the data volume comes from
 	// volumeClaimTemplates), so they are replaced wholesale. Semantic.DeepEqual
@@ -1008,6 +1148,10 @@ func convergeContainer(existing *corev1.Container, desired corev1.Container) boo
 
 	if existing.Image != desired.Image {
 		existing.Image = desired.Image
+		changed = true
+	}
+	if !apiequality.Semantic.DeepEqual(existing.Command, desired.Command) {
+		existing.Command = desired.Command
 		changed = true
 	}
 	if !apiequality.Semantic.DeepEqual(existing.Args, desired.Args) {
@@ -1088,12 +1232,11 @@ func (r *ClusterReconciler) isStatefulSetReady(ctx context.Context, cluster *pos
 		return false, err
 	}
 
-	replicas := cluster.Spec.Replicas
-	if replicas == 0 {
-		replicas = 1
-	}
+	cluster.Status.ReadyInstances = sts.Status.ReadyReplicas
+	cluster.Status.CurrentPrimary = primaryPodName(cluster)
 
-	return sts.Status.ReadyReplicas == replicas, nil
+	replicas := desiredReplicas(cluster)
+	return sts.Status.ReadyReplicas == replicas && (sts.Spec.Replicas == nil || *sts.Spec.Replicas == replicas), nil
 }
 
 func (r *ClusterReconciler) updateStatus(ctx context.Context, cluster *postgresv1alpha1.Cluster, ready bool, reconcileErr error) (ctrl.Result, error) {
@@ -1106,6 +1249,10 @@ func (r *ClusterReconciler) updateStatus(ctx context.Context, cluster *postgresv
 		port = 5432
 	}
 	cluster.Status.Endpoint = fmt.Sprintf("%s.%s.svc.cluster.local:%d", cluster.Name, cluster.Namespace, port)
+	cluster.Status.ReadOnlyEndpoint = ""
+	if desiredReplicas(cluster) > 1 {
+		cluster.Status.ReadOnlyEndpoint = net.JoinHostPort(readOnlyHost(cluster), strconv.Itoa(int(port)))
+	}
 
 	// Set condition
 	condition := metav1.Condition{
@@ -1158,7 +1305,11 @@ func (r *ClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&corev1.Service{}).
 		Owns(&corev1.Secret{}).
 		Owns(&corev1.ConfigMap{}).
-		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.clustersForTLSSecret))
+		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.clustersForTLSSecret)).
+		// Pods belong to the StatefulSet, not the Cluster: map them by label
+		// so new pods get their role label and readiness changes re-check
+		// replication.
+		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(clustersForPod))
 	// Watch cert-manager Certificates only when cert-manager is installed: a
 	// watch on a missing API would keep the controller from starting. Without
 	// it, issuerRef Clusters still converge through the Secret watch and

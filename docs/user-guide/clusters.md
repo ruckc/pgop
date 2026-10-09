@@ -1,15 +1,20 @@
 # Clusters
 
-A Cluster resource represents a PostgreSQL instance managed by the operator.
+A Cluster resource represents a PostgreSQL primary, optionally with streaming
+read replicas, managed by the operator.
 
 ## Overview
 
 The Cluster controller:
 
 1. Creates a Kubernetes Secret with auto-generated credentials
-2. Deploys a StatefulSet running PostgreSQL
-3. Creates a Service for client connections
+2. Deploys a StatefulSet running PostgreSQL (pod `<cluster>-0` is the primary)
+3. Creates the Service `<cluster>` for read-write connections, which only ever
+   routes to the primary, and, with `replicas` > 1, the Service
+   `<cluster>-ro` for read-only connections to the standbys
 4. Manages persistent storage for data
+
+See [Replication](replication.md) for read replicas.
 
 ## Example
 
@@ -40,7 +45,7 @@ spec:
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `image` | string | `postgres:18` | PostgreSQL container image |
-| `replicas` | int | `1` | Number of instances (currently only 1 supported) |
+| `replicas` | int | `1` | Number of instances, 1-10: one primary plus asynchronous streaming standbys. See [Replication](replication.md) |
 | `port` | int | `5432` | PostgreSQL listen port |
 | `storage.size` | string | `1Gi` | PVC size (e.g., "10Gi") |
 | `storage.storageClassName` | string | - | Storage class name |
@@ -60,12 +65,15 @@ spec:
 | Field | Description |
 |-------|-------------|
 | `ready` | Whether the cluster is ready to accept connections |
-| `endpoint` | Service endpoint (hostname:port) |
+| `endpoint` | Read-write Service endpoint (hostname:port); always the primary |
+| `readOnlyEndpoint` | Read-only Service endpoint `<cluster>-ro` (hostname:port); only with `replicas` > 1 |
+| `readyInstances` | Number of ready PostgreSQL pods |
+| `currentPrimary` | Pod running the primary (`<cluster>-0`) |
 | `secretName` | Name of the credentials secret |
 | `tlsSecretHash` | Hash of the certificate the server was last confirmed to present (TLS only) |
 | `parametersHash` | Hash of the generated configuration file the server was last asked to reload (`parameters` only) |
 | `pendingRestart` | Parameters the server reports as needing a restart (`pg_settings.pending_restart`) |
-| `conditions` | Detailed status conditions (`Available`, `ExistingVolume`, `TLSReady`, `ParametersApplied`) |
+| `conditions` | Detailed status conditions (`Available`, `ExistingVolume`, `TLSReady`, `ParametersApplied`, `ReplicationHealthy`) |
 
 ## Parameters
 
@@ -105,7 +113,10 @@ case-insensitively like PostgreSQL does.
   `max_connections` or `shared_preload_libraries`), the parameters are listed
   in `status.pendingRestart` and the operator restarts the pod once, through
   the pod template annotation `pgop.ruck.io/parameters-restart`. With a single
-  replica this means a short outage.
+  instance this means a short outage; with standbys the StatefulSet restarts
+  the standbys first and the primary last (still a short read-write outage).
+- All instances (primary and standbys) mount the same generated file; the
+  operator reloads every ready instance.
 - The `ParametersApplied` condition reports progress:
 
   | Reason | Meaning |
@@ -138,6 +149,11 @@ updated:
 | `include`, `include_dir`, `include_if_exists` | Would read arbitrary files |
 | `ssl`, `ssl_cert_file`, `ssl_key_file`, `ssl_min_protocol_version` | Controlled by [`spec.tls`](#tls) |
 | `archive_mode`, `archive_command`, `archive_library`, `restore_command` | Reserved for operator-managed WAL archiving (physical backups) |
+| `wal_level`, `max_wal_senders`, `max_replication_slots`, `hot_standby` | Streaming [replication](replication.md) depends on them; they keep the PostgreSQL defaults (`replica`, `10`, `10`, `on`) |
+| `primary_conninfo`, `primary_slot_name` | Set by the operator for standbys |
+
+`max_slot_wal_keep_size` can be set; with standbys it otherwise defaults to a
+quarter of `storage.size` (see [Replication](replication.md#replication-slots)).
 
 Other TLS settings such as `ssl_ciphers` or `ssl_max_protocol_version` can be
 set. Values containing line breaks are reported as `InvalidParameter`.
@@ -173,9 +189,10 @@ roll forward.)
 
 ## Storage Retention
 
-Each Cluster stores its data in a PersistentVolumeClaim named
-`data-<cluster-name>-0`, created by the StatefulSet. What happens to that PVC
-when the Cluster is deleted is controlled by `spec.storage.retainPolicy`:
+Each instance stores its data in a PersistentVolumeClaim named
+`data-<cluster-name>-<n>` (`-0` for the primary), created by the StatefulSet.
+What happens to these PVCs when the Cluster is deleted is controlled by
+`spec.storage.retainPolicy`:
 
 | Value | Behaviour on Cluster deletion |
 |-------|-------------------------------|
@@ -201,7 +218,11 @@ Notes:
 
 - `retainPolicy` maps onto the StatefulSet
   `persistentVolumeClaimRetentionPolicy.whenDeleted`. `whenScaled` is always
-  `Retain`, so scaling never destroys data.
+  `Retain`, so scaling the StatefulSet never destroys the primary's data (even
+  a manual `kubectl scale --replicas=0`).
+- Lowering `spec.replicas` removes standbys: once a removed standby's pod is
+  gone, the operator deletes its PVC (never `data-<cluster>-0`) and its
+  replication slot, so a standby added later is cloned afresh.
 - **Requires Kubernetes 1.27+** (the field is beta and enabled by default since
   1.27, GA since 1.32). On older clusters `Delete` is silently ignored and PVCs
   are always retained.
@@ -242,7 +263,13 @@ data:
   sslmode: disable                  # verify-full while TLS is active (see TLS)
   uri: postgresql://pgop_operator:<password>@<host>:5432/postgres?sslmode=disable
   ca.crt: <PEM>                     # only while TLS is active
+  replication-password: <generated> # password of pgop_replicator (standbys)
 ```
+
+`replication-password` is the password standbys use to stream from the
+primary as `pgop_replicator`. It is generated for every Cluster (also added to
+Secrets created by older operator versions) and only used once the Cluster
+has more than one instance.
 
 ## Using Credentials in Applications
 
@@ -293,8 +320,12 @@ See [Databases → Extensions](databases.md#common-extensions).
 ## Connecting: Endpoint & TLS
 
 - Apps connect through the Service `<cluster-name>.<namespace>.svc.cluster.local`
-  on `spec.port` (default `5432`). The same value is published on
-  `status.endpoint`.
+  on `spec.port` (default `5432`). It always routes to the primary. The same
+  value is published on `status.endpoint`.
+- With `replicas` > 1, read-only queries can use
+  `<cluster-name>-ro.<namespace>.svc.cluster.local`
+  (`status.readOnlyEndpoint`), which load-balances over the standbys. See
+  [Replication](replication.md).
 - The `<cluster-name>-credentials` Secret above holds the **operator** superuser
   (`pgop_operator`). Application workloads should connect using a per-app
   [Role](roles.md)/[Database](databases.md) credentials Secret rather than the
@@ -346,7 +377,9 @@ With `tls: {}` the operator needs nothing else (no cert-manager):
 - It issues an ECDSA P-256 **server certificate** valid for 90 days for
   `<cluster>.<namespace>.svc.cluster.local`, `<cluster>.<namespace>.svc`,
   `<cluster>.<namespace>` and `<cluster>`, stored in `<cluster>-server-cert`
-  (`tls.crt`, `tls.key`, `ca.crt`).
+  (`tls.crt`, `tls.key`, `ca.crt`). With `replicas` > 1 the same four names
+  of the read-only Service `<cluster>-ro` are added (the certificate is
+  re-issued, without a restart, when the Cluster is scaled across 1).
 - Both Secrets are owned by the Cluster and deleted with it (or when the
   Cluster stops using the self-managed CA). A pre-existing Secret of the same
   name that the Cluster does not own is never overwritten; `TLSReady` reports
@@ -380,7 +413,7 @@ spec:
 ```
 
 The operator creates a cert-manager `Certificate` named `<cluster>-server`,
-owned by the Cluster, for the same four DNS names as the self-managed
+owned by the Cluster, for the same DNS names as the self-managed
 certificate, with `secretName: <cluster>-server-tls`. cert-manager issues and
 renews it; the Secret then goes through the same validation, mounting and
 reload as a Secret you provide. The operator adds an owner reference to that
@@ -414,9 +447,11 @@ Secrets of deleted Certificates by default).
 | `ca.crt` | CA that issued `tls.crt` (PEM). Required: the operator and clients verify against it |
 
 The certificate must be valid for `<cluster>.<namespace>.svc.cluster.local`
-(the operator connects with `sslmode=verify-full` to that name) and allow
-server authentication. Add any other names your clients use, such as
-`<cluster>.<namespace>.svc` and `<cluster>`.
+(the operator and the standbys connect with `sslmode=verify-full` to that
+name) and allow server authentication. Add any other names your clients use,
+such as `<cluster>.<namespace>.svc` and `<cluster>`, and, for clients of the
+standbys, `<cluster>-ro.<namespace>.svc.cluster.local`. Every instance serves
+the same certificate.
 
 A cert-manager `Certificate` produces exactly this layout (or let the
 operator create it with [`issuerRef`](#cert-manager-issuerref)). Example with a
@@ -469,9 +504,12 @@ Issuers that do not populate `ca.crt` (for example ACME) are not supported.
     Unix-socket connections (probes, the password-sync hook) are unaffected.
     `$PGDATA/pg_hba.conf` is never modified. With `requireTLS: false` the
     image's own `pg_hba.conf` is used and plaintext connections keep working.
-4. **Confirms TLS is live:** once the pod is ready, the operator performs a
-   TLS handshake against the Service and checks that the server presents the
-   certificate from the Secret. Then `TLSReady` becomes `True` (reason
+    Clusters with standbys always use a managed `pg_hba.conf`, which also
+    allows replication connections of `pgop_replicator` (over TLS when
+    `requireTLS` is set); see [Replication](replication.md#pg_hbaconf).
+4. **Confirms TLS is live:** once the pods are ready, the operator performs a
+   TLS handshake against the Service (and against each standby pod) and checks
+   that the server presents the certificate from the Secret. Then `TLSReady` becomes `True` (reason
    `TLSActive`) and `status.tlsSecretHash` is set.
 5. **Connects securely:** while `TLSReady` is `True` the Role and Database
    controllers connect with `sslmode=verify-full`, verifying against `ca.crt`.
@@ -485,7 +523,8 @@ Issuers that do not populate `ca.crt` (for example ACME) are not supported.
    passwords are not changed.
 
 Enabling or disabling TLS (or changing `requireTLS` / `minProtocolVersion`)
-changes the pod template, so the single PostgreSQL pod **restarts** once.
+changes the pod template, so the PostgreSQL pods **restart** once (standbys
+first, the primary last).
 
 ### Client configuration
 
@@ -518,7 +557,9 @@ Renewing a certificate does not restart the pod. When the Secret changes
 (cert-manager and the self-managed CA renew certificates automatically), the
 operator re-validates it and, if the running server still presents the old
 certificate, runs `SELECT pg_reload_conf()`; PostgreSQL re-reads the
-certificate files on reload. Kubelet propagates Secret updates into the pod
+certificate files on reload. Standbys are checked and reloaded the same way,
+each through its pod address (the certificate is still verified for the
+Service name). Kubelet propagates Secret updates into the pod
 with a delay of up to about a minute, so `TLSReady` is briefly `False` (reason
 `CertificateReloading`) and the operator retries until the new certificate is
 served.
@@ -560,7 +601,8 @@ the Cluster credentials Secret when the Job pod starts:
 - the Secret's `ca.crt` (the server CA) is mounted at `/etc/pgop/pg-ca/ca.crt`
   and `PGSSLROOTCERT` points to it;
 - `PGHOST` is the Service name `<cluster>.<namespace>.svc.cluster.local`, which
-  is the name `verify-full` checks against the certificate.
+  is the name `verify-full` checks against the certificate, and which only
+  routes to the primary.
 
 None of this is written into the CronJob, so turning TLS on or off, renewing
 the certificate or rotating the CA needs no CronJob change: the next Job

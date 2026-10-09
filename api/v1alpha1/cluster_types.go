@@ -43,11 +43,22 @@ type ClusterSpec struct {
 	// +kubebuilder:validation:Minimum=1
 	PostgresMajorVersion *int32 `json:"postgresMajorVersion,omitempty"`
 
-	// replicas is the number of PostgreSQL instances to run.
-	// Currently only single instance is supported.
+	// replicas is the total number of PostgreSQL instances to run: one
+	// primary plus replicas-1 asynchronous streaming hot standbys.
+	//
+	// Pod <cluster>-0 is the primary. The other pods clone it with
+	// pg_basebackup and stream from it over a dedicated replication slot. The
+	// Service "<cluster>" always routes to the primary; with more than one
+	// instance the Service "<cluster>-ro" routes to the standbys (read-only).
+	// There is no automated failover: when the primary is down, writes are
+	// unavailable until it is back.
+	//
+	// The first scale-up from 1 restarts the primary once to enable
+	// replication; later scaling does not restart it. Scaling down removes the
+	// highest pods together with their data volumes and replication slots.
 	// +kubebuilder:default=1
 	// +kubebuilder:validation:Minimum=1
-	// +kubebuilder:validation:Maximum=1
+	// +kubebuilder:validation:Maximum=10
 	Replicas int32 `json:"replicas,omitempty"`
 
 	// storage defines the persistent storage configuration
@@ -87,7 +98,8 @@ type ClusterSpec struct {
 	// breaks are reported as InvalidParameter. Keys must be PostgreSQL
 	// parameter names. Parameters the operator manages itself
 	// (listen_addresses, port, file locations, include directives, the
-	// settings controlled by spec.tls, and WAL archiving) are rejected; see
+	// settings controlled by spec.tls, WAL archiving, and the settings
+	// streaming replication depends on) are rejected; see
 	// ReservedParameters. Note that ALTER SYSTEM (postgresql.auto.conf)
 	// still overrides these values; the condition reports it when it does.
 	//
@@ -97,15 +109,19 @@ type ClusterSpec struct {
 	// +optional
 	// +kubebuilder:validation:MaxProperties=256
 	// +kubebuilder:validation:XValidation:rule="self.all(k, k.matches('^[a-zA-Z_][a-zA-Z0-9_.]*$'))",message="parameter names must match ^[a-zA-Z_][a-zA-Z0-9_.]*$"
-	// +kubebuilder:validation:XValidation:rule="!self.exists(k, k.lowerAscii() in ['archive_command', 'archive_library', 'archive_mode', 'config_file', 'data_directory', 'external_pid_file', 'hba_file', 'ident_file', 'include', 'include_dir', 'include_if_exists', 'listen_addresses', 'port', 'restore_command', 'ssl', 'ssl_cert_file', 'ssl_key_file', 'ssl_min_protocol_version', 'unix_socket_directories'])",message="parameters must not set operator-managed parameters (archive_command, archive_library, archive_mode, config_file, data_directory, external_pid_file, hba_file, ident_file, include, include_dir, include_if_exists, listen_addresses, port, restore_command, ssl, ssl_cert_file, ssl_key_file, ssl_min_protocol_version, unix_socket_directories)"
+	// +kubebuilder:validation:XValidation:rule="!self.exists(k, k.lowerAscii() in ['archive_command', 'archive_library', 'archive_mode', 'config_file', 'data_directory', 'external_pid_file', 'hba_file', 'hot_standby', 'ident_file', 'include', 'include_dir', 'include_if_exists', 'listen_addresses', 'max_replication_slots', 'max_wal_senders', 'port', 'primary_conninfo', 'primary_slot_name', 'restore_command', 'ssl', 'ssl_cert_file', 'ssl_key_file', 'ssl_min_protocol_version', 'unix_socket_directories', 'wal_level'])",message="parameters must not set operator-managed parameters (archive_command, archive_library, archive_mode, config_file, data_directory, external_pid_file, hba_file, hot_standby, ident_file, include, include_dir, include_if_exists, listen_addresses, max_replication_slots, max_wal_senders, port, primary_conninfo, primary_slot_name, restore_command, ssl, ssl_cert_file, ssl_key_file, ssl_min_protocol_version, unix_socket_directories, wal_level)"
 	Parameters map[string]string `json:"parameters,omitempty"`
 }
 
 // ReservedParameters are the PostgreSQL parameters spec.parameters must not
 // set because the operator manages them: the listen address, port and file
 // locations; include directives (which would read arbitrary files); the TLS
-// settings controlled by spec.tls; and WAL archiving / restore_command, which
-// are reserved for operator-managed physical backups.
+// settings controlled by spec.tls; WAL archiving / restore_command, which
+// are reserved for operator-managed physical backups; and the settings
+// streaming replication (spec.replicas > 1) depends on: wal_level,
+// max_wal_senders and max_replication_slots keep their defaults (replica,
+// 10, 10), hot_standby stays on so standbys serve reads, and
+// primary_conninfo / primary_slot_name are set by the operator.
 //
 // This is the single list to change when relaxing a reservation. The CEL rule
 // on ClusterSpec.Parameters must list exactly these names (lower case); a
@@ -118,18 +134,24 @@ var ReservedParameters = []string{
 	"data_directory",
 	"external_pid_file",
 	"hba_file",
+	"hot_standby",
 	"ident_file",
 	"include",
 	"include_dir",
 	"include_if_exists",
 	"listen_addresses",
+	"max_replication_slots",
+	"max_wal_senders",
 	"port",
+	"primary_conninfo",
+	"primary_slot_name",
 	"restore_command",
 	"ssl",
 	"ssl_cert_file",
 	"ssl_key_file",
 	"ssl_min_protocol_version",
 	"unix_socket_directories",
+	"wal_level",
 }
 
 // TLSProtocolVersion is a minimum TLS protocol version accepted by the server.
@@ -240,6 +262,22 @@ type ClusterStatus struct {
 	// secretName is the name of the Secret containing operator credentials
 	SecretName string `json:"secretName,omitempty"`
 
+	// readyInstances is the number of PostgreSQL pods (primary and standbys)
+	// that are ready.
+	// +optional
+	ReadyInstances int32 `json:"readyInstances,omitempty"`
+
+	// currentPrimary is the name of the pod running the primary (read-write)
+	// instance. The Service "<cluster>" routes to this pod only.
+	// +optional
+	CurrentPrimary string `json:"currentPrimary,omitempty"`
+
+	// readOnlyEndpoint is the internal endpoint of the "<cluster>-ro"
+	// Service, which routes to the hot standbys. Only set while
+	// spec.replicas is greater than 1.
+	// +optional
+	ReadOnlyEndpoint string `json:"readOnlyEndpoint,omitempty"`
+
 	// tlsSecretHash is a hash of the certificate material (tls.crt and ca.crt)
 	// that the running server was last confirmed to present. It changes when
 	// the certificate is rotated and is empty while TLS is disabled or not yet
@@ -271,6 +309,9 @@ type ClusterStatus struct {
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:printcolumn:name="Ready",type="boolean",JSONPath=".status.ready"
+// +kubebuilder:printcolumn:name="Instances",type="integer",JSONPath=".spec.replicas"
+// +kubebuilder:printcolumn:name="Ready Instances",type="integer",JSONPath=".status.readyInstances"
+// +kubebuilder:printcolumn:name="Primary",type="string",JSONPath=".status.currentPrimary",priority=1
 // +kubebuilder:printcolumn:name="Endpoint",type="string",JSONPath=".status.endpoint"
 // +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
 

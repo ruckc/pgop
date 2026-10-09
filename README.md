@@ -18,7 +18,7 @@ Existing PostgreSQL operators (CloudNativePG, Zalando, CrunchyData PGO) are powe
 
 ### Cluster
 
-Provisions a PostgreSQL StatefulSet, headless Service, and a `<name>-credentials` superuser Secret. The operator uses this credential internally; it is not distributed to application workloads.
+Provisions a PostgreSQL StatefulSet, a read-write Service `<name>` (always the primary), a read-only Service `<name>-ro` when there are standbys, and a `<name>-credentials` superuser Secret. The operator uses this credential internally; it is not distributed to application workloads.
 
 ```yaml
 apiVersion: pgop.ruck.io/v1alpha1
@@ -29,7 +29,7 @@ metadata:
 spec:
   image: postgres:18        # any postgres image tag
   # postgresMajorVersion: 18  # only needed if the tag can't be auto-detected
-  replicas: 1
+  replicas: 1               # >1 adds streaming read replicas (max 10)
   port: 5432
   storage:
     size: 5Gi
@@ -80,8 +80,18 @@ connects with `sslmode=verify-full`, and the credentials Secrets gain `sslmode`,
 a ConfigMap-backed configuration file, reloads the server when they change and
 restarts the pod only when a parameter needs it (`status.pendingRestart`,
 condition `ParametersApplied`). Parameters the operator manages (`port`,
-`listen_addresses`, file locations, TLS and WAL-archiving settings) are
-rejected. See [Clusters → Parameters](docs/user-guide/clusters.md#parameters).
+`listen_addresses`, file locations, TLS, WAL-archiving and replication
+settings) are rejected. See [Clusters → Parameters](docs/user-guide/clusters.md#parameters).
+
+#### Read replicas
+
+`replicas: N` runs a primary (`<name>-0`) and `N-1` asynchronous streaming hot
+standbys, cloned with `pg_basebackup` and streaming over a dedicated
+`pgop_replicator` user and one replication slot each. `<name>` always routes to
+the primary; `<name>-ro` routes read-only traffic to the standbys. There is
+**no automated failover** (a manual switchover is planned); use
+[CloudNativePG](https://cloudnative-pg.io/) if you need HA. See
+[Replication](docs/user-guide/replication.md).
 
 #### Data directory layout
 

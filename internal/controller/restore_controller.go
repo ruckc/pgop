@@ -178,7 +178,7 @@ func (r *RestoreReconciler) buildLogicalRestoreJob(
 	if pgPort == 0 {
 		pgPort = 5432
 	}
-	pgHost := fmt.Sprintf("%s.%s.svc.cluster.local", cluster.Name, restore.Namespace)
+	pgHost := clusterHost(cluster)
 
 	downloadScript := fmt.Sprintf(`
 set -e

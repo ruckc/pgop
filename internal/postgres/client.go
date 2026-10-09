@@ -21,8 +21,10 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"net"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/lib/pq"
 )
@@ -30,6 +32,8 @@ import (
 const (
 	defaultSSLMode  = "disable"
 	defaultDatabase = "postgres"
+	// connectTimeout bounds the TCP connect of a DialAddress connection.
+	connectTimeout = 10 * time.Second
 )
 
 // Client provides PostgreSQL database operations
@@ -58,6 +62,32 @@ type ConnectionConfig struct {
 	// certificate. It is required when SSLMode is "verify-full" (there is no
 	// fallback to the system trust store) and ignored otherwise.
 	RootCertPEM []byte
+	// DialAddress, when set, is the host:port the TCP connection is made to
+	// instead of Host:Port. Host is still used for everything else, in
+	// particular to verify the server certificate, so a single pod can be
+	// reached by its IP while verify-full checks the Service DNS name.
+	DialAddress string
+}
+
+// fixedAddressDialer dials one fixed address, whatever address lib/pq asks
+// for.
+type fixedAddressDialer struct {
+	address string
+	d       net.Dialer
+}
+
+func (f fixedAddressDialer) Dial(network, _ string) (net.Conn, error) {
+	return f.d.Dial(network, f.address)
+}
+
+func (f fixedAddressDialer) DialTimeout(network, _ string, timeout time.Duration) (net.Conn, error) {
+	d := f.d
+	d.Timeout = timeout
+	return d.Dial(network, f.address)
+}
+
+func (f fixedAddressDialer) DialContext(ctx context.Context, network, _ string) (net.Conn, error) {
+	return f.d.DialContext(ctx, network, f.address)
 }
 
 // NewClient creates a new PostgreSQL client connection
@@ -67,8 +97,15 @@ func NewClient(cfg ConnectionConfig) (*Client, error) {
 		return nil, err
 	}
 
-	db, err := sql.Open("postgres", connStr)
-	if err != nil {
+	var db *sql.DB
+	if cfg.DialAddress != "" {
+		connector, err := pq.NewConnector(connStr)
+		if err != nil {
+			return nil, fmt.Errorf("failed to open connection: %w", err)
+		}
+		connector.Dialer(fixedAddressDialer{address: cfg.DialAddress, d: net.Dialer{Timeout: connectTimeout}})
+		db = sql.OpenDB(connector)
+	} else if db, err = sql.Open("postgres", connStr); err != nil {
 		return nil, fmt.Errorf("failed to open connection: %w", err)
 	}
 

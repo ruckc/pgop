@@ -76,14 +76,14 @@ type RoleSpec struct {
 	// metadata.name when unset, and lets the PostgreSQL name use characters
 	// (such as underscores) that Kubernetes object names do not allow.
 	// It must be a lowercase unquoted identifier, must not start with "pg_",
-	// must not be a reserved name (postgres, pgop_operator), and cannot be
-	// changed after creation.
+	// must not be a reserved name (postgres, pgop_operator, pgop_replicator),
+	// and cannot be changed after creation.
 	// +optional
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=63
 	// +kubebuilder:validation:Pattern=`^[a-z_][a-z0-9_]*$`
 	// +kubebuilder:validation:XValidation:rule="!self.startsWith('pg_')",message="roleName must not start with 'pg_' (reserved by PostgreSQL)"
-	// +kubebuilder:validation:XValidation:rule="!(self in ['postgres', 'pgop_operator'])",message="roleName must not be a reserved role name (postgres, pgop_operator)"
+	// +kubebuilder:validation:XValidation:rule="!(self in ['postgres', 'pgop_operator', 'pgop_replicator'])",message="roleName must not be a reserved role name (postgres, pgop_operator, pgop_replicator)"
 	RoleName string `json:"roleName,omitempty"`
 
 	// login allows the role to log in (connect to the database)
