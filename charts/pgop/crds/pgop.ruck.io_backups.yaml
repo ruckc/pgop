@@ -227,6 +227,19 @@ spec:
               physical:
                 description: physical configures schedules for physical backups
                 properties:
+                  archivePushQueueMax:
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    description: |-
+                      archivePushQueueMax bounds the WAL that may queue up in pg_wal while
+                      archiving fails (pgBackRest archive-push-queue-max). Beyond it,
+                      pgBackRest drops WAL (and logs it) instead of filling the data
+                      volume, which breaks point-in-time recovery across the gap until the
+                      next full backup. Defaults to a quarter of the Cluster's storage size
+                      (at least 64Mi).
+                    pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                    x-kubernetes-int-or-string: true
                   fullSchedule:
                     default: 0 2 * * 0
                     description: fullSchedule is the cron schedule for full backups
@@ -245,6 +258,17 @@ spec:
                     description: incrementalSchedule is the cron schedule for incremental
                       backups
                     type: string
+                  postgresImageIncludesPgbackrest:
+                    description: |-
+                      postgresImageIncludesPgbackrest declares that the Cluster's
+                      spec.image already contains pgBackRest (same version as the Job
+                      image, at /usr/bin/pgbackrest, postgres user uid 999), so the
+                      operator uses it as it is. Without it, physical backups are only
+                      enabled for the official Debian (trixie) postgres image of a supported
+                      major version, which the operator replaces with pgop's
+                      Postgres+pgBackRest image; any other image makes the Backup Invalid
+                      and the Cluster is left unchanged.
+                    type: boolean
                 type: object
               retention:
                 description: retention configures backup retention policy

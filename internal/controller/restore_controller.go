@@ -47,6 +47,11 @@ const (
 type RestoreReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+
+	// APIReader lists the pods of restore Jobs, which the manager's pod
+	// cache (PostgreSQL pods only) does not hold. Optional; defaults to
+	// Client.
+	APIReader client.Reader
 }
 
 // +kubebuilder:rbac:groups=pgop.ruck.io,resources=restores,verbs=get;list;watch;create;update;patch;delete
@@ -55,6 +60,7 @@ type RestoreReconciler struct {
 // +kubebuilder:rbac:groups=pgop.ruck.io,resources=backupruns,verbs=get;list;watch
 // +kubebuilder:rbac:groups=pgop.ruck.io,resources=backups,verbs=get;list;watch
 // +kubebuilder:rbac:groups=pgop.ruck.io,resources=clusters,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups=pgop.ruck.io,resources=clusters/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch
 // +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups=core,resources=persistentvolumeclaims,verbs=get;list;watch;delete
@@ -323,7 +329,7 @@ func (r *RestoreReconciler) syncFromJob(restore *postgresv1alpha1.Restore, job *
 		meta.SetStatusCondition(&restore.Status.Conditions, metav1.Condition{
 			Type:               ConditionTypeAvailable,
 			Status:             metav1.ConditionFalse,
-			Reason:             "Failed",
+			Reason:             reasonFailed,
 			Message:            msg,
 			ObservedGeneration: restore.Generation,
 			LastTransitionTime: now,

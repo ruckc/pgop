@@ -9,12 +9,11 @@ updates:
       prefix: chore
       include: scope
 
-  # Base images of the pgBackRest images. The postgres base is selected with
-  # the PG_MAJOR build argument and tracks the latest minor release; the
-  # weekly scheduled rebuild (.github/workflows/images.yml) picks up its
-  # security fixes. pgBackRest itself is pinned by PGBACKREST_VERSION and
-  # PGBACKREST_SHA256 (and pgbackrestVersion in internal/controller), which
-  # are bumped by hand.
+  # Base images of the pgBackRest images (debian:trixie-slim and
+  # postgres:<major>-trixie, one stage per major), pinned by digest: each
+  # Dependabot digest bump is a new postgres minor release or Debian update.
+  # pgBackRest itself is pinned by PGBACKREST_VERSION and PGBACKREST_SHA256
+  # (and pgbackrestVersion in internal/controller), which are bumped by hand.
   - package-ecosystem: docker
     directory: /images/pgbackrest
     schedule:

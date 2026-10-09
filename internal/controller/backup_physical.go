@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path"
 	"strings"
@@ -26,6 +27,7 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -64,18 +66,24 @@ printf '` + terminationLabelPrefix + `%s\n' "$label" > /dev/termination-log
 // (WAL archiving, TLS server, stanza) is set up by the Cluster controller.
 func (r *BackupReconciler) reconcilePhysicalBackup(ctx context.Context, backup *postgresv1alpha1.Backup) error {
 	if err := validatePhysicalBackup(backup); err != nil {
-		return err
+		return fmt.Errorf("%w: %w", errBackupInvalid, err)
 	}
 	cluster := &postgresv1alpha1.Cluster{}
 	if err := r.Get(ctx, types.NamespacedName{Name: backup.Spec.ClusterRef.Name, Namespace: backup.Namespace}, cluster); err != nil {
 		return fmt.Errorf("failed to get cluster %s: %w", backup.Spec.ClusterRef.Name, err)
 	}
+	// Nothing is scheduled (and the Cluster controller leaves the pod alone)
+	// while the Cluster cannot archive for this Backup.
+	if err := validatePhysicalBackupFor(backup, cluster); err != nil {
+		return fmt.Errorf("%w: %w", errBackupInvalid, err)
+	}
 	if owner, err := physicalBackupFor(ctx, r.Client, cluster); err != nil {
 		return err
 	} else if owner != nil && owner.Name != backup.Name {
-		return fmt.Errorf("cluster %s already archives its WAL for physical Backup %s; only one physical Backup per Cluster is supported",
-			cluster.Name, owner.Name)
+		return fmt.Errorf("%w: cluster %s already archives its WAL for physical Backup %s; only one physical Backup per Cluster is supported",
+			errBackupInvalid, cluster.Name, owner.Name)
 	}
+	mirrorArchivingCondition(backup, cluster)
 	layout, err := resolvePostgresLayout(cluster)
 	if err != nil {
 		return err
@@ -105,6 +113,27 @@ func (r *BackupReconciler) reconcilePhysicalBackup(ctx context.Context, backup *
 		return err
 	}
 	return r.recordPhysicalRuns(ctx, backup)
+}
+
+// errBackupInvalid marks a Backup spec that cannot work as it is; it is
+// reported in the Available condition (reason Invalid) and not retried.
+var errBackupInvalid = errors.New("invalid Backup")
+
+// mirrorArchivingCondition copies the Cluster's WALArchiving condition
+// (pg_stat_archiver, see archive_health.go) to the Backup.
+func mirrorArchivingCondition(backup *postgresv1alpha1.Backup, cluster *postgresv1alpha1.Cluster) {
+	c := meta.FindStatusCondition(cluster.Status.Conditions, ConditionTypeWALArchiving)
+	if c == nil {
+		meta.RemoveStatusCondition(&backup.Status.Conditions, ConditionTypeWALArchiving)
+		return
+	}
+	meta.SetStatusCondition(&backup.Status.Conditions, metav1.Condition{
+		Type:               ConditionTypeWALArchiving,
+		Status:             c.Status,
+		ObservedGeneration: backup.Generation,
+		Reason:             c.Reason,
+		Message:            fmt.Sprintf("Cluster %s: %s", cluster.Name, c.Message),
+	})
 }
 
 func defaultString(s, def string) string {

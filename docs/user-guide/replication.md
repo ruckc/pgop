@@ -327,7 +327,7 @@ Backups always run against the primary (`<cluster>` Service; physical
 backups through its pgBackRest TLS server). A
 [physical restore](restores.md#physical-restore-pgbackrest) replaces the
 primary's data, which the standbys no longer match: the Restore deletes the
-standbys' volumes while the Cluster is stopped, and when the Cluster starts
+standbys' volumes once its restore Job succeeded (a failed restore keeps them), and when the Cluster starts
 again the standbys are cloned from the restored primary.
 
 ## Limitations

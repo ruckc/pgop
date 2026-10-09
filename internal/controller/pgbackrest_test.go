@@ -33,12 +33,15 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	postgresv1alpha1 "github.com/ruckc/pgop/api/v1alpha1"
+	"github.com/ruckc/pgop/internal/postgres"
 )
 
 // envValue returns the value of the named variable in env ("" if unset).
@@ -99,16 +102,63 @@ var _ = Describe("pgBackRest", func() {
 	)
 
 	DescribeTable("picks the image of a Cluster with physical backups",
-		func(image string, major *int32, want string) {
+		func(image string, major *int32, optIn bool, want string) {
 			c := &postgresv1alpha1.Cluster{Spec: postgresv1alpha1.ClusterSpec{Image: image, PostgresMajorVersion: major}}
-			Expect(postgresImageForBackups(c)).To(Equal(want))
+			b := &postgresv1alpha1.Backup{Spec: postgresv1alpha1.BackupSpec{
+				Physical: &postgresv1alpha1.PhysicalBackupConfig{PostgresImageIncludesPgbackrest: optIn}}}
+			got, err := postgresImageForBackups(c, b)
+			if want == "" {
+				Expect(err).To(MatchError(errUnsupportedBackupImage))
+				return
+			}
+			Expect(err).NotTo(HaveOccurred())
+			Expect(got).To(Equal(want))
 		},
-		Entry("default", "", nil, "ghcr.io/ruckc/pgop-postgres:18-"+pgbackrestVersion),
-		Entry("official major", "postgres:17", nil, "ghcr.io/ruckc/pgop-postgres:17-"+pgbackrestVersion),
-		Entry("official minor and distro", "docker.io/library/postgres:16.4-bookworm", nil, "ghcr.io/ruckc/pgop-postgres:16-"+pgbackrestVersion),
-		Entry("official by digest", "postgres@sha256:abc", new(int32(18)), "ghcr.io/ruckc/pgop-postgres:18-"+pgbackrestVersion),
-		Entry("unsupported major stays", "postgres:13", nil, "postgres:13"),
-		Entry("custom image stays", "registry.example.com/pg:18-pgbackrest", nil, "registry.example.com/pg:18-pgbackrest"),
+		Entry("default", "", nil, false, "ghcr.io/ruckc/pgop-postgres:18-"+pgbackrestVersion),
+		Entry("official major", "postgres:17", nil, false, "ghcr.io/ruckc/pgop-postgres:17-"+pgbackrestVersion),
+		Entry("official minor, trixie", "docker.io/library/postgres:16.4-trixie", nil, false, "ghcr.io/ruckc/pgop-postgres:16-"+pgbackrestVersion),
+		Entry("alpine is rejected (musl)", "postgres:18-alpine", nil, false, ""),
+		Entry("alpine with minor is rejected", "postgres:17.2-alpine3.21", nil, false, ""),
+		Entry("bookworm is rejected (other glibc)", "postgres:16-bookworm", nil, false, ""),
+		Entry("digest only is rejected (variant unknown)", "postgres@sha256:abc", new(int32(18)), false, ""),
+		Entry("latest is rejected", "postgres:latest", new(int32(18)), false, ""),
+		Entry("unsupported major is rejected", "postgres:15", nil, false, ""),
+		Entry("custom image is rejected", "registry.example.com/pg:18-pgbackrest", nil, false, ""),
+		Entry("custom image with opt-in is kept", "registry.example.com/pg:18-pgbackrest", nil, true, "registry.example.com/pg:18-pgbackrest"),
+		Entry("alpine with opt-in is kept", "postgres:18-alpine", nil, true, "postgres:18-alpine"),
+	)
+
+	It("bounds the archive push queue", func() {
+		c := &postgresv1alpha1.Cluster{Spec: postgresv1alpha1.ClusterSpec{Storage: postgresv1alpha1.StorageSpec{Size: "10Gi"}}}
+		b := &postgresv1alpha1.Backup{}
+		Expect(archivePushQueueMax(b, c)).To(Equal(int64(10<<30) / 4))
+		c.Spec.Storage.Size = "100Mi"
+		Expect(archivePushQueueMax(b, c)).To(Equal(int64(64 << 20)))
+		q := resource.MustParse("2Gi")
+		b.Spec.Physical = &postgresv1alpha1.PhysicalBackupConfig{ArchivePushQueueMax: &q}
+		Expect(archivePushQueueMax(b, c)).To(Equal(int64(2 << 30)))
+
+		b = &postgresv1alpha1.Backup{ObjectMeta: metav1.ObjectMeta{Name: "b"}, Spec: physicalBackupSpec("c")}
+		small := resource.MustParse("1Mi")
+		b.Spec.Physical = &postgresv1alpha1.PhysicalBackupConfig{ArchivePushQueueMax: &small}
+		Expect(validatePhysicalBackup(b)).To(MatchError(ContainSubstring("archivePushQueueMax")))
+	})
+
+	DescribeTable("reports WAL archiving health",
+		func(s postgres.ArchiverStats, status metav1.ConditionStatus, reason string) {
+			gotStatus, gotReason, _ := archivingCondition(s)
+			Expect(gotStatus).To(Equal(status))
+			Expect(gotReason).To(Equal(reason))
+		},
+		Entry("nothing archived yet", postgres.ArchiverStats{}, metav1.ConditionUnknown, reasonNoWALArchivedYet),
+		Entry("archiving", postgres.ArchiverStats{ArchivedCount: 3, LastArchivedTime: time.Now()},
+			metav1.ConditionTrue, reasonArchiving),
+		Entry("failing before the stanza exists", postgres.ArchiverStats{FailedCount: 2, LastFailedTime: time.Now()},
+			metav1.ConditionFalse, reasonArchiveFailing),
+		Entry("failing after earlier success", postgres.ArchiverStats{ArchivedCount: 3, LastArchivedTime: time.Now().Add(-time.Hour),
+			FailedCount: 1, LastFailedTime: time.Now()}, metav1.ConditionFalse, reasonArchiveFailing),
+		Entry("recovered after a failure", postgres.ArchiverStats{ArchivedCount: 3, LastArchivedTime: time.Now(),
+			FailedCount: 1, LastFailedTime: time.Now().Add(-time.Hour)}, metav1.ConditionTrue, reasonArchiving),
 	)
 
 	It("maps retention onto full backup retention", func() {
@@ -137,7 +187,8 @@ var _ = Describe("pgBackRest", func() {
 		Expect(env).To(ContainElement(secretEnv("PGBACKREST_REPO1_S3_KEY", "s3-creds", envAWSAccessKeyID)))
 
 		b.Spec.Destination.S3.Prefix = ""
-		Expect(repoPath(b)).To(Equal("/b"))
+		b.Namespace = "ns"
+		Expect(repoPath(b)).To(Equal("/ns/c/b"))
 	})
 
 	It("builds the restore options", func() {
@@ -388,8 +439,19 @@ var _ = Describe("Physical backups (envtest)", func() {
 			Spec:       physicalBackupSpec(clusterName),
 		}
 		Expect(k8sClient.Create(ctx, second)).To(Succeed())
-		_, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(second)})
-		Expect(err).To(MatchError(ContainSubstring("only one physical Backup per Cluster")))
+		expectInvalid := func(b *postgresv1alpha1.Backup, msg string) {
+			_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(b)})
+			Expect(err).NotTo(HaveOccurred(), "an invalid Backup is reported, not retried")
+			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(b), b)).To(Succeed())
+			c := meta.FindStatusCondition(b.Status.Conditions, ConditionTypeAvailable)
+			Expect(c).NotTo(BeNil())
+			Expect(c.Status).To(Equal(metav1.ConditionFalse))
+			Expect(c.Reason).To(Equal(reasonInvalid))
+			Expect(c.Message).To(ContainSubstring(msg))
+			err = k8sClient.Get(ctx, types.NamespacedName{Name: b.Name + "-full", Namespace: ns}, &batchv1.CronJob{})
+			Expect(apierrors.IsNotFound(err)).To(BeTrue(), "nothing is scheduled")
+		}
+		expectInvalid(second, "only one physical Backup per Cluster")
 
 		By("an http:// endpoint is rejected")
 		third := &postgresv1alpha1.Backup{
@@ -398,7 +460,88 @@ var _ = Describe("Physical backups (envtest)", func() {
 		}
 		third.Spec.Destination.S3.Endpoint = "http://minio:9000"
 		Expect(k8sClient.Create(ctx, third)).To(Succeed())
-		_, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(third)})
-		Expect(err).To(MatchError(ContainSubstring("https://")))
+		expectInvalid(third, "https://")
+
+		By("a Cluster image without pgBackRest is rejected")
+		alpine := &postgresv1alpha1.Cluster{
+			ObjectMeta: metav1.ObjectMeta{Name: "pbka-" + suffix, Namespace: ns},
+			Spec:       postgresv1alpha1.ClusterSpec{Image: "postgres:18-alpine"},
+		}
+		Expect(k8sClient.Create(ctx, alpine)).To(Succeed())
+		fourth := &postgresv1alpha1.Backup{
+			ObjectMeta: metav1.ObjectMeta{Name: "pbka-backup-" + suffix, Namespace: ns},
+			Spec:       physicalBackupSpec(alpine.Name),
+		}
+		Expect(k8sClient.Create(ctx, fourth)).To(Succeed())
+		expectInvalid(fourth, "Debian trixie variant")
+	})
+
+	It("leaves the pod of a Cluster with an unsupported image alone", func() {
+		cluster := &postgresv1alpha1.Cluster{
+			ObjectMeta: metav1.ObjectMeta{Name: "pbku-" + suffix, Namespace: ns},
+			Spec:       postgresv1alpha1.ClusterSpec{Image: "postgres:17-alpine", Replicas: 1, Port: 5432},
+		}
+		Expect(k8sClient.Create(ctx, cluster)).To(Succeed())
+		defer func() {
+			_ = k8sClient.Get(ctx, client.ObjectKeyFromObject(cluster), cluster)
+			cluster.Finalizers = nil
+			_ = k8sClient.Update(ctx, cluster)
+			_ = k8sClient.Delete(ctx, cluster)
+		}()
+		backup := &postgresv1alpha1.Backup{
+			ObjectMeta: metav1.ObjectMeta{Name: "pbku-backup-" + suffix, Namespace: ns},
+			Spec:       physicalBackupSpec(cluster.Name),
+		}
+		Expect(k8sClient.Create(ctx, backup)).To(Succeed())
+		r := &ClusterReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(cluster)})
+		Expect(err).NotTo(HaveOccurred())
+		sts := &appsv1.StatefulSet{}
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(cluster), sts)).To(Succeed())
+		Expect(sts.Spec.Template.Spec.Containers).To(HaveLen(1))
+		Expect(sts.Spec.Template.Spec.Containers[0].Image).To(Equal("postgres:17-alpine"))
+		Expect(sts.Spec.Template.Spec.Containers[0].Args).To(BeEmpty(), "no archive_command without pgBackRest")
+	})
+
+	It("reports WAL archiving health from pg_stat_archiver", func() {
+		cluster := &postgresv1alpha1.Cluster{
+			ObjectMeta: metav1.ObjectMeta{Name: "pbkh-" + suffix, Namespace: ns},
+			Spec:       postgresv1alpha1.ClusterSpec{Image: DefaultPostgresImage},
+		}
+		Expect(k8sClient.Create(ctx, cluster)).To(Succeed())
+		Expect(k8sClient.Create(ctx, &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: cluster.Name + "-credentials", Namespace: ns},
+			Data:       map[string][]byte{SecretKeyUsername: []byte("pgop_operator"), SecretKeyPassword: []byte("pw")},
+		})).To(Succeed())
+		backup := &postgresv1alpha1.Backup{
+			ObjectMeta: metav1.ObjectMeta{Name: "pbkh-backup-" + suffix, Namespace: ns},
+			Spec:       physicalBackupSpec(cluster.Name),
+		}
+		stats := postgres.ArchiverStats{ArchivedCount: 1, LastArchivedTime: time.Now().Add(-time.Hour),
+			FailedCount: 4, LastFailedWAL: "000000010000000000000007", LastFailedTime: time.Now()}
+		r := &ClusterReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(),
+			ConnectArchiveServer: func(context.Context, postgres.ConnectionConfig) (ArchiveServer, error) {
+				return fakeArchiveServer{stats: stats}, nil
+			}}
+		Expect(r.reconcileArchiveHealth(ctx, cluster, backup, true)).To(Equal(archiveHealthInterval))
+		c := meta.FindStatusCondition(cluster.Status.Conditions, ConditionTypeWALArchiving)
+		Expect(c).NotTo(BeNil())
+		Expect(c.Status).To(Equal(metav1.ConditionFalse))
+		Expect(c.Message).To(ContainSubstring("000000010000000000000007"))
+
+		By("the Backup mirrors the condition")
+		mirrorArchivingCondition(backup, cluster)
+		Expect(meta.IsStatusConditionFalse(backup.Status.Conditions, ConditionTypeWALArchiving)).To(BeTrue())
+
+		By("the condition goes away without a physical Backup")
+		r.reconcileArchiveHealth(ctx, cluster, nil, true)
+		Expect(meta.FindStatusCondition(cluster.Status.Conditions, ConditionTypeWALArchiving)).To(BeNil())
 	})
 })
+
+type fakeArchiveServer struct{ stats postgres.ArchiverStats }
+
+func (f fakeArchiveServer) ArchiverStats(context.Context) (postgres.ArchiverStats, error) {
+	return f.stats, nil
+}
+func (f fakeArchiveServer) Close() error { return nil }

@@ -112,6 +112,16 @@ spec:
   clusterRef:
     name: %s
 %s`, restoreName, namespace, fullJob, name, extra))
+
+			By("the Restore waits for the Cluster's confirmation")
+			Eventually(func(g Gomega) {
+				g.Expect(get(g, "restore.pgop.ruck.io", restoreName, "-o",
+					`jsonpath={.status.conditions[?(@.type=="Available")].reason}`)).To(Equal("AwaitingConfirmation"))
+			}).Should(Succeed())
+			Expect(get(Default, "cluster", name, "-o", "jsonpath={.status.ready}")).To(Equal("true"), "not stopped yet")
+			_, err := kubectl("annotate", "cluster", name, "--overwrite", "pgop.ruck.io/allow-restore="+restoreName)
+			Expect(err).NotTo(HaveOccurred())
+
 			Eventually(func(g Gomega) {
 				phase := get(g, "restore.pgop.ruck.io", restoreName, "-o", "jsonpath={.status.phase}")
 				if phase == "Failed" {
@@ -122,6 +132,10 @@ spec:
 				g.Expect(phase).To(Equal("Succeeded"))
 			}).Should(Succeed())
 			Expect(get(Default, "cluster", name, "-o", `jsonpath={.metadata.annotations.pgop\.ruck\.io/restore-in-progress}`)).To(BeEmpty())
+			Expect(get(Default, "cluster", name, "-o", `jsonpath={.metadata.annotations.pgop\.ruck\.io/allow-restore}`)).
+				To(BeEmpty(), "the confirmation is used up")
+			Expect(get(Default, "cluster", name, "-o", "jsonpath={.status.lastRestore.name}/{.status.lastRestore.result}")).
+				To(Equal(restoreName + "/Succeeded"))
 			waitReady()
 		}
 
@@ -218,6 +232,14 @@ spec:
 			mustSQL("CREATE TABLE pbk_items (v text)")
 			mustSQL("INSERT INTO pbk_items VALUES ('a'), ('b'), ('c')")
 			waitArchived()
+			Eventually(func(g Gomega) {
+				g.Expect(get(g, "cluster", name, "-o",
+					`jsonpath={.status.conditions[?(@.type=="WALArchiving")].status}`)).To(Equal("True"))
+				g.Expect(get(g, "backup.pgop.ruck.io", backupName, "-o",
+					`jsonpath={.status.conditions[?(@.type=="WALArchiving")].status}`)).To(Equal("True"))
+			}, 4*time.Minute).Should(Succeed())
+			Expect(get(Default, "pod", name+"-0", "-o",
+				`jsonpath={.spec.containers[0].env[?(@.name=="PGBACKREST_ARCHIVE_PUSH_QUEUE_MAX")].value}`)).To(Equal("268435456"))
 
 			By("taking a full backup from the CronJob")
 			_, err := kubectl("create", "job", fullJob, "--from=cronjob/"+backupName+"-full")

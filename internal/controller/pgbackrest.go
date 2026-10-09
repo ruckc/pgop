@@ -22,12 +22,16 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"path"
 	"regexp"
 	"slices"
 	"strconv"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -131,21 +135,60 @@ func postgresMajor(cluster *postgresv1alpha1.Cluster) int {
 	return parsePostgresMajor(cmp.Or(cluster.Spec.Image, DefaultPostgresImage))
 }
 
+// swappableTagPattern matches the tags of the official postgres image whose
+// variant is Debian trixie, the base of pgop's Postgres+pgBackRest image:
+// "<major>[.<minor>]" (the default variant, trixie since PostgreSQL 18 and
+// the 2025 Debian release) and "<major>[.<minor>]-trixie". Other variants
+// (alpine/musl, bookworm, bullseye) use a different C library or glibc
+// release, whose collations may differ: swapping the image could silently
+// corrupt text indexes.
+var swappableTagPattern = regexp.MustCompile(`^[0-9]+(\.[0-9]+)?(-trixie)?$`)
+
+// imageTag returns the tag of an image reference ("" without one, e.g. a
+// digest-only reference).
+func imageTag(image string) string {
+	if i := strings.Index(image, "@"); i >= 0 {
+		image = image[:i]
+	}
+	if colon := strings.LastIndex(image, ":"); colon > strings.LastIndex(image, "/") {
+		return image[colon+1:]
+	}
+	return ""
+}
+
+// errUnsupportedBackupImage: the Cluster's image cannot run physical backups.
+var errUnsupportedBackupImage = errors.New("unsupported image for physical backups")
+
 // postgresImageForBackups returns the image of a Cluster with physical
-// backups: the official postgres image (the default) is replaced by pgop's
-// Postgres+pgBackRest image of the same major version; any other image is
-// used as it is and must contain pgBackRest pgbackrestVersion at
-// pgbackrestBin.
-func postgresImageForBackups(cluster *postgresv1alpha1.Cluster) string {
+// backups:
+//
+//   - with spec.physical.postgresImageIncludesPgbackrest, the Cluster's image
+//     as it is (the user vouches that it contains pgBackRest);
+//   - the official Debian-trixie postgres image of a supported major version
+//     is replaced by pgop's Postgres+pgBackRest image of that major;
+//   - anything else is an error: archiving with an image that has no
+//     pgBackRest would fail forever and fill pg_wal.
+func postgresImageForBackups(cluster *postgresv1alpha1.Cluster, backup *postgresv1alpha1.Backup) (string, error) {
 	image := cmp.Or(cluster.Spec.Image, DefaultPostgresImage)
+	if backup.Spec.Physical != nil && backup.Spec.Physical.PostgresImageIncludesPgbackrest {
+		return image, nil
+	}
+	hint := "set spec.image to an image that contains pgBackRest " + pgbackrestVersion +
+		" and spec.physical.postgresImageIncludesPgbackrest=true on the Backup"
 	if !isOfficialPostgresImage(image) {
-		return image
+		return "", fmt.Errorf("%w: %q is not the official postgres image; %s", errUnsupportedBackupImage, image, hint)
+	}
+	if tag := imageTag(image); !swappableTagPattern.MatchString(tag) {
+		return "", fmt.Errorf("%w: %q: only the Debian trixie variant of the official image (tags like \"18\", \"18.1\", "+
+			"\"18-trixie\") is replaced by pgop's Postgres+pgBackRest image (other variants use a different C library, "+
+			"whose collations may differ); %s", errUnsupportedBackupImage, image, hint)
 	}
 	major := postgresMajor(cluster)
 	if !slices.Contains(supportedPgopPostgresMajors, major) {
-		return image
+		return "", fmt.Errorf("%w: PostgreSQL %d: pgop builds Postgres+pgBackRest images for %v only; %s",
+			errUnsupportedBackupImage, major, supportedPgopPostgresMajors, hint)
 	}
-	return PgopPostgresImage(major)
+	return PgopPostgresImage(major), nil
 }
 
 // PgopPostgresImage is pgop's Postgres+pgBackRest image for a PostgreSQL
@@ -227,6 +270,16 @@ func parseS3Endpoint(s3 *postgresv1alpha1.S3Destination) (s3Endpoint, error) {
 	return s3Endpoint{Host: u.Hostname(), Port: port}, nil
 }
 
+// validatePhysicalBackupFor checks a physical Backup together with the
+// Cluster it names: the Backup itself and the Cluster's image.
+func validatePhysicalBackupFor(backup *postgresv1alpha1.Backup, cluster *postgresv1alpha1.Cluster) error {
+	if err := validatePhysicalBackup(backup); err != nil {
+		return err
+	}
+	_, err := postgresImageForBackups(cluster, backup)
+	return err
+}
+
 // validatePhysicalBackup checks the parts of a physical Backup that
 // pgBackRest needs.
 func validatePhysicalBackup(backup *postgresv1alpha1.Backup) error {
@@ -243,16 +296,43 @@ func validatePhysicalBackup(backup *postgresv1alpha1.Backup) error {
 	if e := backup.Spec.Encryption; e != nil && e.Enabled && e.KeySecretRef == nil {
 		return errors.New("encryption.keySecretRef is required when encryption is enabled")
 	}
+	if p := backup.Spec.Physical; p != nil && p.ArchivePushQueueMax != nil && p.ArchivePushQueueMax.Value() < minArchivePushQueueMax {
+		return fmt.Errorf("physical.archivePushQueueMax must be at least 64Mi (got %s)", p.ArchivePushQueueMax.String())
+	}
 	return nil
 }
 
-// repoPath is the repository path of a Backup within its bucket.
-func repoPath(backup *postgresv1alpha1.Backup) string {
-	prefix := strings.Trim(backup.Spec.Destination.S3.Prefix, "/")
-	if prefix == "" {
-		prefix = backup.Name
+// minArchivePushQueueMax is the smallest (and default minimum) archive push
+// queue: a few WAL segments.
+const minArchivePushQueueMax = 64 << 20
+
+// archivePushQueueMax is the archive-push-queue-max in bytes: the Backup's
+// setting, or a quarter of the Cluster's storage size (at least 64Mi).
+func archivePushQueueMax(backup *postgresv1alpha1.Backup, cluster *postgresv1alpha1.Cluster) int64 {
+	if p := backup.Spec.Physical; p != nil && p.ArchivePushQueueMax != nil {
+		return p.ArchivePushQueueMax.Value()
 	}
-	return "/" + prefix
+	size := int64(1 << 30)
+	if q, err := resource.ParseQuantity(cmp.Or(cluster.Spec.Storage.Size, defaultStorageSize)); err == nil {
+		size = q.Value()
+	}
+	return max(size/4, minArchivePushQueueMax)
+}
+
+// repoPath is the repository path of a Backup within its bucket:
+// spec.destination.s3.prefix, or "/<namespace>/<cluster>/<backup>", so
+// Backups of different Clusters and namespaces sharing a bucket never share
+// a repository (a stanza holds one system identifier). Changing it later
+// starts a new, empty repository; the old one is left as it is.
+func repoPath(backup *postgresv1alpha1.Backup) string {
+	if prefix := strings.Trim(backup.Spec.Destination.S3.Prefix, "/"); prefix != "" {
+		return "/" + prefix
+	}
+	clusterName := ""
+	if backup.Spec.ClusterRef != nil {
+		clusterName = backup.Spec.ClusterRef.Name
+	}
+	return "/" + path.Join(backup.Namespace, clusterName, backup.Name)
 }
 
 func envVar(name, value string) corev1.EnvVar { return corev1.EnvVar{Name: name, Value: value} }
@@ -391,9 +471,16 @@ done
 // password-sync hook (a restored instance starts in recovery). Returns the
 // sidecar and the pod volumes.
 func applyPgbackrestTemplate(cluster *postgresv1alpha1.Cluster, backup *postgresv1alpha1.Backup, layout postgresLayout,
-	container *corev1.Container, volumes []corev1.Volume) (corev1.Container, []corev1.Volume) {
-	container.Image = postgresImageForBackups(cluster)
+	container *corev1.Container, volumes []corev1.Volume) (corev1.Container, []corev1.Volume, error) {
+	image, err := postgresImageForBackups(cluster, backup)
+	if err != nil {
+		return corev1.Container{}, nil, err
+	}
+	container.Image = image
 	env := append(pgbackrestRepoEnv(backup), pgbackrestPGEnv(cluster, layout)...)
+	// Bound the WAL that piles up while archiving fails: pgBackRest drops
+	// (and reports) WAL beyond it instead of filling the data volume.
+	env = append(env, envVar("PGBACKREST_ARCHIVE_PUSH_QUEUE_MAX", strconv.FormatInt(archivePushQueueMax(backup, cluster), 10)))
 	container.Env = append(container.Env, env...)
 	caVolumes, caMounts := s3CAVolume(backup)
 	socketMount := corev1.VolumeMount{Name: postgresSocketVolume, MountPath: postgresSocketDir}
@@ -449,7 +536,7 @@ func applyPgbackrestTemplate(cluster *postgresv1alpha1.Cluster, backup *postgres
 			}},
 		})
 	volumes = append(volumes, caVolumes...)
-	return sidecar, volumes
+	return sidecar, volumes, nil
 }
 
 // pgbackrestServicePort is the read-write Service port of the TLS server.
@@ -543,8 +630,47 @@ func pgbackrestPodSecurityContext() *corev1.PodSecurityContext {
 }
 
 // pausedForRestore reports whether a physical Restore stopped the Cluster.
+// It stays stopped while a Restore runs, and after a restore that did not
+// complete (restore-interrupted), until that is resolved.
 func pausedForRestore(cluster *postgresv1alpha1.Cluster) bool {
-	return cluster.Annotations[AnnotationRestoreInProgress] != ""
+	return cluster.Annotations[AnnotationRestoreInProgress] != "" ||
+		cluster.Annotations[AnnotationRestoreInterrupted] != ""
+}
+
+// restorePauseReason is the reason and message of the Available condition
+// of a Cluster stopped for a restore.
+func restorePauseReason(cluster *postgresv1alpha1.Cluster) (string, string) {
+	if name := cluster.Annotations[AnnotationRestoreInProgress]; name != "" {
+		return ReasonPausedForRestore, fmt.Sprintf("Stopped while Restore %q restores the data directory", name)
+	}
+	return ConditionTypeRestoreInterrupted, restoreInterruptedMessage(cluster)
+}
+
+func restoreInterruptedMessage(cluster *postgresv1alpha1.Cluster) string {
+	return fmt.Sprintf("Restore %q did not complete, so the data directory may be partly restored and the Cluster "+
+		"stays stopped. Create a new physical Restore (confirmed with the %s annotation) to restore it again, or, "+
+		"to start PostgreSQL on the data directory as it is, remove the %s annotation",
+		cluster.Annotations[AnnotationRestoreInterrupted], AnnotationAllowRestore, AnnotationRestoreInterrupted)
+}
+
+// setRestoreInterruptedCondition sets the RestoreInterrupted condition from
+// the restore-interrupted annotation, with a Warning event when it appears.
+func (r *ClusterReconciler) setRestoreInterruptedCondition(cluster *postgresv1alpha1.Cluster) {
+	if cluster.Annotations[AnnotationRestoreInterrupted] == "" {
+		meta.RemoveStatusCondition(&cluster.Status.Conditions, ConditionTypeRestoreInterrupted)
+		return
+	}
+	if !meta.IsStatusConditionTrue(cluster.Status.Conditions, ConditionTypeRestoreInterrupted) && r.Recorder != nil {
+		r.Recorder.Eventf(cluster, nil, corev1.EventTypeWarning, ConditionTypeRestoreInterrupted, "Restore",
+			"%s", restoreInterruptedMessage(cluster))
+	}
+	meta.SetStatusCondition(&cluster.Status.Conditions, metav1.Condition{
+		Type:               ConditionTypeRestoreInterrupted,
+		Status:             metav1.ConditionTrue,
+		ObservedGeneration: cluster.Generation,
+		Reason:             ConditionTypeRestoreInterrupted,
+		Message:            restoreInterruptedMessage(cluster),
+	})
 }
 
 // clustersForBackup maps a physical Backup to the Cluster it names.

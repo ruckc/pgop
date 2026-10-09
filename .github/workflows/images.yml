@@ -1,17 +1,20 @@
 name: pgBackRest Images
 
 # Builds the pgBackRest images from images/pgbackrest/Dockerfile (one pinned
-# pgBackRest build):
+# pgBackRest build, base images pinned by digest and bumped by Dependabot):
 #
-#   ghcr.io/<owner>/pgop-pgbackrest:<pgbackrest>          backup/restore Jobs
-#   ghcr.io/<owner>/pgop-postgres:<major>-<pgbackrest>    Clusters with physical backups
-#   ghcr.io/<owner>/pgop-postgres:<major>                 (floating)
+#   ghcr.io/<owner>/pgop-pgbackrest:<pgbackrest>[-<date>]          backup/restore Jobs
+#   ghcr.io/<owner>/pgop-postgres:<major>-<pgbackrest>[-<date>]    Clusters with physical backups
+#   ghcr.io/<owner>/pgop-postgres:<major>                          (floating)
 #
 # Pull requests that touch the images build them for every platform without
-# pushing. Pushes to main publish them (with provenance and an SBOM), and a
-# weekly scheduled run rebuilds and republishes the same tags so base-image
-# (Debian, postgres minor release) security fixes reach them without a
-# pgBackRest bump.
+# pushing, with read-only permissions (job "build"). Pushes to main publish
+# them with provenance, an SBOM and a build attestation (job "publish"), and
+# a weekly scheduled run rebuilds them so security fixes of the packages
+# installed on top of the base reach them without a pgBackRest bump. Every
+# publish also writes an immutable "-<YYYYMMDD>" tag; the operator's default
+# references the moving "<major>-<pgbackrest>" tag (see
+# docs/user-guide/backups.md#images for pinning).
 
 on:
   push:
@@ -40,6 +43,46 @@ env:
 jobs:
   build:
     name: Build ${{ matrix.image }}${{ matrix.pg_major && format(' (PostgreSQL {0})', matrix.pg_major) || '' }}
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {target: pgbackrest, image: pgop-pgbackrest, pg_major: ''}
+          - {target: postgres, image: pgop-postgres, pg_major: '16'}
+          - {target: postgres, image: pgop-postgres, pg_major: '17'}
+          - {target: postgres, image: pgop-postgres, pg_major: '18'}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.3
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4.1.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4.1.0
+
+      - name: Build image (no push)
+        uses: docker/build-push-action@v7.2.0
+        with:
+          context: images/pgbackrest
+          target: ${{ matrix.target }}
+          build-args: |
+            ${{ matrix.pg_major && format('PG_MAJOR={0}', matrix.pg_major) || '' }}
+          platforms: linux/amd64,linux/arm64
+          push: false
+          pull: true
+          # The builder stage (the pgBackRest compile) is shared by all
+          # targets; one cache scope lets the matrix reuse it.
+          cache-from: type=gha,scope=pgbackrest-images
+          cache-to: type=gha,scope=pgbackrest-images,mode=max
+
+  publish:
+    name: Publish ${{ matrix.image }}${{ matrix.pg_major && format(' (PostgreSQL {0})', matrix.pg_major) || '' }}
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -50,20 +93,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - target: pgbackrest
-            image: pgop-pgbackrest
-            pg_major: ''
-          - target: postgres
-            image: pgop-postgres
-            pg_major: '16'
-          - target: postgres
-            image: pgop-postgres
-            pg_major: '17'
-          - target: postgres
-            image: pgop-postgres
-            pg_major: '18'
-    env:
-      PUSH: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
+          - {target: pgbackrest, image: pgop-pgbackrest, pg_major: ''}
+          - {target: postgres, image: pgop-postgres, pg_major: '16'}
+          - {target: postgres, image: pgop-postgres, pg_major: '17'}
+          - {target: postgres, image: pgop-postgres, pg_major: '18'}
     steps:
       - name: Checkout
         uses: actions/checkout@v6.0.3
@@ -76,12 +109,15 @@ jobs:
             echo "PGBACKREST_VERSION not found in images/pgbackrest/Dockerfile" >&2
             exit 1
           fi
+          DATE=$(date -u +%Y%m%d)
           OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
           IMAGE="${{ env.REGISTRY }}/${OWNER}/${{ matrix.image }}"
           if [ -n "${{ matrix.pg_major }}" ]; then
-            TAGS="${IMAGE}:${{ matrix.pg_major }}-${VERSION},${IMAGE}:${{ matrix.pg_major }}"
+            BASE="${IMAGE}:${{ matrix.pg_major }}-${VERSION}"
+            TAGS="${BASE},${BASE}-${DATE},${IMAGE}:${{ matrix.pg_major }}"
           else
-            TAGS="${IMAGE}:${VERSION},${IMAGE}:latest"
+            BASE="${IMAGE}:${VERSION}"
+            TAGS="${BASE},${BASE}-${DATE},${IMAGE}:latest"
           fi
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
@@ -95,14 +131,13 @@ jobs:
         uses: docker/setup-buildx-action@v4.1.0
 
       - name: Log in to registry
-        if: env.PUSH == 'true'
         uses: docker/login-action@v4.2.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build image
+      - name: Build and push image
         id: build
         uses: docker/build-push-action@v7.2.0
         with:
@@ -111,7 +146,7 @@ jobs:
           build-args: |
             ${{ matrix.pg_major && format('PG_MAJOR={0}', matrix.pg_major) || '' }}
           platforms: linux/amd64,linux/arm64
-          push: ${{ env.PUSH == 'true' }}
+          push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: |
             org.opencontainers.image.revision=${{ github.sha }}
@@ -119,13 +154,10 @@ jobs:
           provenance: mode=max
           sbom: true
           pull: true
-          # The builder stage (the pgBackRest compile) is shared by all
-          # targets; one cache scope lets the matrix reuse it.
           cache-from: type=gha,scope=pgbackrest-images
           cache-to: type=gha,scope=pgbackrest-images,mode=max
 
       - name: Attest build provenance
-        if: env.PUSH == 'true'
         uses: actions/attest-build-provenance@v4.2.2
         with:
           subject-name: ${{ steps.meta.outputs.image }}

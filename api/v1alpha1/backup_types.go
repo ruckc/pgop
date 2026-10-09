@@ -18,6 +18,7 @@ package v1alpha1
 
 import (
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -58,6 +59,26 @@ type PhysicalBackupConfig struct {
 	// PostgreSQL image.
 	// +optional
 	Image string `json:"image,omitempty"`
+
+	// postgresImageIncludesPgbackrest declares that the Cluster's
+	// spec.image already contains pgBackRest (same version as the Job
+	// image, at /usr/bin/pgbackrest, postgres user uid 999), so the
+	// operator uses it as it is. Without it, physical backups are only
+	// enabled for the official Debian (trixie) postgres image of a supported
+	// major version, which the operator replaces with pgop's
+	// Postgres+pgBackRest image; any other image makes the Backup Invalid
+	// and the Cluster is left unchanged.
+	// +optional
+	PostgresImageIncludesPgbackrest bool `json:"postgresImageIncludesPgbackrest,omitempty"`
+
+	// archivePushQueueMax bounds the WAL that may queue up in pg_wal while
+	// archiving fails (pgBackRest archive-push-queue-max). Beyond it,
+	// pgBackRest drops WAL (and logs it) instead of filling the data
+	// volume, which breaks point-in-time recovery across the gap until the
+	// next full backup. Defaults to a quarter of the Cluster's storage size
+	// (at least 64Mi).
+	// +optional
+	ArchivePushQueueMax *resource.Quantity `json:"archivePushQueueMax,omitempty"`
 }
 
 // RetentionSpec configures how long backups are retained

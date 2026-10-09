@@ -61,23 +61,47 @@ metadata:
 spec:
   type: physical
   backupRunRef:
-    name: my-cluster-backup-full-29342160   # selects the Backup (repository)
+    name: my-cluster-backup-full-29342160   # a Succeeded BackupRun of a physical Backup
   clusterRef:
     name: my-cluster                        # must be the Backup's clusterRef
   targetTime: "2026-01-01T06:00:00Z"        # optional point-in-time target
 ```
 
-What is restored:
+The `BackupRun` must be `Succeeded` and have a recorded backup
+(`status.location`, set by pgop for every backup Job); otherwise the Restore
+fails without touching the Cluster. What is restored:
 
-| `targetTime` | BackupRun `status.location` | Result |
-|--------------|-----------------------------|--------|
-| set | any | point-in-time recovery to `targetTime`, from the newest backup taken before it (`--type=time`) |
-| unset | a backup (recorded by pgop) | that backup, recovered just to consistency (`--set=<label> --type=immediate`) |
-| unset | empty | the newest backup, replaying all archived WAL (latest state) |
+| `targetTime` | Result |
+|--------------|--------|
+| unset | the BackupRun's backup, recovered just to consistency (`--set=<label> --type=immediate`) |
+| set | point-in-time recovery to `targetTime`, from the newest backup taken before it (`--type=time`); the BackupRun only selects the repository |
 
-In every case the server is promoted once the target is reached
+In both cases the server is promoted once the target is reached
 (`--target-action=promote`) and continues on a new timeline, archiving into the
 same repository.
+
+### Confirmation
+
+A physical restore stops the Cluster and replaces its data, so creating a
+`Restore` is not enough: the **Cluster** must confirm it (which needs
+permission to change the Cluster, not just to create Restores):
+
+```sh
+kubectl annotate cluster my-cluster pgop.ruck.io/allow-restore=my-cluster-pitr
+```
+
+Until then the Restore is `Pending` with reason `AwaitingConfirmation`, and
+nothing happens. The value is the Restore name, or `<name>/<uid>` to confirm
+exactly one Restore object. The operator removes the annotation when the
+Restore finishes (succeeded, failed or deleted), so a confirmation is used
+once.
+
+The Cluster records the last finished Restore in `status.lastRestore` (name,
+UID, a fingerprint of its spec, result and time). A Restore with the **same
+name and spec** within 24 hours of it, typically the same manifest applied
+again by GitOps after it was pruned, is only accepted when confirmed by its
+UID (`pgop.ruck.io/allow-restore=<name>/<uid>`), since a name-only annotation
+could be re-applied by the same tooling.
 
 ### What happens
 
@@ -88,29 +112,54 @@ and other Clusters are not affected:
    `pgop.ruck.io/restore-in-progress: <restore>` on the Cluster; the Cluster
    controller scales the StatefulSet to 0 and reports
    `Available=False` (`PausedForRestore`).
-2. **Restore.** Once no PostgreSQL pod runs, it deletes the standbys' data
-   volumes (`data-<cluster>-1…`; they no longer match the restored primary and
-   are cloned again) and runs the Job `<restore>-restore`: the pgBackRest
-   image, as UID 999, with the primary's volume `data-<cluster>-0` mounted. It
-   runs `pgbackrest restore --delta` (only changed files are rewritten), which
-   also writes `recovery.signal` and the recovery settings
-   (`restore_command = pgbackrest archive-get …`).
-3. **Start the Cluster.** When the Job succeeds the annotation is removed, the
-   StatefulSet scales back up and PostgreSQL recovers from the WAL archive,
-   then is promoted. The Restore is `Succeeded` at this point; the Cluster
-   becomes `Ready` once recovery is complete. Standbys are cloned from the
-   restored primary.
+2. **Restore.** Once no PostgreSQL pod runs, it runs the Job
+   `<restore>-restore`: the pgBackRest image, as UID 999, with the primary's
+   volume `data-<cluster>-0` mounted. It runs `pgbackrest restore --delta`
+   (only changed files are rewritten), which also writes `recovery.signal`
+   and the recovery settings (`restore_command = pgbackrest archive-get …`).
+3. **Start the Cluster.** When the Job succeeds, the standbys' data volumes
+   (`data-<cluster>-1…`, which no longer match the restored primary) are
+   deleted, the annotation is removed, the StatefulSet scales back up and
+   PostgreSQL recovers from the WAL archive, then is promoted. The Restore is
+   `Succeeded` at this point; the Cluster becomes `Ready` once recovery is
+   complete. Standbys are cloned from the restored primary.
 
-`status.conditions` shows the current step (`StoppingCluster`, `Restoring`).
-Only one Restore at a time can hold a Cluster; a second one waits
-(`WaitingForRestore`).
+`status.conditions` shows the current step (`AwaitingConfirmation`,
+`StoppingCluster`, `Restoring`). Only one Restore at a time can hold a
+Cluster; a second one waits (`WaitingForRestore`), including for a Restore
+that is being deleted until its Job has stopped.
 
-!!! warning "When the restore Job fails"
-    The data directory may be partly restored, so the Cluster **stays
-    stopped** and the Restore is `Failed` (the Job's pod and log are kept).
-    Fix the cause and create a new Restore, or delete the failed Restore to
-    start the Cluster again on whatever is in its volume. Deleting a Restore
-    at any time starts the Cluster again.
+### Failed or interrupted restores
+
+If the restore Job **fails**, or the Restore is **deleted after its Job
+started**, the data directory may be partly restored:
+
+- a deleted Restore first deletes its Job (foreground) and waits until none
+  of its pods exists, so pgBackRest and PostgreSQL never run on the volume at
+  the same time;
+- the Cluster **stays stopped**: the annotation
+  `pgop.ruck.io/restore-interrupted: <restore>` replaces `restore-in-progress`,
+  and the Cluster reports `RestoreInterrupted=True` (and `Available=False`,
+  reason `RestoreInterrupted`) with a Warning event;
+- the standbys keep their volumes (they are only deleted after a successful
+  restore);
+- a failed Job's pod and log are kept (`kubectl logs job/<restore>-restore`).
+
+The way out is to **restore again**: fix the cause, create a new Restore and
+confirm it. `pgbackrest restore --delta` brings the partly restored directory
+to the backup's state, and its success clears `restore-interrupted`.
+
+Removing `pgop.ruck.io/restore-interrupted` by hand starts PostgreSQL on the
+data directory as it is. Only do this if you know the restore did not change
+it (e.g. it failed before writing anything). pgBackRest deletes
+`global/pg_control` before changing any file and writes it last (verified in
+pgBackRest 2.59.3, `restore/clean.c` and `restore.c`), so PostgreSQL refuses to
+start on an incomplete restore instead of running on mixed data; but a restore
+that was interrupted early may have left the previous data without its
+`pg_control`, which then needs a new restore as well.
+
+A Restore deleted before its Job started (still `Pending` or stopping the
+Cluster) leaves the data untouched, and the Cluster simply starts again.
 
 ### Disaster recovery
 
@@ -119,25 +168,36 @@ The Cluster and its data volume must exist (the Job restores into
 Kubernetes cluster:
 
 1. Create the Cluster with the same name, and the physical Backup with the
-   same `destination` (same bucket and `prefix`, credentials and encryption
-   passphrase). The new, empty server cannot archive into the existing
-   repository (its system identifier differs), which is expected until the
-   restore.
-2. Create a `BackupRun` that points at the Backup (`status.location` may stay
-   empty to restore the latest state):
+   same `destination`, credentials and encryption passphrase, and a `prefix`
+   equal to the old repository path (the default path contains the
+   namespace: `/<old-namespace>/<cluster>/<backup>`). The new, empty server
+   cannot archive into the existing repository (its system identifier
+   differs); `WALArchiving` is `False` until the restore, and the queued WAL
+   is bounded by `archivePushQueueMax`.
+2. Find the backup to restore: the labels are the directory names under
+   `s3://<bucket>/<repository path>/backup/main/` (e.g. `20260101-020000F`,
+   or `20260101-020000F_20260102-020000I` for an incremental one).
+3. Record it in a `BackupRun` and mark it `Succeeded` (the status
+   subresource):
 
-    ```yaml
+    ```sh
+    kubectl apply -f - <<EOF
     apiVersion: pgop.ruck.io/v1alpha1
     kind: BackupRun
     metadata:
-      name: dr-latest
+      name: dr-20260101
     spec:
       backupRef:
         name: my-cluster-backup
       type: full
+    EOF
+    kubectl patch backuprun dr-20260101 --subresource=status --type=merge -p \
+      '{"status":{"phase":"Succeeded","location":"s3://<bucket>/<repository path>/backup/main/20260101-020000F"}}'
     ```
 
-3. Create the Restore with that `backupRunRef` (and optionally `targetTime`).
+4. Create the Restore with that `backupRunRef` (with `targetTime` to recover
+   past the backup, up to the newest archived WAL) and confirm it on the
+   Cluster.
 
 ### Limitations
 

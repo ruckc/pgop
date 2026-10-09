@@ -52,6 +52,8 @@ spec:
     fullSchedule: "0 2 * * 0"          # default: Sundays 02:00
     incrementalSchedule: "0 2 * * 1-6" # default: the other days
     # image: ghcr.io/ruckc/pgop-pgbackrest:2.59.3   # default
+    # archivePushQueueMax: 4Gi       # default: a quarter of the Cluster's storage size
+    # postgresImageIncludesPgbackrest: true   # only for a custom Cluster image, see Images
   retention:
     disabled: false
     keepLast: 4                        # keep 4 full backups (and what depends on them)
@@ -60,7 +62,7 @@ spec:
     type: s3
     s3:
       bucket: pgop-backups
-      prefix: my-cluster                # repository path; defaults to the Backup name
+      prefix: my-cluster                # repository path; default /<namespace>/<cluster>/<backup>
       region: us-east-1
       endpoint: https://minio.example.com   # optional; must be https://
       credentialsSecretRef:
@@ -81,11 +83,23 @@ spec:
 
 - The pod runs pgop's **Postgres+pgBackRest image**
   `ghcr.io/ruckc/pgop-postgres:<major>-<pgbackrest-version>` instead of the
-  official `postgres:<major>` image (see [Images](#images)).
+  official `postgres:<major>` image (see [Images](#images)). If the Cluster's
+  image cannot be swapped and is not declared to contain pgBackRest, the
+  Backup is `Invalid` and **the Cluster is not changed** (no archiving is
+  configured that could never succeed).
 - **WAL archiving**: `archive_mode=on` and
   `archive_command=pgbackrest --stanza=main archive-push %p`. Both are
   operator-owned (they cannot be set in `spec.parameters`). WAL goes straight
   from the pod to the repository.
+- **A bound on queued WAL**: while archiving fails (wrong credentials, the
+  repository unreachable, the stanza not created yet), WAL waits in `pg_wal`
+  up to `physical.archivePushQueueMax` (pgBackRest `archive-push-queue-max`;
+  default a quarter of `storage.size`, at least 64Mi). Beyond it pgBackRest
+  **drops** WAL, reporting it, instead of filling the volume and stopping
+  PostgreSQL: point-in-time recovery then has a gap until the next full
+  backup. The Cluster's and the Backup's `WALArchiving` condition (from
+  `pg_stat_archiver`, checked every minute) turns `False` as soon as archiving
+  fails.
 - A **`pgbackrest` sidecar** runs the
   [pgBackRest TLS server](https://pgbackrest.org/user-guide.html#repo-host/setup-tls)
   on port 8432, exposed on the read-write Service `<cluster>`, and creates the
@@ -126,14 +140,22 @@ my-cluster-backup-full-29342160  full          Succeeded   10m       9m
 ```
 
 `status.location` holds the backup:
-`s3://<bucket>/<prefix>/backup/main/<pgBackRest label>`, for example
+`s3://<bucket>/<repository path>/backup/main/<pgBackRest label>`, for example
 `s3://pgop-backups/my-cluster/backup/main/20260101-020000F`. A `BackupRun` is
 deleted `backupRunTTL` after it completed (the backup itself stays in the
 repository until pgBackRest expires it).
 
 The `Backup` reports `status.lastFullBackupTime`,
-`status.lastIncrementalBackupTime` and an `Available` condition (`False` with
-the reason when the spec cannot be used, e.g. an `http://` endpoint).
+`status.lastIncrementalBackupTime`, an `Available` condition (`False`,
+reason `Invalid`, when the spec cannot be used: an `http://` endpoint, an
+unsupported Cluster image, a second physical Backup of the Cluster; nothing
+is scheduled then) and `WALArchiving`, mirrored from the Cluster:
+
+| `WALArchiving` | Meaning |
+|----------------|---------|
+| `True` (`Archiving`) | the last WAL segment was archived after the last failure |
+| `False` (`ArchiveFailing`) | the last attempt failed; the message names the segment, see the `postgresql` container log |
+| `Unknown` | nothing archived yet, or the primary cannot be queried |
 
 To take a backup now:
 
@@ -151,6 +173,15 @@ kubectl create job my-cluster-backup-full-now --from=cronjob/my-cluster-backup-f
 
 Keep `disabled: true` with write-only credentials (e.g. object lock); expiry
 needs delete permission.
+
+### Repository path
+
+Without `prefix`, the repository is `/<namespace>/<cluster>/<backup>` in the
+bucket, so Backups of different Clusters (or namespaces) sharing a bucket
+never share a repository: a pgBackRest stanza belongs to one PostgreSQL
+system, and archiving into another system's stanza fails. Changing `prefix`
+(or the Backup's name without a prefix) starts a new, empty repository; the
+old one, with its backups, stays where it is and is not expired by pgop.
 
 ### pgBackRest TLS
 
@@ -203,15 +234,42 @@ version on both ends of its protocol:
 | `ghcr.io/ruckc/pgop-pgbackrest:2.59.3` | backup and restore Jobs (`spec.physical.image`) |
 | `ghcr.io/ruckc/pgop-postgres:<major>-2.59.3` (16, 17, 18) | Clusters with physical backups |
 
-They are rebuilt weekly so base-image fixes are picked up, and published for
-`linux/amd64` and `linux/arm64` with provenance and an SBOM.
+They are published for `linux/amd64` and `linux/arm64` with provenance, an
+SBOM and a build attestation. The base images are pinned by digest
+(Dependabot bumps them, e.g. for a new PostgreSQL minor release) and the
+images are rebuilt weekly for package updates. Each publish also writes an
+immutable tag with the date, e.g. `ghcr.io/ruckc/pgop-postgres:18-2.59.3-20261012`.
 
-The image swap only applies to the **official** `postgres` image
-(`postgres:<tag>`, `docker.io/library/postgres:<tag>`) of a supported major
-version; the tag's minor version is not kept (pgop's image follows the latest
-minor release of the major). Any other `spec.image` is used as it is and
-must contain pgBackRest **2.59.3** at `/usr/bin/pgbackrest`, with the
-`postgres` user as UID 999, for example:
+The operator uses the moving tag `<major>-2.59.3` (pull policy
+`IfNotPresent`): a node keeps the build it pulled first, so after a rebuild
+pods on different nodes can run different builds (PostgreSQL minor releases
+of the same major, which streaming replication supports) until their nodes
+pull the new one. To pin a build, set `spec.image` to a dated tag or digest
+of `ghcr.io/ruckc/pgop-postgres` and `physical.postgresImageIncludesPgbackrest: true`
+(and `physical.image` to the matching `pgop-pgbackrest` tag).
+
+The image swap only applies to the **official Debian trixie** `postgres`
+image of a supported major version: tags `<major>`, `<major>.<minor>`,
+`<major>-trixie`, `<major>.<minor>-trixie` (`postgres:<tag>` or
+`docker.io/library/postgres:<tag>`). pgop's image is built on the same
+Debian release, so the C library and its collations (which text indexes
+depend on) are the same. Other variants are **rejected** (the Backup is
+`Invalid`): `-alpine` uses musl, and `-bookworm`/`-bullseye` an older glibc
+whose collations can differ, so swapping could silently corrupt text indexes.
+A digest-only reference or `latest` is rejected too (the variant is
+unknown). The tag's minor version is not kept: pgop's image follows the
+latest minor release of the major.
+
+!!! warning "Clusters created on an older default tag"
+    The bare tags (`postgres:16`, `postgres:17`) were Debian bookworm until
+    Debian trixie's release in 2025. A Cluster initialized on such a tag
+    before that has indexes built with bookworm's glibc; check (or
+    `REINDEX` text indexes) before enabling physical backups, or keep its
+    image with a custom image as below.
+
+Any other image must contain pgBackRest **2.59.3** at `/usr/bin/pgbackrest`,
+with the `postgres` user as UID 999, and the Backup must declare it with
+`physical.postgresImageIncludesPgbackrest: true`, for example:
 
 ```dockerfile
 FROM ghcr.io/ruckc/pgop-pgbackrest:2.59.3 AS pgbackrest
@@ -229,8 +287,14 @@ version as the Cluster's image.
   rejected (`Available=False`).
 - S3 destinations only (no Azure/GCS for physical backups yet).
 - Backups are always taken from the primary.
-- WAL is pushed synchronously (no `archive-async`); a repository outage makes
-  WAL accumulate in `pg_wal` until it is reachable again.
+- WAL is pushed synchronously (no `archive-async`); during a repository
+  outage WAL accumulates in `pg_wal` up to `archivePushQueueMax`, then is
+  dropped (see above).
+- Archiving is enabled when the pod starts with the Backup, before the stanza
+  exists; the sidecar creates it within seconds of the primary accepting
+  connections, and failures until then are bounded as above. (Enabling
+  `archive_command` only after a health check would need an extra pod
+  restart or reload orchestration.)
 - `archive_timeout` is not set by pgop: on a quiet server the newest WAL
   reaches the repository only when a segment fills up. Set
   `spec.parameters.archive_timeout` (e.g. `"60s"`) to bound how much a

@@ -216,7 +216,8 @@ and the server CA from the credentials Secret.
 Physical backups use pgBackRest: WAL archiving from the Cluster pod, full and
 incremental backups through a pgBackRest TLS server sidecar, and restores
 (to a backup or a point in time) that stop the Cluster, restore its volume and
-start it again. The S3 endpoint must be HTTPS.
+start it again once the Cluster confirms them (`pgop.ruck.io/allow-restore`).
+The S3 endpoint must be HTTPS.
 
 ```yaml
 apiVersion: pgop.ruck.io/v1alpha1

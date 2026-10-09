@@ -18,7 +18,9 @@ metadata:
   name: example-cluster-pitr
 spec:
   # physical restore: pgBackRest, optionally to a point in time. The operator
-  # stops the Cluster, restores its data volume and starts it again.
+  # stops the Cluster, restores its data volume and starts it again, once the
+  # Cluster confirms it:
+  #   kubectl annotate cluster example-cluster pgop.ruck.io/allow-restore=example-cluster-pitr
   # See docs/user-guide/restores.md.
   type: physical
   backupRunRef:

@@ -13,10 +13,18 @@
 # remote protocol is version-locked), so both copy the binary built by the
 # builder stage. Bump PGBACKREST_VERSION and PGBACKREST_SHA256 together, and
 # update pgbackrestVersion in internal/controller/pgbackrest.go to match.
+#
+# Base images are pinned by digest (Dependabot bumps them); one stage per
+# supported PostgreSQL major, selected with --build-arg PG_MAJOR. pgop only
+# swaps Debian-trixie official images for these (same libc and collations).
 
 ARG PG_MAJOR=18
 
-FROM debian:trixie-slim AS builder
+FROM postgres:16-trixie@sha256:ca0bd484cb98bf4b24eb1010e73fb3fcbd6714d240fbc1a10eea5b7dbecb641d AS postgres-base-16
+FROM postgres:17-trixie@sha256:2d2b8998d31037bf721cfdf764d76ba74171b4fab3431b7f72c27c56ddbdf9e3 AS postgres-base-17
+FROM postgres:18-trixie@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336 AS postgres-base-18
+
+FROM debian:trixie-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f AS builder
 
 ARG PGBACKREST_VERSION=2.59.3
 ARG PGBACKREST_SHA256=b2a95535a68e326a0f316c2d8d3243bc30092cf1ce9de9be5d142e204d2d4263
@@ -40,7 +48,7 @@ RUN curl -fsSL -o pgbackrest.tar.gz \
 # The runtime stages install the libraries pgBackRest links against (Debian
 # trixie package names; the postgres image is trixie-based as well).
 
-FROM debian:trixie-slim AS pgbackrest
+FROM debian:trixie-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f AS pgbackrest
 
 ARG PGBACKREST_VERSION=2.59.3
 LABEL org.opencontainers.image.title="pgop-pgbackrest" \
@@ -65,7 +73,7 @@ RUN pgbackrest version
 USER 999:999
 CMD ["pgbackrest", "version"]
 
-FROM postgres:${PG_MAJOR}-trixie AS postgres
+FROM postgres-base-${PG_MAJOR} AS postgres
 
 ARG PGBACKREST_VERSION=2.59.3
 LABEL org.opencontainers.image.title="pgop-postgres" \

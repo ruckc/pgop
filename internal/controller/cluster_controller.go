@@ -84,6 +84,11 @@ type ClusterReconciler struct {
 	// a real PostgreSQL connection. Tests override it.
 	ConnectReplicationServer func(ctx context.Context, cfg postgres.ConnectionConfig) (ReplicationServer, error)
 
+	// ConnectArchiveServer connects to the primary to read WAL archiving
+	// statistics. Optional; defaults to a real PostgreSQL connection. Tests
+	// override it.
+	ConnectArchiveServer func(ctx context.Context, cfg postgres.ConnectionConfig) (ArchiveServer, error)
+
 	// Now returns the current time. Optional; tests override it to exercise
 	// certificate renewal and CA rotation.
 	Now func() time.Time
@@ -258,6 +263,9 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// connects) is known. Never fails the reconcile.
 	parametersRecheck := r.reconcileParameters(ctx, cluster, ready, pods)
 
+	// WAL archiving health (physical backups). Never fails the reconcile.
+	archiveRecheck := r.reconcileArchiveHealth(ctx, cluster, backup, ready)
+
 	// Converge the client-facing connection info last, once the TLS state of
 	// this reconcile is known.
 	var caPEM []byte
@@ -276,7 +284,7 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if tlsPending {
 		result.RequeueAfter = shorterRequeue(result.RequeueAfter, 10*time.Second)
 	}
-	for _, recheck := range []time.Duration{parametersRecheck, replicationRecheck} {
+	for _, recheck := range []time.Duration{parametersRecheck, replicationRecheck, archiveRecheck} {
 		if recheck > 0 {
 			result.RequeueAfter = shorterRequeue(result.RequeueAfter, recheck)
 		}
@@ -320,7 +328,9 @@ func (r *ClusterReconciler) physicalBackup(ctx context.Context, cluster *postgre
 	if err != nil || backup == nil {
 		return nil, err
 	}
-	if err := validatePhysicalBackup(backup); err != nil {
+	// A Backup the Cluster cannot archive for (an unsupported image, an
+	// http:// endpoint, ...) never changes the pod: the Backup reports why.
+	if err := validatePhysicalBackupFor(backup, cluster); err != nil {
 		logf.FromContext(ctx).Info("Ignoring an invalid physical Backup", "backup", backup.Name, "reason", err.Error())
 		return nil, nil
 	}
@@ -902,8 +912,11 @@ func (r *ClusterReconciler) reconcileStatefulSet(ctx context.Context, cluster *p
 	// physical Backup.
 	var sidecars []corev1.Container
 	if backup != nil {
-		var sidecar corev1.Container
-		sidecar, volumes = applyPgbackrestTemplate(cluster, backup, layout, &container, volumes)
+		sidecar, withBackup, err := applyPgbackrestTemplate(cluster, backup, layout, &container, volumes)
+		if err != nil {
+			return err
+		}
+		volumes = withBackup
 		sidecars = append(sidecars, sidecar)
 	}
 
@@ -1405,9 +1418,7 @@ func (r *ClusterReconciler) updateStatus(ctx context.Context, cluster *postgresv
 		condition.Message = reconcileErr.Error()
 	} else if pausedForRestore(cluster) {
 		condition.Status = metav1.ConditionFalse
-		condition.Reason = ReasonPausedForRestore
-		condition.Message = fmt.Sprintf("Stopped while Restore %q restores the data directory",
-			cluster.Annotations[AnnotationRestoreInProgress])
+		condition.Reason, condition.Message = restorePauseReason(cluster)
 	} else {
 		condition.Status = metav1.ConditionFalse
 		condition.Reason = "ClusterNotReady"
@@ -1415,6 +1426,7 @@ func (r *ClusterReconciler) updateStatus(ctx context.Context, cluster *postgresv
 	}
 
 	meta.SetStatusCondition(&cluster.Status.Conditions, condition)
+	r.setRestoreInterruptedCondition(cluster)
 
 	if err := r.Status().Update(ctx, cluster); err != nil {
 		return ctrl.Result{}, err

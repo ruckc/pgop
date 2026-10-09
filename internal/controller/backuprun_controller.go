@@ -168,7 +168,7 @@ func (r *BackupRunReconciler) syncFromJob(run *postgresv1alpha1.BackupRun, job *
 			meta.SetStatusCondition(&run.Status.Conditions, metav1.Condition{
 				Type:               ConditionTypeAvailable,
 				Status:             metav1.ConditionFalse,
-				Reason:             "Failed",
+				Reason:             reasonFailed,
 				Message:            msg,
 				ObservedGeneration: run.Generation,
 				LastTransitionTime: now,

@@ -21,8 +21,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
+	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -127,9 +129,13 @@ func (r *BackupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		Reason:             "Scheduled",
 		Message:            "Backup CronJobs are scheduled",
 	}
+	invalid := errors.Is(reconcileErr, errBackupInvalid)
 	if reconcileErr != nil {
 		cond.Status = metav1.ConditionFalse
 		cond.Reason = ReasonReconcileError
+		if invalid {
+			cond.Reason = reasonInvalid
+		}
 		cond.Message = reconcileErr.Error()
 	}
 	meta.SetStatusCondition(&backup.Status.Conditions, cond)
@@ -137,6 +143,14 @@ func (r *BackupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		if err := r.Status().Update(ctx, backup); err != nil {
 			return ctrl.Result{}, err
 		}
+	}
+	if invalid {
+		// Fixed by a spec change of the Backup or its Cluster, both watched.
+		return ctrl.Result{}, nil
+	}
+	if reconcileErr == nil && backup.Spec.Type == postgresv1alpha1.BackupTypePhysical {
+		// Refresh the mirrored WALArchiving condition.
+		return ctrl.Result{RequeueAfter: time.Minute}, nil
 	}
 	return ctrl.Result{}, reconcileErr
 }

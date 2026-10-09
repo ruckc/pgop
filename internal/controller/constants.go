@@ -218,4 +218,27 @@ const (
 
 	// reasonSucceeded: a BackupRun or Restore completed successfully.
 	reasonSucceeded = "Succeeded"
+	// reasonInvalid: the spec cannot work as it is.
+	reasonInvalid = "Invalid"
+	// reasonFailed: a BackupRun or Restore failed.
+	reasonFailed = "Failed"
+
+	// ConditionTypeWALArchiving reports WAL archiving health from
+	// pg_stat_archiver while the Cluster has a physical Backup.
+	ConditionTypeWALArchiving = "WALArchiving"
+	// ConditionTypeRestoreInterrupted is True while the Cluster is stopped
+	// because a physical restore did not complete (see
+	// AnnotationRestoreInterrupted).
+	ConditionTypeRestoreInterrupted = "RestoreInterrupted"
+
+	// AnnotationRestoreInterrupted on a Cluster names the physical Restore
+	// that failed or was deleted after it started writing the data
+	// directory. The Cluster stays stopped while it is set: run a new
+	// (confirmed) Restore, or remove the annotation to start PostgreSQL on
+	// the data directory as it is.
+	AnnotationRestoreInterrupted = "pgop.ruck.io/restore-interrupted"
+	// AnnotationAllowRestore on a Cluster confirms a physical Restore:
+	// "<restore-name>" or "<restore-name>/<restore-uid>". The operator
+	// removes it once that Restore finished.
+	AnnotationAllowRestore = "pgop.ruck.io/allow-restore"
 )

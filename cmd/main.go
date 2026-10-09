@@ -233,6 +233,8 @@ func main() {
 	if err := (&controller.RestoreReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
+		// Restore Job pods are not in the (PostgreSQL pods only) cache.
+		APIReader: mgr.GetAPIReader(),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Restore")
 		os.Exit(1)
