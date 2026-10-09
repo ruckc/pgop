@@ -1069,6 +1069,11 @@ func buildPostgresContainer(secret *corev1.Secret, image string, port int32, res
 			},
 			InitialDelaySeconds: 5,
 			PeriodSeconds:       10,
+			// The API server defaults; set explicitly so an unchanged
+			// StatefulSet does not diff on every reconcile.
+			TimeoutSeconds:   1,
+			SuccessThreshold: 1,
+			FailureThreshold: 3,
 		},
 		LivenessProbe: &corev1.Probe{
 			ProbeHandler: corev1.ProbeHandler{
@@ -1078,6 +1083,11 @@ func buildPostgresContainer(secret *corev1.Secret, image string, port int32, res
 			},
 			InitialDelaySeconds: 30,
 			PeriodSeconds:       10,
+			// The API server defaults; set explicitly so an unchanged
+			// StatefulSet does not diff on every reconcile.
+			TimeoutSeconds:   1,
+			SuccessThreshold: 1,
+			FailureThreshold: 3,
 		},
 	}
 }
@@ -1267,6 +1277,14 @@ func (r *ClusterReconciler) isStatefulSetReady(ctx context.Context, cluster *pos
 }
 
 func (r *ClusterReconciler) updateStatus(ctx context.Context, cluster *postgresv1alpha1.Cluster, ready bool, reconcileErr error) (ctrl.Result, error) {
+	// An optimistic-concurrency conflict (an object changed between the cache
+	// read and the write) is transient and retried right away. Recording it
+	// would flip status.ready to false for a moment, which pauses Role and
+	// Database reconciles although the server is fine.
+	if apierrors.IsConflict(reconcileErr) {
+		return ctrl.Result{}, reconcileErr
+	}
+
 	// Update status fields
 	cluster.Status.Ready = ready
 	cluster.Status.SecretName = cluster.Name + "-credentials"
