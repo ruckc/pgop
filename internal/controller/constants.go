@@ -159,6 +159,10 @@ const (
 	// the salted fingerprint of the replication password last set in
 	// PostgreSQL.
 	AnnotationReplicationPasswordFingerprint = "pgop.ruck.io/replication-password-fingerprint"
+	// AnnotationReplicationPasswordRollout on the credentials Secret records
+	// (unix time) that the replication password changed and the standbys
+	// started before then are being restarted one at a time.
+	AnnotationReplicationPasswordRollout = "pgop.ruck.io/replication-password-rollout"
 
 	// ConditionTypeReplicationHealthy reports whether every standby streams
 	// from the primary. Only set while spec.replicas is greater than 1.

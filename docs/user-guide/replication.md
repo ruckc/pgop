@@ -278,15 +278,18 @@ also refuses while standbys answer on `<cluster>-ro`.
 Recover the primary's volume from a backup. To deliberately start over with an
 empty database, set the annotation `pgop.ruck.io/allow-primary-init: "true"`
 on the Cluster (the operator removes the marker), let the primary initialize,
-and remove the annotation again. Standbys that hold data of the old primary
+and **remove the annotation again**: while it is set, the guard stays off
+(the marker is never written). Standbys that hold data of the old primary
 then cannot stream (they stay out of `<cluster>-ro`) and must be re-cloned.
 
 ### Changing the replication password
 
 Editing `replication-password` in `<cluster>-credentials` sets the new
-password on the primary and restarts the standby pods (not the primary) so
-they read it; the standbys reconnect within seconds and `<cluster>-ro` is
-briefly unavailable.
+password on the primary and then restarts the standby pods **one at a time**
+(highest ordinal first; the next one only once the previous one streams again,
+or after 10 minutes), so `<cluster>-ro` keeps serving from the others. The
+primary is not restarted. The rollout is recorded in the
+`pgop.ruck.io/replication-password-rollout` annotation of the Secret.
 
 ### Manual scaling of the StatefulSet
 
@@ -312,9 +315,14 @@ physical backup), where `ALTER ROLE` would fail. Known limitations:
   separately.
 - **Clusters with standbys:** after a restore, the hook skipped the password
   sync while the server was recovering, so the primary may reject the
-  operator password (`28P01`) once recovery ends. The operator then restarts
-  the primary pod once per password value, which syncs it. If the server
-  stays paused in recovery, resume or promote it first.
+  operator password (`28P01`) once recovery ends. The operator cannot tell
+  from a failed login whether the server is still recovering, so it restarts
+  the primary pod and retries with a growing delay (after 5, 10, 20 and 40
+  minutes; at most 5 restarts per password value, recorded in the
+  `pgop.ruck.io/password-sync-restart` annotation of the credentials Secret,
+  which is cleared once the login works). A restart while the server is still
+  paused in recovery does not sync the password; resume or promote it, and a
+  later attempt (or deleting the primary pod by hand) completes the sync.
 
 ## Backups and restores
 

@@ -20,6 +20,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"slices"
 	"strings"
 	"time"
@@ -184,6 +187,61 @@ var _ = Describe("Replication helpers", func() {
 		Expect(statefulSetReplicas(c, sts)).To(Equal(int32(1)))
 	})
 
+	Context("bootstrap script", func() {
+		// run executes bootstrapScript for pod ordinal 0 in a temp dir.
+		run := func(marker bool, pgVersion bool) (string, error) {
+			dir := GinkgoT().TempDir()
+			pgdata := filepath.Join(dir, "data")
+			if pgVersion {
+				Expect(os.MkdirAll(pgdata, 0o700)).To(Succeed())
+				Expect(os.WriteFile(filepath.Join(pgdata, "PG_VERSION"), []byte("18\n"), 0o600)).To(Succeed())
+			}
+			markerPath := filepath.Join(dir, "hba", initializedMarkerKey)
+			if marker {
+				Expect(os.MkdirAll(filepath.Dir(markerPath), 0o755)).To(Succeed())
+				Expect(os.WriteFile(markerPath, []byte(initializedMarkerValue), 0o600)).To(Succeed())
+			}
+			cmd := exec.Command(shBin, "-c", bootstrapScript)
+			cmd.Env = []string{
+				"PATH=" + os.Getenv("PATH"),
+				"POD_NAME=pg-0",
+				"PGDATA=" + pgdata,
+				"PGUSER=pgop_replicator",
+				"PGPASSWORD=pa:ss\\word",
+				"PGPORT=5432",
+				"PGCONNECT_TIMEOUT=1",
+				"PGOP_READ_ONLY_HOST=pgop-test.invalid",
+				"PGOP_PASSFILE=" + filepath.Join(dir, "run", "replication.pgpass"),
+				"PGOP_INITIALIZED_MARKER=" + markerPath,
+			}
+			out, err := cmd.CombinedOutput()
+			if err == nil {
+				pass, readErr := os.ReadFile(filepath.Join(dir, "run", "replication.pgpass"))
+				Expect(readErr).NotTo(HaveOccurred())
+				Expect(string(pass)).To(Equal("*:*:*:pgop_replicator:pa\\:ss\\\\word\n"), "':' and '\\' are escaped")
+			}
+			return string(out), err
+		}
+
+		It("refuses to initialize an empty primary once the Cluster held data", func() {
+			out, err := run(true, false)
+			Expect(err).To(HaveOccurred())
+			Expect(out).To(ContainSubstring("refusing to initialize an empty primary data directory"))
+			Expect(out).To(ContainSubstring("pgop.ruck.io/allow-primary-init"))
+		})
+
+		It("lets an empty primary initialize without the marker", func() {
+			out, err := run(false, false)
+			Expect(err).NotTo(HaveOccurred(), out)
+		})
+
+		It("starts an existing data directory even with the marker", func() {
+			out, err := run(true, true)
+			Expect(err).NotTo(HaveOccurred(), out)
+			Expect(out).To(ContainSubstring("using the existing data directory"))
+		})
+	})
+
 	It("adds -ro names to operator-requested certificates only with standbys", func() {
 		Expect(serverDNSNames(cluster(1, nil))).NotTo(ContainElement(ContainSubstring("-ro")))
 		Expect(serverDNSNames(cluster(2, nil))).To(ContainElements("pg-ro.ns.svc.cluster.local", "pg-ro"))
@@ -236,6 +294,7 @@ type fakeReplicationServer struct {
 	createdRole []postgres.RoleOptions
 	slots       []postgres.ReplicationSlot
 	created     []string
+	reserved    []bool
 	dropped     []string
 	standbys    []postgres.StandbyStatus
 	err         error
@@ -256,8 +315,9 @@ func (f *fakeReplicationServer) CreateRole(_ context.Context, name string, opts 
 func (f *fakeReplicationServer) ReplicationSlots(context.Context) ([]postgres.ReplicationSlot, error) {
 	return slices.Clone(f.slots), f.err
 }
-func (f *fakeReplicationServer) CreatePhysicalReplicationSlot(_ context.Context, name string) error {
+func (f *fakeReplicationServer) CreatePhysicalReplicationSlot(_ context.Context, name string, reserve bool) error {
 	f.created = append(f.created, name)
+	f.reserved = append(f.reserved, reserve)
 	f.slots = append(f.slots, postgres.ReplicationSlot{Name: name, Physical: true})
 	return nil
 }
@@ -853,6 +913,7 @@ var _ = Describe("Cluster replication", func() {
 			reconcileOnce(r)
 			Expect(fake.dropped).To(ConsistOf("pgop_replica_1"))
 			Expect(fake.created).To(Equal([]string{"pgop_replica_1", "pgop_replica_1"}))
+			Expect(fake.reserved).To(Equal([]bool{true, false}), "the replacement does not reserve WAL")
 			Expect(condition().Message).To(ContainSubstring("re-clone"))
 			Expect(recorder.Events).To(Receive(ContainSubstring("ReplicationSlotInvalidated")))
 
@@ -940,11 +1001,15 @@ var _ = Describe("Cluster replication", func() {
 			Expect(got.Data).To(HaveKey(initializedMarkerKey))
 		})
 
-		It("restarts only the standbys when the replication password changes", func() {
+		It("restarts the standbys one at a time when the replication password changes", func() {
 			create(newCluster(3))
 			r := newReconciler()
 			reconcileOnce(r)
 			p0, p1, p2 := createPod(0, true), createPod(1, true), createPod(2, true)
+			fake.standbys = []postgres.StandbyStatus{
+				{ApplicationName: name + "-1", State: walSenderStreaming},
+				{ApplicationName: name + "-2", State: walSenderStreaming},
+			}
 			reconcileOnce(r)
 			Expect(fake.createdRole).To(HaveLen(1))
 			gone := func(p *corev1.Pod) bool {
@@ -953,37 +1018,99 @@ var _ = Describe("Cluster replication", func() {
 				return apierrors.IsNotFound(err) || (err == nil && got.UID != p.UID)
 			}
 			Expect(gone(p1)).To(BeFalse(), "creating the role does not restart standbys")
+			secret := func() *corev1.Secret {
+				s := &corev1.Secret{}
+				Expect(k8sClient.Get(ctx, key(name+"-credentials"), s)).To(Succeed())
+				return s
+			}
+			// Pod creation times have a resolution of one second.
+			time.Sleep(1100 * time.Millisecond)
 
-			secret := &corev1.Secret{}
-			Expect(k8sClient.Get(ctx, key(name+"-credentials"), secret)).To(Succeed())
-			secret.Data[SecretKeyReplicationPassword] = []byte("rotated")
-			Expect(k8sClient.Update(ctx, secret)).To(Succeed())
+			s := secret()
+			s.Data[SecretKeyReplicationPassword] = []byte("rotated")
+			Expect(k8sClient.Update(ctx, s)).To(Succeed())
 			reconcileOnce(r)
 			Expect(fake.createdRole).To(HaveLen(2))
+			Expect(secret().Annotations).To(HaveKey(AnnotationReplicationPasswordRollout))
 			Expect(gone(p0)).To(BeFalse())
-			Eventually(func() bool { return gone(p1) && gone(p2) }).Should(BeTrue())
+			Expect(gone(p2)).To(BeTrue(), "the highest standby restarts first")
+			Expect(gone(p1)).To(BeFalse(), "one standby at a time")
+
+			By("the next standby waits until the restarted one streams again")
+			time.Sleep(1100 * time.Millisecond)
+			fake.standbys = fake.standbys[:1]
+			newP2 := createPod(2, false)
+			reconcileOnce(r)
+			Expect(gone(p1)).To(BeFalse())
+			Expect(fake.createdRole).To(HaveLen(2), "the password is not re-sent")
+
+			ensureSTSPod(getSTS(), 2, true)
+			fake.standbys = append(fake.standbys, postgres.StandbyStatus{ApplicationName: name + "-2", State: walSenderStreaming})
+			reconcileOnce(r)
+			Expect(gone(p1)).To(BeTrue())
+			Expect(gone(newP2)).To(BeFalse())
+
+			By("the rollout ends once every standby was restarted")
+			createPod(1, true)
+			reconcileOnce(r)
+			Expect(secret().Annotations).NotTo(HaveKey(AnnotationReplicationPasswordRollout))
+			Expect(gone(p0)).To(BeFalse())
 		})
 
-		It("restarts the primary once when it rejects the operator password", func() {
+		It("retries restarting a primary that rejects the operator password, with a growing delay", func() {
 			create(newCluster(2))
 			r := newReconciler()
+			now := time.Now()
+			r.Now = func() time.Time { return now }
+			loginFails := true
 			connectErr := &pq.Error{Code: pqCodeInvalidPassword, Message: "password authentication failed"}
 			r.ConnectReplicationServer = func(context.Context, postgres.ConnectionConfig) (ReplicationServer, error) {
-				return nil, fmt.Errorf("failed to ping database: %w", connectErr)
+				if loginFails {
+					return nil, fmt.Errorf("failed to ping database: %w", connectErr)
+				}
+				return fake, nil
 			}
 			reconcileOnce(r)
+			restarted := func(p *corev1.Pod) bool {
+				return apierrors.IsNotFound(k8sClient.Get(ctx, key(p.Name), &corev1.Pod{}))
+			}
+			record := func() string {
+				s := &corev1.Secret{}
+				Expect(k8sClient.Get(ctx, key(name+"-credentials"), s)).To(Succeed())
+				return s.Annotations[AnnotationPasswordSyncRestart]
+			}
+
+			By("28P01 while the restored primary is still paused in recovery: restart, still rejected")
 			p0 := createPod(0, true)
 			reconcileOnce(r)
-			Eventually(func() bool {
-				return apierrors.IsNotFound(k8sClient.Get(ctx, key(p0.Name), &corev1.Pod{}))
-			}).Should(BeTrue())
+			Eventually(func() bool { return restarted(p0) }).Should(BeTrue())
 			Expect(condition().Reason).To(Equal(ReasonReplicationError))
+			Expect(record()).To(HaveSuffix(fmt.Sprintf("/1/%d", now.Unix())), "an attempt, not 'done'")
 
-			By("not again for the same password")
+			By("no immediate second restart")
 			p0 = createPod(0, true)
 			reconcileOnce(r)
-			Consistently(func() error { return k8sClient.Get(ctx, key(p0.Name), &corev1.Pod{}) },
-				time.Second, 200*time.Millisecond).Should(Succeed())
+			Consistently(func() bool { return restarted(p0) }, time.Second, 200*time.Millisecond).Should(BeFalse())
+
+			By("after the delay (recovery resumed meanwhile) the primary is restarted again")
+			now = now.Add(passwordSyncFirstBackoff + time.Second)
+			reconcileOnce(r)
+			Eventually(func() bool { return restarted(p0) }).Should(BeTrue())
+			Expect(record()).To(ContainSubstring("/2/"))
+
+			By("once the login works the record is cleared")
+			loginFails = false
+			createPod(0, true)
+			reconcileOnce(r)
+			Expect(record()).To(BeEmpty())
+		})
+
+		It("bounds the password-sync restarts per password", func() {
+			state := passwordSyncRestart{Fingerprint: "fp", Attempts: passwordSyncMaxAttempts, Last: time.Unix(1, 0)}
+			Expect(parsePasswordSyncRestart(state.String())).To(Equal(state))
+			Expect(parsePasswordSyncRestart("legacy-value")).To(Equal(passwordSyncRestart{}))
+			Expect(passwordSyncBackoff(1)).To(Equal(5 * time.Minute))
+			Expect(passwordSyncBackoff(4)).To(Equal(40 * time.Minute))
 		})
 	})
 })

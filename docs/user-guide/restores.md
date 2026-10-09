@@ -66,13 +66,36 @@ spec:
   targetTime: "2026-01-01T06:00:00Z"   # optional PITR target
 ```
 
-!!! warning "Physical restore rewrites the data directory"
+!!! warning "Physical restores are not automated end to end"
     A physical restore overwrites PostgreSQL's data directory with
-    `pgbackrest restore --delta`. The target Cluster **must be stopped** (scale
-    its StatefulSet to `0` replicas) with its data volume available before the
-    restore Job runs, and started again afterward. The operator issues the
-    restore command but does not automate the stop/start dance — do that as part
-    of your recovery runbook.
+    `pgbackrest restore --delta`, so the server must be stopped while it runs.
+    pgop does not do this for you, and two things stand in the way today:
+
+    - **The Cluster cannot be stopped through pgop.** `spec.replicas` has a
+      minimum of 1, and the operator reverts a manual
+      `kubectl scale statefulset <cluster> --replicas=0` on its next reconcile.
+      Deleting the StatefulSet with `--cascade=orphan` does not help either:
+      the operator recreates it and it adopts the running pod again.
+    - **The restore Job does not mount the Cluster's data volume.** It runs
+      `pgbackrest restore` with only the pgBackRest configuration and a
+      scratch directory mounted, so it cannot write into `data-<cluster>-0`.
+
+    Until this is automated, a physical restore is a manual procedure:
+
+    1. Stop the operator: `kubectl -n <operator-namespace> scale deployment
+       <operator-deployment> --replicas=0` (this pauses reconciliation of
+       **every** Cluster it manages).
+    2. Scale the StatefulSet to 0: `kubectl scale statefulset <cluster>
+       --replicas=0`, and wait until the pods are gone.
+    3. Run `pgbackrest restore --delta` (with your `--type`/`--target`
+       options) in a pod that mounts `data-<cluster>-0` at the Cluster's data
+       path and the `<backup>-pgbackrest` ConfigMap at `/etc/pgbackrest`, as
+       the postgres user (UID 999).
+    4. Scale the operator back up; it restores the StatefulSet's replicas.
+
+    For a point-in-time target, prefer `--target-action=promote`: see
+    [Replication → Restores and the password-sync hook](replication.md#restores-and-the-password-sync-hook)
+    for why a server left paused in recovery is a problem.
 
 !!! warning "Clusters with standbys"
     A physical restore only rewrites the primary's volume (`data-<cluster>-0`);

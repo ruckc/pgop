@@ -119,6 +119,15 @@ const (
 	initializedMarkerKey   = "pgop-initialized"
 	initializedMarkerValue = "The Cluster holds data; pgop refuses to initialize an empty primary data directory.\n"
 
+	// passwordSyncMaxAttempts and passwordSyncFirstBackoff bound the primary
+	// restarts of restartPrimaryForPasswordSync per password value.
+	passwordSyncMaxAttempts  = 5
+	passwordSyncFirstBackoff = 5 * time.Minute
+
+	// rolloutStandbyTimeout is how long a password rollout waits for a
+	// restarted standby to stream again before restarting the next one.
+	rolloutStandbyTimeout = 10 * time.Minute
+
 	// pqCodeInvalidPassword is SQLSTATE 28P01 (invalid_password).
 	pqCodeInvalidPassword = "28P01"
 )
@@ -679,7 +688,7 @@ type ReplicationServer interface {
 	RoleExists(ctx context.Context, name string) (bool, error)
 	CreateRole(ctx context.Context, name string, opts postgres.RoleOptions) error
 	ReplicationSlots(ctx context.Context) ([]postgres.ReplicationSlot, error)
-	CreatePhysicalReplicationSlot(ctx context.Context, name string) error
+	CreatePhysicalReplicationSlot(ctx context.Context, name string, reserve bool) error
 	DropReplicationSlot(ctx context.Context, name string) error
 	ReplicationStatus(ctx context.Context) ([]postgres.StandbyStatus, error)
 	Close() error
@@ -763,6 +772,9 @@ func (r *ClusterReconciler) reconcileReplication(ctx context.Context, cluster *p
 		return fail("Cannot connect to the primary", err)
 	}
 	defer func() { _ = srv.Close() }()
+	if err := r.clearPasswordSyncRestart(ctx, secret); err != nil {
+		return fail("Cannot update the credentials Secret", err)
+	}
 
 	// The read-write Service must reach the primary; never manage slots on
 	// (or report health of) a standby.
@@ -775,7 +787,7 @@ func (r *ClusterReconciler) reconcileReplication(ctx context.Context, cluster *p
 		return fail("Cannot record that the Cluster is initialized", err)
 	}
 
-	if err := r.ensureReplicationRole(ctx, cluster, secret, srv, pods); err != nil {
+	if err := r.ensureReplicationRole(ctx, cluster, secret, srv); err != nil {
 		return fail("Cannot set up the replication role", err)
 	}
 	podExists := map[int]bool{}
@@ -805,7 +817,15 @@ func (r *ClusterReconciler) reconcileReplication(ctx context.Context, cluster *p
 	if err := r.labelStreaming(ctx, cluster, pods, streaming); err != nil {
 		return fail("Cannot label the standbys", err)
 	}
-	return reportStreaming(cluster, want, streaming, recreated)
+	rolling, err := r.rolloutReplicationPassword(ctx, cluster, secret, pods)
+	if err != nil {
+		return fail("Cannot restart the standbys for the new replication password", err)
+	}
+	recheck := reportStreaming(cluster, want, streaming, recreated)
+	if rolling {
+		recheck = min(recheck, replicationRetryInterval)
+	}
+	return recheck
 }
 
 // reportStreaming sets ReplicationHealthy from the standbys that stream and
@@ -884,24 +904,72 @@ func (r *ClusterReconciler) labelStreaming(ctx context.Context, cluster *postgre
 	return nil
 }
 
-// restartPrimaryForPasswordSync deletes the primary pod once when the
-// operator's password is rejected (28P01) by a primary that is not in
-// recovery: the recovery-aware postStart hook skips the password sync while
-// a restored server is still recovering, so after a restore the password is
-// only synced on the next start. At most one restart per operator password,
-// recorded on the credentials Secret, so a password that keeps failing does
-// not cause a restart loop.
+// passwordSyncRestart is the state of restartPrimaryForPasswordSync, kept
+// in the AnnotationPasswordSyncRestart annotation of the credentials Secret
+// as "<fingerprint>/<attempts>/<unix time of the last attempt>".
+type passwordSyncRestart struct {
+	Fingerprint string
+	Attempts    int
+	Last        time.Time
+}
+
+func parsePasswordSyncRestart(v string) passwordSyncRestart {
+	parts := strings.Split(v, "/")
+	if len(parts) != 3 {
+		return passwordSyncRestart{}
+	}
+	attempts, err1 := strconv.Atoi(parts[1])
+	last, err2 := strconv.ParseInt(parts[2], 10, 64)
+	if err1 != nil || err2 != nil {
+		return passwordSyncRestart{}
+	}
+	return passwordSyncRestart{Fingerprint: parts[0], Attempts: attempts, Last: time.Unix(last, 0)}
+}
+
+func (p passwordSyncRestart) String() string {
+	return fmt.Sprintf("%s/%d/%d", p.Fingerprint, p.Attempts, p.Last.Unix())
+}
+
+// passwordSyncBackoff is the wait before restart attempt n+1 (n >= 1):
+// 5, 10, 20, 40 and 80 minutes.
+func passwordSyncBackoff(attempts int) time.Duration {
+	return passwordSyncFirstBackoff << (attempts - 1)
+}
+
+// restartPrimaryForPasswordSync restarts the primary pod when it rejects the
+// operator's password (28P01). The recovery-aware postStart hook skips the
+// password sync while a restored server is still recovering, so after a
+// restore the password is only synced by a start after recovery ended. A
+// failed login cannot tell whether the server is still recovering (for
+// example paused at a point-in-time target), so instead of a single restart
+// the operator retries with a growing delay (passwordSyncBackoff, at most
+// passwordSyncMaxAttempts per password value) and clears the record once it
+// can log in again (clearPasswordSyncRestart). A password that keeps failing
+// therefore causes a bounded number of restarts, and a primary that is
+// resumed or promoted after a restart is still picked up by a later attempt.
 func (r *ClusterReconciler) restartPrimaryForPasswordSync(ctx context.Context, cluster *postgresv1alpha1.Cluster,
 	secret *corev1.Secret, primary *corev1.Pod) {
+	log := logf.FromContext(ctx)
 	fp := replicationPasswordFingerprint(cluster, "operator\x00"+string(secret.Data[SecretKeyPassword]))
-	if secret.Annotations[AnnotationPasswordSyncRestart] == fp {
+	state := parsePasswordSyncRestart(secret.Annotations[AnnotationPasswordSyncRestart])
+	if state.Fingerprint != fp {
+		state = passwordSyncRestart{Fingerprint: fp}
+	}
+	now := r.now()
+	switch {
+	case state.Attempts >= passwordSyncMaxAttempts:
+		log.Info("The primary still rejects the operator password; not restarting it again",
+			"attempts", state.Attempts)
+		return
+	case state.Attempts > 0 && now.Before(state.Last.Add(passwordSyncBackoff(state.Attempts))):
 		return
 	}
-	log := logf.FromContext(ctx)
+	state.Attempts++
+	state.Last = now
 	if secret.Annotations == nil {
 		secret.Annotations = map[string]string{}
 	}
-	secret.Annotations[AnnotationPasswordSyncRestart] = fp
+	secret.Annotations[AnnotationPasswordSyncRestart] = state.String()
 	if err := r.Update(ctx, secret); err != nil {
 		log.Error(err, "Failed to record the password-sync restart")
 		return
@@ -910,11 +978,23 @@ func (r *ClusterReconciler) restartPrimaryForPasswordSync(ctx context.Context, c
 		log.Error(err, "Failed to restart the primary to sync the operator password")
 		return
 	}
-	log.Info("Restarted the primary: it rejects the operator password, which is synced on start")
+	log.Info("Restarted the primary: it rejects the operator password, which is synced on start",
+		"attempt", state.Attempts)
 	if r.Recorder != nil {
 		r.Recorder.Eventf(cluster, primary, corev1.EventTypeWarning, "OperatorPasswordRejected", "RestartPrimary",
-			"The primary rejects the operator password; restarting it once so the postStart hook syncs the password")
+			"The primary rejects the operator password; restarted it so the postStart hook syncs the password "+
+				"(attempt %d of %d; a server still in recovery is retried later)", state.Attempts, passwordSyncMaxAttempts)
 	}
+}
+
+// clearPasswordSyncRestart removes the restart record once the operator can
+// log in to the primary again.
+func (r *ClusterReconciler) clearPasswordSyncRestart(ctx context.Context, secret *corev1.Secret) error {
+	if _, ok := secret.Annotations[AnnotationPasswordSyncRestart]; !ok {
+		return nil
+	}
+	delete(secret.Annotations, AnnotationPasswordSyncRestart)
+	return r.Update(ctx, secret)
 }
 
 // markInitialized records in the pg_hba ConfigMap (mounted into the
@@ -966,12 +1046,10 @@ func (r *ClusterReconciler) primaryVolumeMissing(ctx context.Context, cluster *p
 // primary and converges its password to the credentials Secret. The password
 // is sent as a SCRAM verifier and only when the role is missing or the
 // Secret's fingerprint annotation does not match, so it is not re-sent on
-// every reconcile. When the password changed, the standby pods are deleted:
-// their bootstrap init container writes the password file the WAL receiver
-// uses, so they pick up the new password on restart. The primary is not
-// restarted.
+// every reconcile. When the password changed, a rollout is recorded and the
+// standbys are restarted one by one (rolloutReplicationPassword).
 func (r *ClusterReconciler) ensureReplicationRole(ctx context.Context, cluster *postgresv1alpha1.Cluster,
-	secret *corev1.Secret, srv ReplicationServer, pods []corev1.Pod) error {
+	secret *corev1.Secret, srv ReplicationServer) error {
 	password := string(secret.Data[SecretKeyReplicationPassword])
 	if password == "" {
 		return fmt.Errorf("credentials Secret %q has no %q", secret.Name, SecretKeyReplicationPassword)
@@ -993,36 +1071,71 @@ func (r *ClusterReconciler) ensureReplicationRole(ctx context.Context, cluster *
 	}); err != nil {
 		return err
 	}
-	if exists && recorded != "" {
-		if err := r.restartStandbys(ctx, cluster, pods); err != nil {
-			return err
-		}
-	}
 	if secret.Annotations == nil {
 		secret.Annotations = map[string]string{}
 	}
 	secret.Annotations[AnnotationReplicationPasswordFingerprint] = fingerprint
+	if exists && recorded != "" {
+		// Record the rollout together with the new fingerprint, before any
+		// standby is restarted, so a conflicting update cannot start a
+		// second wave of restarts (see rolloutReplicationPassword).
+		secret.Annotations[AnnotationReplicationPasswordRollout] = strconv.FormatInt(r.now().Unix(), 10)
+	}
 	return r.Update(ctx, secret)
 }
 
-// restartStandbys deletes the standby pods so the StatefulSet recreates
-// them (with a fresh replication password file).
-func (r *ClusterReconciler) restartStandbys(ctx context.Context, cluster *postgresv1alpha1.Cluster, pods []corev1.Pod) error {
+// rolloutReplicationPassword restarts the standbys one at a time after the
+// replication password changed: their bootstrap init container writes the
+// password file the WAL receiver uses, so a standby started before the
+// change (recorded in AnnotationReplicationPasswordRollout) cannot
+// reconnect. The next standby is only restarted once the previous one is
+// ready and streams again (or rolloutStandbyTimeout passed), so the
+// read-only Service never loses every standby at once. The primary is not
+// restarted. Returns whether the rollout is still in progress.
+func (r *ClusterReconciler) rolloutReplicationPassword(ctx context.Context, cluster *postgresv1alpha1.Cluster,
+	secret *corev1.Secret, pods []corev1.Pod) (bool, error) {
+	v, ok := secret.Annotations[AnnotationReplicationPasswordRollout]
+	if !ok {
+		return false, nil
+	}
+	sinceUnix, _ := strconv.ParseInt(v, 10, 64)
+	since := time.Unix(sinceUnix, 0)
+	var stale *corev1.Pod
+	staleOrdinal := -1
 	for i := range pods {
 		pod := &pods[i]
-		if ordinal, _ := podOrdinal(cluster, pod.Name); ordinal == 0 || pod.DeletionTimestamp != nil {
+		ordinal, _ := podOrdinal(cluster, pod.Name)
+		if ordinal == 0 || pod.DeletionTimestamp != nil {
 			continue
 		}
-		if err := r.Delete(ctx, pod, client.Preconditions{UID: &pod.UID}); err != nil && !apierrors.IsNotFound(err) {
-			return fmt.Errorf("failed to restart standby %s: %w", pod.Name, err)
+		if !pod.CreationTimestamp.After(since) {
+			if ordinal > staleOrdinal {
+				stale, staleOrdinal = pod, ordinal
+			}
+			continue
 		}
-		logf.FromContext(ctx).Info("Restarted a standby for the new replication password", "pod", pod.Name)
+		// Restarted after the change: wait until it is back.
+		back := isPodReady(pod) && pod.Labels[LabelStreaming] == labelValueTrue
+		if !back && r.now().Before(pod.CreationTimestamp.Add(rolloutStandbyTimeout)) {
+			return true, nil
+		}
 	}
-	if r.Recorder != nil {
-		r.Recorder.Eventf(cluster, nil, corev1.EventTypeNormal, "ReplicationPasswordChanged", "RestartStandbys",
-			"The replication password changed; restarted the standbys to load it")
+	if stale == nil {
+		delete(secret.Annotations, AnnotationReplicationPasswordRollout)
+		if err := r.Update(ctx, secret); err != nil {
+			return true, err
+		}
+		if r.Recorder != nil {
+			r.Recorder.Eventf(cluster, nil, corev1.EventTypeNormal, "ReplicationPasswordChanged", "RestartStandbys",
+				"Every standby was restarted with the new replication password")
+		}
+		return false, nil
 	}
-	return nil
+	if err := r.Delete(ctx, stale, client.Preconditions{UID: &stale.UID}); err != nil && !apierrors.IsNotFound(err) {
+		return true, fmt.Errorf("failed to restart standby %s: %w", stale.Name, err)
+	}
+	logf.FromContext(ctx).Info("Restarted a standby for the new replication password", "pod", stale.Name)
+	return true, nil
 }
 
 // reconcileReplicationSlots manages the operator's slots on the primary:
@@ -1031,8 +1144,11 @@ func (r *ClusterReconciler) restartStandbys(ctx context.Context, cluster *postgr
 //     exists, not ahead of time, so a slot never holds back WAL for a standby
 //     that is still waiting for its predecessors to start;
 //   - an invalidated slot (wal_status "lost") that is not in use is dropped
-//     and re-created, so re-cloning the standby works; its pod names are
-//     returned (the standby itself must be re-cloned);
+//     and re-created without reserving WAL (the stale standby cannot use it,
+//     so it must not hold back WAL until it is invalidated again; it starts
+//     reserving once the re-cloned standby streams over it), so re-cloning
+//     the standby works; its pod names are returned (the standby itself must
+//     be re-cloned);
 //   - the slots of scaled-away standbys are dropped once they are not in use
 //     and their data PVC is gone or being deleted (a standby scaled back up
 //     before its PVC was removed resumes from its slot). pvcs is the set of
@@ -1045,6 +1161,7 @@ func (r *ClusterReconciler) reconcileReplicationSlots(ctx context.Context, clust
 		return nil, err
 	}
 	existing := map[string]bool{}
+	lost := map[string]bool{}
 	var recreated []string
 	for _, s := range slots {
 		ordinal, ok := slotOrdinal(s.Name)
@@ -1068,6 +1185,7 @@ func (r *ClusterReconciler) reconcileReplicationSlots(ctx context.Context, clust
 			}
 			pod := fmt.Sprintf("%s-%d", cluster.Name, ordinal)
 			recreated = append(recreated, pod)
+			lost[s.Name] = true
 			log.Info("Dropped an invalidated replication slot", "slot", s.Name)
 			if r.Recorder != nil {
 				r.Recorder.Eventf(cluster, nil, corev1.EventTypeWarning, "ReplicationSlotInvalidated", "RecreateSlot",
@@ -1080,7 +1198,7 @@ func (r *ClusterReconciler) reconcileReplicationSlots(ctx context.Context, clust
 	}
 	for i := 1; i < int(want); i++ {
 		if name := replicationSlotName(i); !existing[name] && podExists[i] {
-			if err := srv.CreatePhysicalReplicationSlot(ctx, name); err != nil {
+			if err := srv.CreatePhysicalReplicationSlot(ctx, name, !lost[name]); err != nil {
 				return recreated, err
 			}
 		}

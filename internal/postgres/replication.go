@@ -78,11 +78,12 @@ func (c *Client) ReplicationSlots(ctx context.Context) ([]ReplicationSlot, error
 	return out, nil
 }
 
-// CreatePhysicalReplicationSlot creates a physical replication slot that
-// reserves WAL right away, so a standby cloned from this point on finds all
-// the WAL it needs.
-func (c *Client) CreatePhysicalReplicationSlot(ctx context.Context, name string) error {
-	if _, err := c.db.ExecContext(ctx, "SELECT pg_create_physical_replication_slot($1, true)", name); err != nil {
+// CreatePhysicalReplicationSlot creates a physical replication slot. With
+// reserve it reserves WAL right away, so a standby cloned from this point on
+// finds all the WAL it needs; otherwise it only starts reserving WAL once a
+// standby streams over it.
+func (c *Client) CreatePhysicalReplicationSlot(ctx context.Context, name string, reserve bool) error {
+	if _, err := c.db.ExecContext(ctx, "SELECT pg_create_physical_replication_slot($1, $2)", name, reserve); err != nil {
 		return fmt.Errorf("failed to create replication slot %q: %w", name, err)
 	}
 	return nil
