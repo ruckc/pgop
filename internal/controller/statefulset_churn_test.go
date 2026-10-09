@@ -34,7 +34,7 @@ import (
 var _ = Describe("StatefulSet convergence", func() {
 	It("does not write an unchanged StatefulSet (no perpetual no-op updates)", func() {
 		name := fmt.Sprintf("churn-%d", time.Now().UnixNano())
-		c := &postgresv1alpha1.Cluster{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+		c := &postgresv1alpha1.Cluster{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testReplicationNamespace},
 			Spec: postgresv1alpha1.ClusterSpec{Replicas: 2, TLS: &postgresv1alpha1.ClusterTLSSpec{}}}
 		Expect(k8sClient.Create(ctx, c)).To(Succeed())
 		updates := 0
