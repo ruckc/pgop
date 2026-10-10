@@ -136,7 +136,7 @@ Unset or `true` leaves PostgreSQL's default alone (and restores what pgop revoke
 | `ready` | Whether the database is ready |
 | `databaseName` | The effective PostgreSQL database name that was reconciled |
 | `installedExtensions` | The extensions of `extensions` that are installed |
-| `extensions` | Per extension: installed `version` and `schema`, whether pgop `created` it, `dropOnRemoval` as last reconciled, `reason`/`message` when it is not as requested, `skippedObjects` (see [Extensions](#extensions)) |
+| `extensions` | Per extension: installed `version` and `schema`, whether pgop `created` it (with the installation's `oid` and `owner`), `dropOnRemoval` as last reconciled, `reason`/`message` when it is not as requested, `skippedObjects` (see [Extensions](#extensions)) |
 | `managedExtensionGrants` | Privileges pgop added on extension objects, per extension, grantee and kind (revoked when removed from `extensions[].grants`) |
 | `createdSchemas` | Schemas the Database manages (created by it, or existing and owned by the declared or database owner) |
 | `managedGrants` | Database privileges and grant options pgop added (revoked when removed from `grants`) |
@@ -683,6 +683,19 @@ extension there is the Cluster editor's explicit decision to let pgop install
 it as a superuser; grants on its objects still follow the rules in
 [Grants on extension objects](#grants-on-extension-objects).
 
+Trust is checked for **every version whose scripts would run**, not only the
+requested one: `CREATE EXTENSION` may run an older version's install script
+and then every update script up to the requested version, and
+`ALTER EXTENSION ... UPDATE` runs every update script on its path. pgop reads
+the update paths (`pg_extension_update_paths`) and requires each version on
+them to be trusted (PostgreSQL itself checks every step for a non-superuser);
+since it cannot see which path PostgreSQL will pick for an install, it checks
+all paths that end at the requested version and start at an installable
+version. A version the server does not list in
+`pg_available_extension_versions` counts as not trusted. If any of them is not
+trusted, the extension is only installed when the Cluster lists it, and the
+[stricter schema rule](#the-schema-an-extensions-scripts-run-in) applies.
+
 A refused extension is not installed (reason `ExtensionNotAllowed`). An
 installed extension the policy no longer allows is reported the same way, is
 not updated, and the grants pgop made on its objects are revoked; it is not
@@ -749,6 +762,17 @@ by superusers only**. In practice:
   (pgop revokes what it granted) and add it back afterwards. Objects that role
   already created in the schema are not checked: review the schema before
   updating.
+
+pgop creates every missing schema an install needs itself, with a plain
+`CREATE SCHEMA` owned by the operator, before it runs `CREATE EXTENSION`:
+the extension's `schema`, and the schemas control files name (of the
+extension and of the dependencies `cascade` installs). `CREATE EXTENSION`
+would otherwise create a control-file schema itself, but it uses a schema of
+that name that already exists without checking who owns it, and between
+pgop's check and the `CREATE EXTENSION` the database owner could create it
+with planted objects. If someone creates the schema first, pgop checks it
+again with the rules above and refuses (`ExtensionSchemaNotAllowed`) unless
+it qualifies.
 
 When the control file of an extension names a schema (`schema = ...`), it is
 always installed there, and a different `schema` in the spec is refused.
@@ -821,6 +845,18 @@ pgop do it:
   (a background worker, for example) would run as that superuser. Write
   privileges on an extension's configuration tables still influence what that
   code does: grant them only to roles you would trust with the extension.
+- **Extensions the server does not trust** (installed only because the
+  Cluster lists them in `allowedExtensions`) only get read-only grants:
+  `USAGE` on the schema, `SELECT` on tables and sequences, and `EXECUTE` (by
+  the rules above). `CREATE` on their schema would let the grantee plant
+  objects where the extension's superuser-run code (background workers,
+  `SECURITY DEFINER` functions, a DBA calling its functions) resolves names,
+  and write privileges (`INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`,
+  `REFERENCES`, `MAINTAIN`, sequence `USAGE`/`UPDATE`) would let it change
+  the state that code reads: the same situation the stricter install rule
+  forbids. They are refused with reason `ExtensionGrantNotAllowed` and
+  revoked if pgop granted them earlier (for example before an update made a
+  version untrusted).
 - Skipped objects are counted in `status.extensions[].skippedObjects`; they do
   not make the Database not ready.
 - `schema` grants are only applied on a schema of the extension's own: not
@@ -850,14 +886,19 @@ which is data loss. Grants pgop made on its objects are revoked.
 
 To drop it, set `dropOnRemoval: true` and let the Database reconcile (the
 setting is recorded in `status.extensions[].dropOnRemoval`), then remove the
-entry. pgop then runs `DROP EXTENSION ... RESTRICT`, and only for an extension
-it created for this Database (`status.extensions[].created`, recorded before
-`CREATE EXTENSION` runs): an extension that was there before, or that someone
-else created while pgop was creating it (`ExtensionNotManaged`), is never
-dropped. pgop never drops with `CASCADE`: when other objects depend on the
+entry. pgop then runs `DROP EXTENSION ... RESTRICT`, and only for the
+installation it created for this Database: `status.extensions[].created` is
+recorded before `CREATE EXTENSION` runs, and the extension's `oid` and `owner`
+right after it succeeds. An extension that was there before, that someone
+else created while pgop was creating it (`ExtensionNotManaged`), that was
+dropped and created again since (another `oid`), or whose creation pgop could
+not confirm (the status write after `CREATE EXTENSION` was lost) is never
+dropped: pgop stops treating it as its own. pgop never drops with `CASCADE`: when other objects depend on the
 extension, the Database reports `ExtensionDropBlocked` and retries until they
 are gone (or the entry is listed again). Dependencies installed by `cascade`
-are not dropped.
+are not dropped. `status.extensions` holds at most 128 entries (the spec's
+extensions and the removed ones pgop still has to drop); removed extensions
+beyond that are no longer tracked, not dropped, and reported.
 
 !!! warning "Extensions must exist in the image"
     The operator does **not** install packages: `CREATE EXTENSION` only

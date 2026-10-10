@@ -80,7 +80,7 @@ func TestGrantEngineIntegration(t *testing.T) {
 	}
 	roles := []string{engOwner, engX, "eng_y"}
 	cleanup := func() {
-		_, _ = admin.ExecContext(ctx, `DROP DATABASE IF EXISTS `+db)
+		_, _ = admin.ExecContext(ctx, `DROP DATABASE IF EXISTS `+db+` WITH (FORCE)`)
 		for _, r := range roles {
 			_, _ = admin.ExecContext(ctx, `DROP ROLE IF EXISTS `+r)
 		}

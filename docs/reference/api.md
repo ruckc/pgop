@@ -364,6 +364,9 @@ spec:
           sequences: [string]  # USAGE, SELECT, UPDATE, ALL
           functions: [string]  # EXECUTE (or ALL): only SQL / PL/pgSQL functions
                                # and procedures that are not SECURITY DEFINER
+          # On an extension the server does not trust (allowed only by
+          # allowedExtensions), only USAGE (schema), SELECT (tables,
+          # sequences) and EXECUTE are granted (ExtensionGrantNotAllowed).
 
   # Schemas to create (max 64, each name at most once)
   schemas:
@@ -456,6 +459,8 @@ status:
       version: string      # Installed version (empty: not installed)
       schema: string       # Schema it is installed in
       created: boolean     # pgop created it (recorded before CREATE EXTENSION)
+      oid: integer         # pg_extension.oid of the installation pgop created
+      owner: string        # its extowner; both must still match for a drop
       dropOnRemoval: boolean   # dropOnRemoval as last reconciled
       reason: string       # Why it is not as requested (a condition reason)
       message: string

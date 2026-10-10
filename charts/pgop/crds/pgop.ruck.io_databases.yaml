@@ -132,7 +132,11 @@ spec:
                         and table privileges only on plain and partitioned tables: the other
                         objects run with the privileges of their owner (a superuser) or rely
                         on not being executable by others, and are skipped
-                        (status.extensions[].skippedObjects).
+                        (status.extensions[].skippedObjects). On an extension the server does
+                        not trust at its installed version (installed because the Cluster's
+                        allowedExtensions lists it), only read-only privileges are granted
+                        (schema USAGE, tables and sequences SELECT, functions EXECUTE): the
+                        others are refused with reason ExtensionGrantNotAllowed.
                       items:
                         description: ExtensionGrantSpec grants privileges on an extension's
                           objects to a role.
@@ -249,7 +253,9 @@ spec:
                         role can write to. The schema is checked before every CREATE EXTENSION
                         and ALTER EXTENSION ... UPDATE (reason ExtensionSchemaNotAllowed): see
                         the Database documentation. pgop never moves an installed extension to
-                        another schema.
+                        another schema. Schemas control files name are created by pgop too,
+                        before CREATE EXTENSION, so an extension never runs in a schema someone
+                        else created in the meantime.
                       maxLength: 63
                       minLength: 1
                       type: string
@@ -623,8 +629,8 @@ spec:
                     created:
                       description: |-
                         created reports that pgop created the extension for this Database
-                        (recorded before CREATE EXTENSION runs). Only such an extension is
-                        dropped by dropOnRemoval.
+                        (recorded before CREATE EXTENSION runs, and kept only once oid and
+                        owner confirm it). Only such an extension is dropped by dropOnRemoval.
                       type: boolean
                     dropOnRemoval:
                       description: |-
@@ -636,6 +642,19 @@ spec:
                       type: string
                     name:
                       description: name is the extension.
+                      type: string
+                    oid:
+                      description: |-
+                        oid and owner identify the installation pgop created
+                        (pg_extension.oid and extowner). An extension dropped and created
+                        again by someone else has another oid, so pgop no longer treats it as
+                        created by it.
+                      format: int64
+                      type: integer
+                    owner:
+                      description: |-
+                        owner is the extension's owner (pg_extension.extowner) when pgop
+                        created it.
                       type: string
                     reason:
                       description: |-

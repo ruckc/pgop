@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"strings"
 
@@ -64,8 +65,8 @@ type fakeExtClient struct {
 	available map[string]postgres.ExtensionVersionInfo
 	defaults  map[string]string
 	installed map[string]*postgres.InstalledExtension
-	// paths lists "name|from|to" update paths.
-	paths      map[string]bool
+	// paths maps "name|from|to" to the update path (versions, from first).
+	paths      map[string][]string
 	schemas    map[string]postgres.SchemaWriters
 	dbOwner    string
 	superusers map[string]bool
@@ -73,13 +74,17 @@ type fakeExtClient struct {
 	dependents map[string]bool
 	// raceOn makes CREATE EXTENSION of that name find it already created.
 	raceOn string
-	calls  []string
+	// schemaRace maps schemas that someone else creates (with these
+	// writers) right before pgop's CREATE SCHEMA.
+	schemaRace map[string]postgres.SchemaWriters
+	nextOID    int64
+	calls      []string
 }
 
 func newFakeExtClient() *fakeExtClient {
 	f := &fakeExtClient{
 		available: map[string]postgres.ExtensionVersionInfo{}, defaults: map[string]string{},
-		installed: map[string]*postgres.InstalledExtension{}, paths: map[string]bool{},
+		installed: map[string]*postgres.InstalledExtension{}, paths: map[string][]string{},
 		schemas: map[string]postgres.SchemaWriters{
 			publicSchemaName: {Exists: true, Owner: pgDatabaseOwnerRole},
 		},
@@ -100,7 +105,15 @@ func (f *fakeExtClient) offer(name, version string, trusted bool, requires ...st
 }
 
 func (f *fakeExtClient) install(name, version, schema string) {
-	f.installed[name] = &postgres.InstalledExtension{Name: name, Version: version, Schema: schema}
+	f.nextOID++
+	f.installed[name] = &postgres.InstalledExtension{Name: name, Version: version, Schema: schema,
+		OID: 16384 + f.nextOID, Owner: extOperator}
+}
+
+// path records the update path through versions (the first is the source,
+// the last the target).
+func (f *fakeExtClient) path(name string, versions ...string) {
+	f.paths[name+"|"+versions[0]+"|"+versions[len(versions)-1]] = versions
 }
 
 func (f *fakeExtClient) ExtensionVersion(_ context.Context, name, version string) (postgres.ExtensionVersionInfo, bool, error) {
@@ -119,8 +132,15 @@ func (f *fakeExtClient) InstalledExtension(_ context.Context, name string) (*pos
 	return nil, nil
 }
 
-func (f *fakeExtClient) ExtensionUpdatePathExists(_ context.Context, name, from, to string) (bool, error) {
-	return f.paths[name+"|"+from+"|"+to], nil
+func (f *fakeExtClient) ExtensionUpdatePaths(_ context.Context, name, from, to string) ([][]string, error) {
+	var out [][]string
+	for _, k := range slices.Sorted(maps.Keys(f.paths)) {
+		parts := strings.Split(k, "|")
+		if parts[0] == name && parts[2] == to && (from == "" || parts[1] == from) {
+			out = append(out, f.paths[k])
+		}
+	}
+	return out, nil
 }
 
 func (f *fakeExtClient) SchemaWriters(_ context.Context, name string) (postgres.SchemaWriters, error) {
@@ -135,6 +155,10 @@ func (f *fakeExtClient) LookupRole(_ context.Context, name string) (*postgres.Re
 
 func (f *fakeExtClient) CreateSchema(_ context.Context, name, owner string) error {
 	f.calls = append(f.calls, fmt.Sprintf("create schema %s owner=%q", name, owner))
+	if w, ok := f.schemaRace[name]; ok {
+		f.schemas[name] = w
+		return fmt.Errorf("schema %q: %w", name, postgres.ErrObjectExists)
+	}
 	f.schemas[name] = postgres.SchemaWriters{Exists: true, Owner: extOperator, OwnerSuperuser: true}
 	return nil
 }
@@ -223,7 +247,7 @@ var _ = Describe("Extensions", func() {
 			Expect(eligible.eligible).To(HaveKey(polTrgm))
 			Expect(db.Status.InstalledExtensions).To(Equal([]string{polTrgm}))
 			Expect(statusOf(db, polTrgm)).To(Equal(postgresv1alpha1.ExtensionStatus{Name: polTrgm, Version: extV16,
-				Schema: publicSchemaName, Created: true}))
+				Schema: publicSchemaName, Created: true, OID: 16385, Owner: extOperator}))
 		})
 
 		It("refuses an untrusted extension until the Cluster allows it", func() {
@@ -246,7 +270,7 @@ var _ = Describe("Extensions", func() {
 			db := newDB(postgresv1alpha1.ExtensionSpec{Name: extHstore, Version: extV14})
 			_, err := reconcileExtensions(ctx, f, db, nil, nil, nil)
 			Expect(extReason(err)).To(Equal(ReasonExtensionNotAllowed))
-			Expect(err.Error()).To(ContainSubstring("version 1.4"))
+			Expect(err.Error()).To(ContainSubstring("version(s) 1.4"))
 		})
 
 		It("reports an extension the server does not have", func() {
@@ -361,11 +385,12 @@ var _ = Describe("Extensions", func() {
 			Expect(extReason(err)).To(Equal(ReasonExtensionSchemaNotAllowed))
 			Expect(err.Error()).To(ContainSubstring("control file"))
 
-			By("installing into the control file's schema, which CREATE EXTENSION creates")
+			By("installing into the control file's schema, which pgop creates for the operator first")
 			db.Spec.Extensions[0].Schema = ""
 			_, err = reconcileExtensions(ctx, f, db, nil, nil, nil)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(f.calls).To(Equal([]string{`create extension ctl_ext schema="" version="" cascade=false`}))
+			Expect(f.calls).To(Equal([]string{`create schema ctl owner=""`,
+				`create extension ctl_ext schema="" version="" cascade=false`}), "pgop creates the control file's schema itself")
 		})
 
 		DescribeTable("refuses a schema others can write to",
@@ -418,8 +443,8 @@ var _ = Describe("Extensions", func() {
 		newHstore := func(installed string) *fakeExtClient {
 			f := newFakeExtClient().offer(extHstore, extV14, true).offer(extHstore, "1.10", true).offer(extHstore, extV18, true)
 			f.install(extHstore, installed, publicSchemaName)
-			f.paths[extHstore+"|1.4|1.8"] = true
-			f.paths[extHstore+"|1.8|1.10"] = true
+			f.path(extHstore, extV14, extV18)
+			f.path(extHstore, extV18, "1.10")
 			return f
 		}
 
@@ -442,7 +467,7 @@ var _ = Describe("Extensions", func() {
 
 		It("refuses a downgrade", func() {
 			f := newHstore(extV18)
-			f.paths[extHstore+"|1.8|1.4"] = true // even with a downgrade script
+			f.path(extHstore, extV18, extV14) // even with a downgrade script
 			db := newDB(postgresv1alpha1.ExtensionSpec{Name: extHstore, Version: extV14})
 			_, err := reconcileExtensions(ctx, f, db, nil, nil, nil)
 			Expect(extReason(err)).To(Equal(ReasonExtensionDowngradeNotAllowed))
@@ -582,6 +607,151 @@ var _ = Describe("Extensions", func() {
 			_, err = reconcileExtensions(ctx, f, db, nil, nil, nil)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(f.installed).To(HaveKey(polTrgm))
+		})
+	})
+
+	Describe("review fixes", func() {
+		ctlSchema := func(f *fakeExtClient, name, schema string) {
+			for k, info := range f.available {
+				if info.Name == name {
+					info.Schema = schema
+					f.available[k] = info
+				}
+			}
+		}
+
+		It("creates a missing control-file schema itself and refuses one someone created meanwhile", func() {
+			for _, trusted := range []bool{true, false} {
+				f := newFakeExtClient().offer(extCtl, "1.0", trusted)
+				ctlSchema(f, extCtl, "evs")
+				f.dbOwner = extDBOwner
+				// The database owner creates the schema between pgop's check
+				// and its CREATE SCHEMA, with an overload planted in it.
+				f.schemaRace = map[string]postgres.SchemaWriters{"evs": {Exists: true, Owner: extDBOwner}}
+				db := newDB(postgresv1alpha1.ExtensionSpec{Name: extCtl})
+				_, err := reconcileExtensions(ctx, f, db, allow(extCtl), nil, nil)
+				if trusted {
+					// The database owner may own the target schema of a
+					// trusted extension (it could install it itself).
+					Expect(err).NotTo(HaveOccurred())
+					continue
+				}
+				Expect(extReason(err)).To(Equal(ReasonExtensionSchemaNotAllowed))
+				Expect(err.Error()).To(ContainSubstring("while pgop was creating it"))
+				Expect(f.calls).To(Equal([]string{`create schema evs owner=""`}), "CREATE EXTENSION must not run")
+			}
+		})
+
+		It("refuses a raced control-file schema another role can write to, also for a trusted extension", func() {
+			f := newFakeExtClient().offer(extCtl, "1.0", true)
+			ctlSchema(f, extCtl, "evs")
+			f.schemaRace = map[string]postgres.SchemaWriters{"evs": {Exists: true, Owner: extEvil}}
+			db := newDB(postgresv1alpha1.ExtensionSpec{Name: extCtl})
+			_, err := reconcileExtensions(ctx, f, db, nil, nil, nil)
+			Expect(extReason(err)).To(Equal(ReasonExtensionSchemaNotAllowed))
+			Expect(f.installed).NotTo(HaveKey(extCtl))
+		})
+
+		It("creates the missing control-file schema of a cascaded dependency", func() {
+			f := newFakeExtClient().offer(extCube, "1.5", true).offer(extEarth, "1.2", true, extCube)
+			ctlSchema(f, extCube, "cubes")
+			db := newDB(postgresv1alpha1.ExtensionSpec{Name: extEarth, Cascade: true})
+			_, err := reconcileExtensions(ctx, f, db, nil, nil, nil)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(f.calls[0]).To(Equal(`create schema cubes owner=""`))
+		})
+
+		Describe("trust of every version whose scripts run", func() {
+			// 1.0 and 1.2 are trusted, 1.1 is not; 1.2 is installed from the
+			// 1.0 base script through 1.1.
+			newEvt := func() *fakeExtClient {
+				f := newFakeExtClient().offer("evt", "1.0", true).offer("evt", "1.1", false).offer("evt", "1.2", true)
+				f.path("evt", "1.0", "1.1", "1.2")
+				f.path("evt", "1.1", "1.2")
+				return f
+			}
+
+			It("refuses an install whose path runs an untrusted version's script", func() {
+				f := newEvt()
+				db := newDB(postgresv1alpha1.ExtensionSpec{Name: "evt"})
+				_, err := reconcileExtensions(ctx, f, db, nil, nil, nil)
+				Expect(extReason(err)).To(Equal(ReasonExtensionNotAllowed))
+				Expect(err.Error()).To(ContainSubstring("version(s) 1.1"))
+				Expect(f.calls).To(BeEmpty())
+
+				By("allowing it, the install is strict about schemas: public of an owned database is refused")
+				f.dbOwner = extDBOwner
+				_, err = reconcileExtensions(ctx, f, db, allow("evt"), nil, nil)
+				Expect(extReason(err)).To(Equal(ReasonExtensionSchemaNotAllowed))
+				Expect(f.calls).To(BeEmpty())
+			})
+
+			It("refuses an update through an untrusted version", func() {
+				f := newEvt()
+				f.install("evt", "1.0", publicSchemaName)
+				db := newDB(postgresv1alpha1.ExtensionSpec{Name: "evt", Version: "1.2"})
+				_, err := reconcileExtensions(ctx, f, db, nil, nil, nil)
+				Expect(extReason(err)).To(Equal(ReasonExtensionNotAllowed))
+				Expect(err.Error()).To(ContainSubstring("version(s) 1.1"))
+				Expect(f.calls).To(BeEmpty())
+
+				By("an update from 1.1 only runs the trusted 1.2 script")
+				f.install("evt", "1.1", publicSchemaName)
+				_, err = reconcileExtensions(ctx, f, db, nil, nil, nil)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(f.calls).To(Equal([]string{"update extension evt to 1.2"}))
+			})
+		})
+
+		Describe("proof of creation", func() {
+			It("does not drop an extension that was dropped and created again by someone else", func() {
+				f := newFakeExtClient().offer(polTrgm, extV16, true)
+				db := newDB(postgresv1alpha1.ExtensionSpec{Name: polTrgm, DropOnRemoval: true})
+				_, err := reconcileExtensions(ctx, f, db, nil, nil, nil)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(statusOf(db, polTrgm).OID).NotTo(BeZero())
+
+				f.install(polTrgm, extV16, publicSchemaName) // dropped and created again: another oid
+				db.Spec.Extensions = nil
+				_, err = reconcileExtensions(ctx, f, db, nil, nil, nil)
+				Expect(extReason(err)).To(Equal(ReasonExtensionNotManaged))
+				Expect(f.calls).NotTo(ContainElement("drop extension pg_trgm"))
+				Expect(f.installed).To(HaveKey(polTrgm))
+				Expect(db.Status.Extensions).To(BeEmpty())
+			})
+
+			It("does not trust an intent record without oid", func() {
+				f := newFakeExtClient().offer(polTrgm, extV16, true)
+				f.install(polTrgm, extV16, publicSchemaName)
+				db := newDB(postgresv1alpha1.ExtensionSpec{Name: polTrgm, DropOnRemoval: true})
+				// Recorded before CREATE EXTENSION, then the status write after
+				// it was lost (or someone else installed it).
+				db.Status.Extensions = []postgresv1alpha1.ExtensionStatus{{Name: polTrgm, Created: true, DropOnRemoval: true}}
+				_, err := reconcileExtensions(ctx, f, db, nil, nil, nil)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(statusOf(db, polTrgm).Created).To(BeFalse())
+				db.Spec.Extensions = nil
+				_, err = reconcileExtensions(ctx, f, db, nil, nil, nil)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(f.installed).To(HaveKey(polTrgm))
+			})
+		})
+
+		It("keeps status.extensions within its limit", func() {
+			f := newFakeExtClient()
+			db := newDB()
+			for i := range extensionStatusLimit + 2 {
+				name := fmt.Sprintf("blocked_%03d", i)
+				f.install(name, "1.0", publicSchemaName)
+				f.dependents[name] = true
+				e := f.installed[name]
+				db.Status.Extensions = append(db.Status.Extensions, postgresv1alpha1.ExtensionStatus{Name: name,
+					Created: true, DropOnRemoval: true, OID: e.OID, Owner: e.Owner})
+			}
+			_, err := reconcileExtensions(ctx, f, db, nil, nil, nil)
+			Expect(extReason(err)).To(Equal(ReasonExtensionDropBlocked))
+			Expect(err.Error()).To(ContainSubstring("status.extensions is full"))
+			Expect(db.Status.Extensions).To(HaveLen(extensionStatusLimit))
 		})
 	})
 })

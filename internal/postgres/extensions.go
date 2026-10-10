@@ -71,14 +71,19 @@ type InstalledExtension struct {
 	Name    string
 	Version string
 	Schema  string
+	// OID and Owner identify this installation: an extension dropped and
+	// created again has another OID.
+	OID   int64
+	Owner string
 }
 
 // InstalledExtension returns the extension installed in the connected
 // database under name, or nil when it is not installed.
 func (c *Client) InstalledExtension(ctx context.Context, name string) (*InstalledExtension, error) {
 	ext := &InstalledExtension{Name: name}
-	err := c.db.QueryRowContext(ctx, `SELECT e.extversion, n.nspname FROM pg_catalog.pg_extension e
-JOIN pg_catalog.pg_namespace n ON n.oid = e.extnamespace WHERE e.extname = $1`, name).Scan(&ext.Version, &ext.Schema)
+	err := c.db.QueryRowContext(ctx, `SELECT e.extversion, n.nspname, e.oid::pg_catalog.int8, pg_catalog.pg_get_userbyid(e.extowner)
+FROM pg_catalog.pg_extension e
+JOIN pg_catalog.pg_namespace n ON n.oid = e.extnamespace WHERE e.extname = $1`, name).Scan(&ext.Version, &ext.Schema, &ext.OID, &ext.Owner)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -88,17 +93,29 @@ JOIN pg_catalog.pg_namespace n ON n.oid = e.extnamespace WHERE e.extname = $1`, 
 	return ext, nil
 }
 
-// ExtensionUpdatePathExists reports whether the server has an update path
-// (a chain of update scripts) from version from to version to of the
-// extension.
-func (c *Client) ExtensionUpdatePathExists(ctx context.Context, name, from, to string) (bool, error) {
-	var exists bool
-	err := c.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM pg_catalog.pg_extension_update_paths($1)
-WHERE source = $2 AND target = $3 AND path IS NOT NULL)`, name, from, to).Scan(&exists)
+// ExtensionUpdatePaths returns the update paths (chains of update scripts)
+// of the extension that end at version to, each as the list of versions it
+// goes through, source first. With from set, only the path from that
+// version is returned (none when there is no such path).
+func (c *Client) ExtensionUpdatePaths(ctx context.Context, name, from, to string) ([][]string, error) {
+	rows, err := c.db.QueryContext(ctx, `SELECT path FROM pg_catalog.pg_extension_update_paths($1)
+WHERE target = $2 AND path IS NOT NULL AND ($3 = '' OR source = $3) ORDER BY source`, name, to, from)
 	if err != nil {
-		return false, fmt.Errorf("failed to look up the update paths of extension %q: %w", name, err)
+		return nil, fmt.Errorf("failed to look up the update paths of extension %q: %w", name, err)
 	}
-	return exists, nil
+	defer func() { _ = rows.Close() }()
+	var out [][]string
+	for rows.Next() {
+		var path string
+		if err := rows.Scan(&path); err != nil {
+			return nil, fmt.Errorf("failed to scan update path: %w", err)
+		}
+		out = append(out, strings.Split(path, "--"))
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to look up the update paths of extension %q: %w", name, err)
+	}
+	return out, nil
 }
 
 // buildCreateExtensionQuery builds CREATE EXTENSION. It never uses IF NOT

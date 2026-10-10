@@ -296,4 +296,33 @@ var _ = Describe("Extension grants", func() {
 			postgresv1alpha1.ExtensionGrantSpec{Role: grantTestLowerPublic, Functions: []string{postgres.PrivilegeExecute}})
 		Expect(reconcile(f, db, installed(extPartSch), pgVersion17)).To(MatchError(ContainSubstring("listed more than once")))
 	})
+
+	It("only grants read-only privileges on an extension the server does not trust, and revokes the others", func() {
+		f := newFakeExtGrantClient()
+		g := postgresv1alpha1.ExtensionGrantSpec{Role: grantTestRole, Schema: []string{postgres.PrivilegeAll},
+			Tables: []string{postgres.PrivilegeAll}, Sequences: []string{postgres.PrivilegeAll}, Functions: []string{postgres.PrivilegeExecute}}
+		db := newDB(g)
+		By("granting everything while it is trusted")
+		Expect(reconcile(f, db, installed(extPartSch), pgVersion17)).To(Succeed())
+		Expect(f.calls).To(ContainElement("grant CREATE,USAGE on schema partman to app wgo=false"))
+
+		By("treating it as allowed only by the Cluster")
+		f.calls = nil
+		states := extensionStates{eligible: installed(extPartSch), untrusted: map[string]bool{extPartman: true}}
+		err := reconcileExtensionGrants(ctx, f, db, states, pgVersion17, testChecker(f.fakeGrantClient, nil), nil)
+		Expect(extReason(err)).To(Equal(ReasonExtensionGrantNotAllowed))
+		Expect(err.Error()).To(ContainSubstring("does not trust"))
+		Expect(f.calls).To(ConsistOf(
+			"revoke CREATE on schema partman from app optionOnly=false cascade=false",
+			"revoke DELETE on table partman.part_config from app",
+			"revoke INSERT on table partman.part_config from app",
+			"revoke REFERENCES on table partman.part_config from app",
+			"revoke TRUNCATE on table partman.part_config from app",
+			"revoke UPDATE on table partman.part_config from app",
+			"revoke UPDATE on sequence partman.part_config_id_seq from app",
+			"revoke USAGE on sequence partman.part_config_id_seq from app",
+		))
+		Expect(f.acl[aclKey(memberObj(postgres.MemberTables, tblConfig), grantTestRole)].privileges).To(Equal([]string{postgres.PrivilegeSelect}))
+		Expect(f.acl[aclKey(memberObj(postgres.MemberRoutines, fnMaint), grantTestRole)].privileges).To(Equal([]string{postgres.PrivilegeExecute}))
+	})
 })

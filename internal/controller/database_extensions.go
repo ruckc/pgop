@@ -38,9 +38,10 @@ import (
 // may only request within limits:
 //
 //   - policy: every extension that would be installed or updated (the listed
-//     one, at the requested version, and with cascade every dependency that
-//     is not installed yet) must be marked trusted by the server for that
-//     version, or be listed in the Cluster's rolePolicy.allowedExtensions.
+//     one, and with cascade every dependency that is not installed yet) must
+//     be marked trusted by the server for every version whose scripts would
+//     run (the versions on the update paths, see installVersions), or be
+//     listed in the Cluster's rolePolicy.allowedExtensions.
 //     The dependency list is resolved before anything runs; one refused
 //     dependency refuses the whole install (ExtensionNotAllowed);
 //   - schemas: the scripts run with search_path set to the target schema (and
@@ -53,21 +54,23 @@ import (
 //     Cluster allows it (not trusted), even that is not enough: its scripts
 //     were not written to be safe for a non-superuser to install, so every
 //     such schema must be owned by a superuser and writable by superusers
-//     only. Otherwise nothing runs (ExtensionSchemaNotAllowed). A missing
-//     target schema that the spec does not list is created by pgop, owned by
-//     the operator;
+//     only. Otherwise nothing runs (ExtensionSchemaNotAllowed). Every
+//     missing schema an install needs (the target schema the spec does not
+//     list, and schemas control files name) is created by pgop, owned by the
+//     operator, before CREATE EXTENSION, which would otherwise reuse a schema
+//     created in the meantime without checking its owner;
 //   - versions: an installed extension is only ever updated to a higher
 //     version the server has an update path to; downgrades are refused;
 //   - removal: an extension removed from the spec is left installed, unless
-//     pgop created it and dropOnRemoval was recorded; then it is dropped
-//     without CASCADE.
+//     pgop created it (the installation whose oid and owner it recorded) and
+//     dropOnRemoval was recorded; then it is dropped without CASCADE.
 
 // extensionInstallClient is the subset of *postgres.Client used to install,
 // update and drop extensions (on a connection to the database).
 type extensionInstallClient interface {
 	ExtensionVersion(ctx context.Context, name, version string) (postgres.ExtensionVersionInfo, bool, error)
 	InstalledExtension(ctx context.Context, name string) (*postgres.InstalledExtension, error)
-	ExtensionUpdatePathExists(ctx context.Context, name, from, to string) (bool, error)
+	ExtensionUpdatePaths(ctx context.Context, name, from, to string) ([][]string, error)
 	SchemaWriters(ctx context.Context, name string) (postgres.SchemaWriters, error)
 	CurrentDatabaseOwner(ctx context.Context) (string, error)
 	LookupRole(ctx context.Context, name string) (*postgres.ReachableRole, error)
@@ -93,6 +96,8 @@ type extensionRun struct {
 	save           statusSaver
 	// cur is the working copy of status.extensions, by name.
 	cur map[string]postgresv1alpha1.ExtensionStatus
+	// listed are the names in spec.extensions.
+	listed map[string]bool
 }
 
 // installedExtensions maps the extensions pgop may grant on (installed and
@@ -104,6 +109,11 @@ type installedExtensions map[string]*postgres.InstalledExtension
 type extensionStates struct {
 	// eligible are the extensions pgop may grant on.
 	eligible installedExtensions
+	// untrusted lists the eligible extensions that the server does not mark
+	// trusted at their installed version (allowed only by the Cluster's
+	// allowedExtensions): grants that would let a role write where their
+	// superuser-run code reads are not applied on them.
+	untrusted map[string]bool
 	// unknown lists extensions whose state could not be read (an error that
 	// is not a refusal): the grants pgop tracks on them are left alone, so a
 	// transient error never revokes anything. allUnknown: nothing could be
@@ -111,6 +121,10 @@ type extensionStates struct {
 	unknown    map[string]bool
 	allUnknown bool
 }
+
+// extensionStatusLimit is the maxItems of status.extensions: the spec's
+// extensions (at most 64) and the removed ones pgop still has to drop.
+const extensionStatusLimit = 128
 
 // reconcileExtensions installs, updates and (with dropOnRemoval) drops the
 // Database's extensions and records them in status.extensions and
@@ -122,6 +136,7 @@ func reconcileExtensions(ctx context.Context, pg extensionInstallClient, databas
 	r := &extensionRun{
 		pg: pg, policy: policy, database: database, managedSchemas: setOf(managedSchemas),
 		specSchemas: map[string]bool{}, save: save, cur: map[string]postgresv1alpha1.ExtensionStatus{},
+		listed: map[string]bool{},
 	}
 	for _, s := range database.Spec.Schemas {
 		r.specSchemas[s.Name] = true
@@ -129,7 +144,10 @@ func reconcileExtensions(ctx context.Context, pg extensionInstallClient, databas
 	for _, st := range database.Status.Extensions {
 		r.cur[st.Name] = st
 	}
-	states := extensionStates{eligible: installedExtensions{}, unknown: map[string]bool{}}
+	states := extensionStates{eligible: installedExtensions{}, untrusted: map[string]bool{}, unknown: map[string]bool{}}
+	for _, ext := range database.Spec.Extensions {
+		r.listed[ext.Name] = true
+	}
 	if len(database.Spec.Extensions) == 0 && len(r.cur) == 0 {
 		database.Status.InstalledExtensions = nil
 		return states, nil
@@ -148,15 +166,24 @@ func reconcileExtensions(ctx context.Context, pg extensionInstallClient, databas
 	var errs []error
 	var statuses []postgresv1alpha1.ExtensionStatus
 	var installedNames []string
-	listed := map[string]bool{}
+	seen := map[string]bool{}
 	for _, ext := range database.Spec.Extensions {
-		if listed[ext.Name] {
+		if seen[ext.Name] {
 			errs = append(errs, fmt.Errorf("extensions: %q is listed more than once", ext.Name))
 			continue
 		}
-		listed[ext.Name] = true
-		st := postgresv1alpha1.ExtensionStatus{Name: ext.Name, DropOnRemoval: ext.DropOnRemoval, Created: r.cur[ext.Name].Created}
+		seen[ext.Name] = true
+		prev := r.cur[ext.Name]
+		st := postgresv1alpha1.ExtensionStatus{Name: ext.Name, DropOnRemoval: ext.DropOnRemoval,
+			Created: prev.Created, OID: prev.OID, Owner: prev.Owner}
 		inst, err := r.reconcileOne(ctx, ext, &st)
+		if inst != nil && st.Created && (st.OID == 0 || st.OID != inst.OID || st.Owner != inst.Owner) {
+			// Only an installation whose oid and owner pgop recorded right
+			// after creating it is pgop's: an intent record without them (a
+			// status write lost after CREATE EXTENSION), or an extension
+			// dropped and created again since, is not.
+			st.Created, st.OID, st.Owner = false, 0, ""
+		}
 		if err != nil {
 			errs = append(errs, err)
 			if st.Reason == "" {
@@ -169,19 +196,20 @@ func reconcileExtensions(ctx context.Context, pg extensionInstallClient, databas
 		if inst != nil {
 			st.Version, st.Schema = inst.Version, inst.Schema
 			installedNames = append(installedNames, ext.Name)
-			allowed, err := r.allowedAsInstalled(ctx, inst)
+			allowed, trusted, err := r.allowedAsInstalled(ctx, inst)
 			switch {
 			case err != nil:
 				errs = append(errs, err)
 				states.unknown[ext.Name] = true
 			case allowed:
 				states.eligible[ext.Name] = inst
+				states.untrusted[ext.Name] = !trusted
 			}
 		}
 		r.cur[ext.Name] = st
 		statuses = append(statuses, st)
 	}
-	statuses = append(statuses, r.dropRemoved(ctx, listed, &errs)...)
+	statuses = append(statuses, r.dropRemoved(ctx, len(statuses), &errs)...)
 	database.Status.Extensions = statuses
 	database.Status.InstalledExtensions = installedNames
 	return states, errors.Join(errs...)
@@ -195,13 +223,15 @@ func refuse(st *postgresv1alpha1.ExtensionStatus, reason, format string, args ..
 }
 
 // allowedAsInstalled reports whether the policy allows the extension at the
-// version it is installed at: only then are its grants applied.
-func (r *extensionRun) allowedAsInstalled(ctx context.Context, inst *postgres.InstalledExtension) (bool, error) {
-	if r.policy.AllowsExtension(inst.Name) {
-		return true, nil
-	}
+// version it is installed at (only then are its grants applied), and
+// whether the server marks that version trusted.
+func (r *extensionRun) allowedAsInstalled(ctx context.Context, inst *postgres.InstalledExtension) (allowed, trusted bool, err error) {
 	info, found, err := r.pg.ExtensionVersion(ctx, inst.Name, inst.Version)
-	return found && info.Trusted, err
+	if err != nil {
+		return false, false, err
+	}
+	trusted = found && info.Trusted
+	return trusted || r.policy.AllowsExtension(inst.Name), trusted, nil
 }
 
 // reconcileOne brings one extension to its spec and returns it as it is
@@ -226,7 +256,7 @@ func (r *extensionRun) reconcileOne(ctx context.Context, ext postgresv1alpha1.Ex
 	case ext.Version != "" && ext.Version != inst.Version:
 		return r.update(ctx, ext, inst, st)
 	}
-	allowed, err := r.allowedAsInstalled(ctx, inst)
+	allowed, _, err := r.allowedAsInstalled(ctx, inst)
 	if err != nil {
 		return inst, err
 	}
@@ -235,11 +265,6 @@ func (r *extensionRun) reconcileOne(ctx context.Context, ext postgresv1alpha1.Ex
 			"nor listed in the Cluster's spec.rolePolicy.allowedExtensions; its grants are not applied", inst.Version)
 	}
 	return inst, nil
-}
-
-// allows reports whether the policy allows installing info.
-func (r *extensionRun) allows(info postgres.ExtensionVersionInfo) bool {
-	return info.Trusted || r.policy.AllowsExtension(info.Name)
 }
 
 // dependencies resolves the extensions info requires, recursively: those
@@ -284,12 +309,71 @@ type installPlan struct {
 	info          postgres.ExtensionVersionInfo
 	installedDeps []*postgres.InstalledExtension
 	toInstall     []postgres.ExtensionVersionInfo
-	// strict is set when one of the extensions to install is not trusted.
+	// strict is set when a script of one of the extensions to install (of
+	// any version it may run) is not trusted.
 	strict bool
 }
 
+// installVersions returns the versions of the extension name whose scripts
+// installing version may run: version itself and every version on an
+// update path that ends at it (PostgreSQL may run an older version's install
+// script and update from there, running every update script on the way).
+// pgop cannot see which path PostgreSQL picks, so it takes all of them that
+// start at an installable version (one pg_available_extension_versions
+// lists; the others have no install script to start from).
+func (r *extensionRun) installVersions(ctx context.Context, name, version string) ([]string, error) {
+	paths, err := r.pg.ExtensionUpdatePaths(ctx, name, "", version)
+	if err != nil {
+		return nil, err
+	}
+	versions := []string{version}
+	for _, p := range paths {
+		_, installable, err := r.pg.ExtensionVersion(ctx, name, p[0])
+		if err != nil {
+			return nil, err
+		}
+		if installable {
+			versions = append(versions, p...)
+		}
+	}
+	return uniqueSorted(versions), nil
+}
+
+// untrustedVersions returns the versions of the extension name that the
+// server does not mark trusted (or does not have).
+func (r *extensionRun) untrustedVersions(ctx context.Context, name string, versions []string) ([]string, error) {
+	var out []string
+	for _, v := range versions {
+		info, found, err := r.pg.ExtensionVersion(ctx, name, v)
+		if err != nil {
+			return nil, err
+		}
+		if !found || !info.Trusted {
+			out = append(out, v)
+		}
+	}
+	return out, nil
+}
+
+// checkVersions checks the policy for the scripts of versions of the
+// extension name: every one must be trusted, or the Cluster must allow the
+// extension. It returns a problem ("" when allowed) and whether a script is
+// not trusted (strict schema rules then apply).
+func (r *extensionRun) checkVersions(ctx context.Context, name string, versions []string) (problem string, untrusted bool, err error) {
+	bad, err := r.untrustedVersions(ctx, name, versions)
+	if err != nil || len(bad) == 0 {
+		return "", false, err
+	}
+	if r.policy.AllowsExtension(name) {
+		return "", true, nil
+	}
+	return fmt.Sprintf("%s version(s) %s, whose scripts it would run, are neither trusted by the server nor allowed by the "+
+		"Cluster's spec.rolePolicy.allowedExtensions", name, strings.Join(bad, ", ")), true, nil
+}
+
 // planCreate resolves what installing ext would install and checks it
-// against the policy. A nil plan comes with the refusal.
+// against the policy: every version of every extension whose scripts would
+// run. A nil plan comes with the refusal.
 func (r *extensionRun) planCreate(ctx context.Context, ext postgresv1alpha1.ExtensionSpec,
 	st *postgresv1alpha1.ExtensionStatus) (*installPlan, error) {
 	info, found, err := r.pg.ExtensionVersion(ctx, ext.Name, ext.Version)
@@ -300,9 +384,16 @@ func (r *extensionRun) planCreate(ctx context.Context, ext postgresv1alpha1.Exte
 		return nil, refuse(st, ReasonExtensionVersionNotAvailable, "%s is not available on the server "+
 			"(its files are not in the image)", versionLabel(ext.Version))
 	}
-	if !r.allows(info) {
-		return nil, refuse(st, ReasonExtensionNotAllowed, "version %s is neither trusted by the server nor listed in the "+
-			"Cluster's spec.rolePolicy.allowedExtensions", info.Version)
+	versions, err := r.installVersions(ctx, ext.Name, info.Version)
+	if err != nil {
+		return nil, err
+	}
+	problem, strict, err := r.checkVersions(ctx, ext.Name, versions)
+	if err != nil {
+		return nil, err
+	}
+	if problem != "" {
+		return nil, refuse(st, ReasonExtensionNotAllowed, "not installed: %s", problem)
 	}
 	installedDeps, toInstall, unavailable, err := r.dependencies(ctx, info)
 	if err != nil {
@@ -316,31 +407,42 @@ func (r *extensionRun) planCreate(ctx context.Context, ext postgresv1alpha1.Exte
 		return nil, refuse(st, ReasonExtensionDependencyMissing, "requires %s, which is not installed: list it "+
 			"before this extension, or set cascade: true", strings.Join(extensionNames(toInstall), ", "))
 	}
-	plan := &installPlan{info: info, installedDeps: installedDeps, toInstall: toInstall, strict: !info.Trusted}
+	plan := &installPlan{info: info, installedDeps: installedDeps, toInstall: toInstall, strict: strict}
 	var refused []string
 	for _, dep := range toInstall {
-		if !r.allows(dep) {
-			refused = append(refused, dep.Name)
+		versions, err := r.installVersions(ctx, dep.Name, dep.Version)
+		if err != nil {
+			return nil, err
 		}
-		plan.strict = plan.strict || !dep.Trusted
+		problem, untrusted, err := r.checkVersions(ctx, dep.Name, versions)
+		if err != nil {
+			return nil, err
+		}
+		if problem != "" {
+			refused = append(refused, problem)
+		}
+		plan.strict = plan.strict || untrusted
 	}
 	if len(refused) > 0 {
-		return nil, refuse(st, ReasonExtensionNotAllowed, "cascade would install %s, which is neither trusted by the "+
-			"server nor listed in the Cluster's spec.rolePolicy.allowedExtensions; nothing was installed", strings.Join(refused, ", "))
+		return nil, refuse(st, ReasonExtensionNotAllowed, "cascade would install dependencies the policy does not allow, "+
+			"nothing was installed: %s", strings.Join(refused, "; "))
 	}
 	return plan, nil
 }
 
 // checkInstallSchemas checks the schemas the install scripts of plan run in:
 // each new extension's target schema, and the schemas of the installed
-// extensions they require. It reports whether pgop has to create ext's
-// schema first.
+// extensions they require. It returns the schemas that do not exist yet and
+// that pgop must create (owned by the operator) before CREATE EXTENSION, so
+// CREATE EXTENSION never creates one itself: a schema it would create could
+// be created by the database owner in the meantime, and CREATE EXTENSION
+// would use it without checking who owns it.
 func (r *extensionRun) checkInstallSchemas(ctx context.Context, ext postgresv1alpha1.ExtensionSpec,
-	st *postgresv1alpha1.ExtensionStatus, plan *installPlan) (createTarget bool, err error) {
+	st *postgresv1alpha1.ExtensionStatus, plan *installPlan) (toCreate []string, err error) {
 	target := ext.Schema
 	if s := plan.info.Schema; s != "" {
 		if ext.Schema != "" && ext.Schema != s {
-			return false, refuse(st, ReasonExtensionSchemaNotAllowed, "its control file installs it in schema %s, not %s",
+			return nil, refuse(st, ReasonExtensionSchemaNotAllowed, "its control file installs it in schema %s, not %s",
 				s, ext.Schema)
 		}
 		target = s
@@ -348,8 +450,8 @@ func (r *extensionRun) checkInstallSchemas(ctx context.Context, ext postgresv1al
 	if target == "" {
 		target = publicSchemaName
 	}
-	// controlSchemas are created by CREATE EXTENSION when missing (owned by
-	// the operator).
+	// controlSchemas are schemas named by control files: CREATE EXTENSION
+	// would create them when missing.
 	controlSchemas := map[string]bool{plan.info.Schema: plan.info.Schema != ""}
 	schemas := []string{target}
 	for _, dep := range plan.toInstall {
@@ -368,12 +470,11 @@ func (r *extensionRun) checkInstallSchemas(ctx context.Context, ext postgresv1al
 	for _, s := range uniqueSorted(schemas) {
 		p, missing, err := r.schemaProblem(ctx, s, plan.strict)
 		if err != nil {
-			return false, err
+			return nil, err
 		}
 		switch {
-		case missing && controlSchemas[s]:
-		case missing && s == ext.Schema && !r.specSchemas[s]:
-			createTarget = true
+		case missing && (controlSchemas[s] || s == ext.Schema && !r.specSchemas[s]):
+			toCreate = append(toCreate, s)
 		case missing:
 			problems = append(problems, fmt.Sprintf("schema %s does not exist", s))
 		case p != "":
@@ -381,10 +482,39 @@ func (r *extensionRun) checkInstallSchemas(ctx context.Context, ext postgresv1al
 		}
 	}
 	if len(problems) > 0 {
-		return false, refuse(st, ReasonExtensionSchemaNotAllowed, "not installed: its install script would run as a "+
+		return nil, refuse(st, ReasonExtensionSchemaNotAllowed, "not installed: its install script would run as a "+
 			"superuser in %s", strings.Join(problems, "; "))
 	}
-	return createTarget, nil
+	return toCreate, nil
+}
+
+// createSchemas creates the missing schemas an install needs, owned by the
+// operator (the session user), so no other role can write to them. A schema
+// someone created since the check is checked again and refused unless it is
+// acceptable.
+func (r *extensionRun) createSchemas(ctx context.Context, ext postgresv1alpha1.ExtensionSpec,
+	st *postgresv1alpha1.ExtensionStatus, schemas []string, strict bool) error {
+	for _, s := range schemas {
+		err := r.pg.CreateSchema(ctx, s, "")
+		if err == nil {
+			continue
+		}
+		if !errors.Is(err, postgres.ErrObjectExists) {
+			return fmt.Errorf("extension %s: creating schema %s: %w", ext.Name, s, err)
+		}
+		p, missing, err := r.schemaProblem(ctx, s, strict)
+		if err != nil {
+			return err
+		}
+		if missing {
+			p = fmt.Sprintf("schema %s, which was created and dropped while pgop was creating it", s)
+		}
+		if p != "" {
+			return refuse(st, ReasonExtensionSchemaNotAllowed, "not installed: someone created its schema while pgop was "+
+				"creating it, and its install script would run as a superuser in %s", p)
+		}
+	}
+	return nil
 }
 
 // create installs an extension that is not installed.
@@ -392,26 +522,24 @@ func (r *extensionRun) create(ctx context.Context, ext postgresv1alpha1.Extensio
 	st *postgresv1alpha1.ExtensionStatus) (*postgres.InstalledExtension, error) {
 	// An extension pgop recorded as created but that is gone is no longer
 	// pgop's (it may be created by someone else next).
-	st.Created = false
+	st.Created, st.OID, st.Owner = false, 0, ""
 	plan, err := r.planCreate(ctx, ext, st)
 	if err != nil {
 		return nil, err
 	}
-	createTarget, err := r.checkInstallSchemas(ctx, ext, st, plan)
+	toCreate, err := r.checkInstallSchemas(ctx, ext, st, plan)
 	if err != nil {
 		return nil, err
 	}
-	if createTarget {
-		// Owned by the operator (the session user): no other role can write
-		// to it.
-		if err := r.pg.CreateSchema(ctx, ext.Schema, ""); err != nil {
-			return nil, fmt.Errorf("extension %s: creating its schema %s: %w", ext.Name, ext.Schema, err)
-		}
+	if err := r.createSchemas(ctx, ext, st, toCreate, plan.strict); err != nil {
+		return nil, err
 	}
 
 	// Record the creation before it happens (an intent log, as for grants):
 	// a status update lost after CREATE EXTENSION must not make pgop forget
-	// that it created the extension. A failed create clears the record.
+	// that it created the extension. The record only becomes proof once the
+	// extension's oid and owner are recorded too (below); a failed create
+	// clears it.
 	st.Created = true
 	if err := r.persist(ctx, *st); err != nil {
 		st.Created = false
@@ -427,7 +555,11 @@ func (r *extensionRun) create(ctx context.Context, ext postgresv1alpha1.Extensio
 		}
 		return nil, err
 	}
-	return r.pg.InstalledExtension(ctx, ext.Name)
+	inst, err := r.pg.InstalledExtension(ctx, ext.Name)
+	if inst != nil {
+		st.OID, st.Owner = inst.OID, inst.Owner
+	}
+	return inst, err
 }
 
 // update updates an installed extension to the requested version.
@@ -445,17 +577,22 @@ func (r *extensionRun) update(ctx context.Context, ext postgresv1alpha1.Extensio
 		return inst, refuse(st, ReasonExtensionVersionNotAvailable, "%s is not available on the server "+
 			"(its files are not in the image)", versionLabel(ext.Version))
 	}
-	path, err := r.pg.ExtensionUpdatePathExists(ctx, ext.Name, inst.Version, ext.Version)
+	paths, err := r.pg.ExtensionUpdatePaths(ctx, ext.Name, inst.Version, ext.Version)
 	if err != nil {
 		return inst, err
 	}
-	if !path {
+	if len(paths) == 0 || len(paths[0]) < 2 {
 		return inst, refuse(st, ReasonExtensionVersionNotAvailable, "the server has no update path from version %s to %s",
 			inst.Version, ext.Version)
 	}
-	if !r.allows(info) {
-		return inst, refuse(st, ReasonExtensionNotAllowed, "version %s is neither trusted by the server nor listed in the "+
-			"Cluster's spec.rolePolicy.allowedExtensions; it stays at version %s", info.Version, inst.Version)
+	// ALTER EXTENSION ... UPDATE runs the update script of every step: each
+	// version after the installed one must pass the policy.
+	problem, strict, err := r.checkVersions(ctx, ext.Name, paths[0][1:])
+	if err != nil {
+		return inst, err
+	}
+	if problem != "" {
+		return inst, refuse(st, ReasonExtensionNotAllowed, "not updated, it stays at version %s: %s", inst.Version, problem)
 	}
 	// ALTER EXTENSION ... UPDATE does not cascade.
 	installedDeps, toInstall, unavailable, err := r.dependencies(ctx, info)
@@ -472,7 +609,7 @@ func (r *extensionRun) update(ctx context.Context, ext postgresv1alpha1.Extensio
 	}
 	var problems []string
 	for _, s := range uniqueSorted(schemas) {
-		p, missing, err := r.schemaProblem(ctx, s, !info.Trusted)
+		p, missing, err := r.schemaProblem(ctx, s, strict)
 		if err != nil {
 			return inst, err
 		}
@@ -546,12 +683,16 @@ func extensionSchemaProblem(name string, w postgres.SchemaWriters, dbOwner strin
 
 // dropRemoved drops the extensions that left the spec and that pgop created
 // with dropOnRemoval recorded, and returns the status entries to keep for
-// removed extensions (drops that failed).
-func (r *extensionRun) dropRemoved(ctx context.Context, listed map[string]bool, errs *[]error) []postgresv1alpha1.ExtensionStatus {
+// removed extensions (drops that failed). An extension is only dropped when
+// it is still the installation pgop created (same oid and owner). listed is
+// the number of status entries of the spec's extensions: the entries kept
+// stay within extensionStatusLimit, the others are no longer tracked (and
+// so never dropped) and reported.
+func (r *extensionRun) dropRemoved(ctx context.Context, listed int, errs *[]error) []postgresv1alpha1.ExtensionStatus {
 	var keep []postgresv1alpha1.ExtensionStatus
 	for _, name := range slices.Sorted(maps.Keys(r.cur)) {
 		st := r.cur[name]
-		if listed[name] || !st.Created || !st.DropOnRemoval {
+		if r.listed[name] || !st.Created || !st.DropOnRemoval {
 			continue
 		}
 		inst, err := r.pg.InstalledExtension(ctx, name)
@@ -561,6 +702,12 @@ func (r *extensionRun) dropRemoved(ctx context.Context, listed map[string]bool, 
 			continue
 		}
 		if inst == nil {
+			continue
+		}
+		if st.OID == 0 || inst.OID != st.OID || inst.Owner != st.Owner {
+			*errs = append(*errs, refuse(&st, ReasonExtensionNotManaged, "removed from the spec with dropOnRemoval, but it "+
+				"is not the installation pgop created (it was dropped and created again, or pgop could not confirm "+
+				"its creation); it is not dropped and no longer tracked"))
 			continue
 		}
 		err = r.pg.DropExtension(ctx, name)
@@ -575,21 +722,39 @@ func (r *extensionRun) dropRemoved(ctx context.Context, listed map[string]bool, 
 			keep = append(keep, st)
 		}
 	}
+	if room := max(extensionStatusLimit-listed, 0); len(keep) > room {
+		dropped := make([]string, 0, len(keep)-room)
+		for _, st := range keep[room:] {
+			dropped = append(dropped, st.Name)
+		}
+		*errs = append(*errs, &conditionError{reason: ReasonExtensionDropBlocked, err: fmt.Errorf(
+			"status.extensions is full: removed extensions %s are no longer tracked and will not be dropped by pgop",
+			strings.Join(dropped, ", "))})
+		keep = keep[:room]
+	}
 	return keep
 }
 
 // persist records st (with the rest of the working status) before pgop
-// creates the extension.
+// creates the extension. The record holds the spec's extensions and the
+// removed ones pgop still has to drop, within extensionStatusLimit.
 func (r *extensionRun) persist(ctx context.Context, st postgresv1alpha1.ExtensionStatus) error {
 	r.cur[st.Name] = st
 	if r.save == nil {
 		return nil
 	}
-	saved := r.database.Status.Extensions
-	r.database.Status.Extensions = nil
+	var record, removed []postgresv1alpha1.ExtensionStatus
 	for _, name := range slices.Sorted(maps.Keys(r.cur)) {
-		r.database.Status.Extensions = append(r.database.Status.Extensions, r.cur[name])
+		switch e := r.cur[name]; {
+		case r.listed[name]:
+			record = append(record, e)
+		case e.Created && e.DropOnRemoval:
+			removed = append(removed, e)
+		}
 	}
+	record = append(record, removed[:min(len(removed), max(extensionStatusLimit-len(record), 0))]...)
+	saved := r.database.Status.Extensions
+	r.database.Status.Extensions = record
 	if err := r.save(ctx); err != nil {
 		r.database.Status.Extensions = saved
 		return err

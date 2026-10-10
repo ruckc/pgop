@@ -140,7 +140,7 @@ func TestExtensionsIntegration(t *testing.T) {
 	admin := raw("postgres")
 	roles := []string{extITOwner, extApp, extITEvil}
 	cleanup := func() {
-		_, _ = admin.ExecContext(ctx, `DROP DATABASE IF EXISTS `+extITDB)
+		_, _ = admin.ExecContext(ctx, `DROP DATABASE IF EXISTS `+extITDB+` WITH (FORCE)`)
 		for _, r := range roles {
 			_, _ = admin.ExecContext(ctx, `DROP ROLE IF EXISTS `+r)
 		}
@@ -329,5 +329,134 @@ func extITRemoval(it *extIT) {
 	}
 	if it.extVersion(polTrgm) == "" {
 		t.Error("pg_trgm (no dropOnRemoval) was dropped")
+	}
+}
+
+// racingSchemaClient runs before right before each CREATE SCHEMA pgop
+// issues: it simulates a role creating the schema between pgop's check and
+// its CREATE SCHEMA.
+type racingSchemaClient struct {
+	*postgres.Client
+	before func()
+}
+
+func (c racingSchemaClient) CreateSchema(ctx context.Context, name, owner string) error {
+	c.before()
+	return c.Client.CreateSchema(ctx, name, owner)
+}
+
+// TestExtensionFixturesIntegration checks the extension-script hijack and
+// the per-version trust checks with the fixture extensions in
+// testdata/extensions, which must be installed into the server's extension
+// directory, for example:
+//
+//	docker cp internal/controller/testdata/extensions/. <container>:/usr/share/postgresql/18/extension/
+//
+// It runs only when PGOP_TEST_PGHOST is set and the fixtures are available.
+func TestExtensionFixturesIntegration(t *testing.T) {
+	host := os.Getenv("PGOP_TEST_PGHOST")
+	if host == "" {
+		t.Skip("PGOP_TEST_PGHOST not set")
+	}
+	port, err := strconv.Atoi(os.Getenv("PGOP_TEST_PGPORT"))
+	if err != nil {
+		t.Fatalf("PGOP_TEST_PGPORT: %v", err)
+	}
+	user, password := os.Getenv("PGOP_TEST_PGUSER"), os.Getenv("PGOP_TEST_PGPASSWORD")
+	ctx := context.Background()
+	const db, tenant = "pgop_extfx_test", "extfx_owner"
+	open := func(database string) *sql.DB {
+		conn, err := sql.Open("postgres", fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=disable",
+			host, port, user, password, database))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = conn.Close() })
+		return conn
+	}
+	admin := open("postgres")
+	var fixtures int
+	if err := admin.QueryRowContext(ctx, `SELECT count(*) FROM pg_available_extensions WHERE name IN ('pgop_evs', 'pgop_evt')`).
+		Scan(&fixtures); err != nil {
+		t.Fatal(err)
+	}
+	if fixtures != 2 {
+		t.Skip("the fixture extensions of testdata/extensions are not installed on the server")
+	}
+	cleanup := func() {
+		_, _ = admin.ExecContext(ctx, `DROP DATABASE IF EXISTS `+db+` WITH (FORCE)`)
+		_, _ = admin.ExecContext(ctx, `DROP ROLE IF EXISTS `+tenant)
+	}
+	cleanup()
+	t.Cleanup(cleanup)
+	setup := &extIT{t: t, ctx: ctx, conn: admin}
+	setup.exec(`CREATE ROLE ` + tenant)
+	setup.exec(`CREATE DATABASE ` + db + ` OWNER ` + tenant)
+	pg, err := postgres.NewClient(postgres.ConnectionConfig{Host: host, Port: int32(port), User: user, Password: password, Database: db})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = pg.Close() }()
+	it := &extIT{t: t, ctx: ctx, conn: open(db), pg: pg, database: &postgresv1alpha1.Database{},
+		policy: &postgresv1alpha1.RolePolicySpec{AllowedExtensions: []string{"pgop_evs"}}}
+	reconcileWith := func(c extensionInstallClient) func() error {
+		return func() error {
+			_, err := reconcileExtensions(ctx, c, it.database, it.policy, nil, nil)
+			return err
+		}
+	}
+
+	t.Log("the database owner creates the control file's schema, with a planted f(integer), right before pgop does")
+	raced := false
+	client := racingSchemaClient{Client: pg, before: func() {
+		if !raced {
+			raced = true
+			it.exec(`SET ROLE ` + tenant + `; CREATE SCHEMA pgop_evs; ` +
+				`CREATE FUNCTION pgop_evs.f(integer) RETURNS text LANGUAGE sql AS 'SELECT ''hijacked as '' || current_user'; RESET ROLE`)
+		}
+	}}
+	it.database.Spec.Extensions = []postgresv1alpha1.ExtensionSpec{{Name: "pgop_evs"}}
+	it.wantReasonFrom(reconcileWith(client), ReasonExtensionSchemaNotAllowed, "while pgop was creating it")
+	if it.extVersion("pgop_evs") != "" {
+		t.Fatal("the extension was installed into the raced schema")
+	}
+
+	t.Log("without the race, pgop creates the schema for the operator and the script calls its own f")
+	it.exec(`DROP SCHEMA pgop_evs CASCADE`)
+	if err := reconcileWith(client)(); err != nil {
+		t.Fatal(err)
+	}
+	if got := it.query(`SELECT result FROM pgop_evs.ran`); got != "extension" {
+		t.Errorf("the script called %q", got)
+	}
+	if got := it.query(`SELECT nspowner::regrole::text FROM pg_namespace WHERE nspname = 'pgop_evs'`); got != user {
+		t.Errorf("pgop_evs owned by %q", got)
+	}
+
+	t.Log("an install or update through the untrusted 1.1 is refused")
+	it.database.Spec.Extensions = []postgresv1alpha1.ExtensionSpec{{Name: "pgop_evt"}}
+	it.wantReasonFrom(reconcileWith(pg), ReasonExtensionNotAllowed, "version(s) 1.1")
+	it.database.Spec.Extensions[0].Version = "1.0"
+	if err := reconcileWith(pg)(); err != nil {
+		t.Fatal(err)
+	}
+	it.database.Spec.Extensions[0].Version = "1.2"
+	it.wantReasonFrom(reconcileWith(pg), ReasonExtensionNotAllowed, "version(s) 1.1")
+	if got := it.extVersion("pgop_evt"); got != "1.0@public" {
+		t.Errorf("pgop_evt = %q", got)
+	}
+}
+
+// wantReasonFrom runs f and checks the reason and message of its error.
+func (it *extIT) wantReasonFrom(f func() error, reason string, parts ...string) {
+	it.t.Helper()
+	err := f()
+	if got := extReason(err); got != reason {
+		it.t.Fatalf("want reason %s, got %v", reason, err)
+	}
+	for _, p := range parts {
+		if !strings.Contains(err.Error(), p) {
+			it.t.Errorf("%q not in %v", p, err)
+		}
 	}
 }

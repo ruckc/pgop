@@ -49,7 +49,8 @@ func TestOperatorSessionPinsIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = admin.Close() }()
+	// Closed after the cleanups (which run after deferred calls).
+	t.Cleanup(func() { _ = admin.Close() })
 	exec := func(q string) {
 		t.Helper()
 		if _, err := admin.db.ExecContext(ctx, q); err != nil {
@@ -57,13 +58,15 @@ func TestOperatorSessionPinsIntegration(t *testing.T) {
 		}
 	}
 	const db = "pgop_pin_test"
-	exec(`DROP DATABASE IF EXISTS ` + db)
-	exec(`DROP ROLE IF EXISTS pgop_pin_tenant`)
+	exec(`DROP DATABASE IF EXISTS ` + db + ` WITH (FORCE)`)
+	for _, r := range []string{"pgop_pin_member", "pgop_pin_marked", "pgop_pin_tenant"} {
+		exec(`DROP ROLE IF EXISTS ` + r)
+	}
 	exec(`CREATE ROLE pgop_pin_tenant`)
 	exec(`CREATE DATABASE ` + db + ` OWNER pgop_pin_tenant`)
 	t.Cleanup(func() {
 		_, _ = admin.db.ExecContext(ctx, `ALTER ROLE `+quoteIdent(cfg.User)+` IN DATABASE `+db+` RESET ALL`)
-		_, _ = admin.db.ExecContext(ctx, `DROP DATABASE IF EXISTS `+db)
+		_, _ = admin.db.ExecContext(ctx, `DROP DATABASE IF EXISTS `+db+` WITH (FORCE)`)
 		_, _ = admin.db.ExecContext(ctx, `DROP ROLE IF EXISTS pgop_pin_tenant`)
 	})
 	for _, set := range []string{
@@ -177,7 +180,7 @@ func checkCatalogHelpers(ctx context.Context, t *testing.T, admin, c *Client, db
 	// Connectability, and databases with schema privileges of a role.
 	exec(`CREATE ROLE pgop_pin_member`)
 	t.Cleanup(func() {
-		_, _ = admin.db.ExecContext(ctx, `DROP DATABASE IF EXISTS `+db)
+		_, _ = admin.db.ExecContext(ctx, `DROP DATABASE IF EXISTS `+db+` WITH (FORCE)`)
 		_, _ = admin.db.ExecContext(ctx, `DROP ROLE IF EXISTS pgop_pin_member`)
 	})
 	if _, err := c.db.ExecContext(ctx, `GRANT USAGE ON SCHEMA public TO pgop_pin_member`); err != nil {

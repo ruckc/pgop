@@ -224,7 +224,9 @@ type ExtensionSpec struct {
 	// role can write to. The schema is checked before every CREATE EXTENSION
 	// and ALTER EXTENSION ... UPDATE (reason ExtensionSchemaNotAllowed): see
 	// the Database documentation. pgop never moves an installed extension to
-	// another schema.
+	// another schema. Schemas control files name are created by pgop too,
+	// before CREATE EXTENSION, so an extension never runs in a schema someone
+	// else created in the meantime.
 	// +optional
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=63
@@ -277,7 +279,11 @@ type ExtensionSpec struct {
 	// and table privileges only on plain and partitioned tables: the other
 	// objects run with the privileges of their owner (a superuser) or rely
 	// on not being executable by others, and are skipped
-	// (status.extensions[].skippedObjects).
+	// (status.extensions[].skippedObjects). On an extension the server does
+	// not trust at its installed version (installed because the Cluster's
+	// allowedExtensions lists it), only read-only privileges are granted
+	// (schema USAGE, tables and sequences SELECT, functions EXECUTE): the
+	// others are refused with reason ExtensionGrantNotAllowed.
 	// +optional
 	// +listType=map
 	// +listMapKey=role
@@ -395,10 +401,22 @@ type ExtensionStatus struct {
 	Schema string `json:"schema,omitempty"`
 
 	// created reports that pgop created the extension for this Database
-	// (recorded before CREATE EXTENSION runs). Only such an extension is
-	// dropped by dropOnRemoval.
+	// (recorded before CREATE EXTENSION runs, and kept only once oid and
+	// owner confirm it). Only such an extension is dropped by dropOnRemoval.
 	// +optional
 	Created bool `json:"created,omitempty"`
+
+	// oid and owner identify the installation pgop created
+	// (pg_extension.oid and extowner). An extension dropped and created
+	// again by someone else has another oid, so pgop no longer treats it as
+	// created by it.
+	// +optional
+	OID int64 `json:"oid,omitempty"`
+
+	// owner is the extension's owner (pg_extension.extowner) when pgop
+	// created it.
+	// +optional
+	Owner string `json:"owner,omitempty"`
 
 	// dropOnRemoval is the extension's dropOnRemoval setting as last
 	// reconciled; it decides what happens once the entry leaves the spec.

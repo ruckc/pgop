@@ -60,6 +60,13 @@ import (
 //   - no TRIGGER privilege (see ExtensionGrantSpec.Tables).
 //
 // Skipped objects are counted in status.extensions[].skippedObjects.
+//
+// On an extension the server does not trust at its installed version (only
+// the Cluster's allowedExtensions allows it), only read-only privileges are
+// granted (extensionKind.readOnly): CREATE on its schema or write privileges
+// on its tables and sequences would let a role plant objects where, or
+// change the state that, the extension's superuser-run code reads, which is
+// what the stricter install rule for such extensions forbids.
 
 // Ledger limit: the maxItems of status.managedExtensionGrants.
 const extensionGrantLedgerLimit ledgerLimit = 1024
@@ -85,27 +92,37 @@ type extensionKind struct {
 	// expands to.
 	privileges []string
 	all        []string
-	spec       func(postgresv1alpha1.ExtensionGrantSpec) []string
+	// readOnly are the privileges granted on an extension the server does
+	// not trust (one only the Cluster's allowedExtensions allows): none of
+	// them lets the grantee write where the extension's superuser-run code
+	// (background workers, SECURITY DEFINER functions, a DBA calling its
+	// functions) resolves names or reads its state.
+	readOnly []string
+	spec     func(postgresv1alpha1.ExtensionGrantSpec) []string
 }
 
 var extensionKinds = []extensionKind{
 	{api: postgresv1alpha1.ExtensionObjectSchema, engine: extKindSchema,
 		privileges: []string{postgres.PrivilegeCreate, postgres.PrivilegeUsage},
 		all:        []string{postgres.PrivilegeCreate, postgres.PrivilegeUsage},
+		readOnly:   []string{postgres.PrivilegeUsage},
 		spec:       func(g postgresv1alpha1.ExtensionGrantSpec) []string { return g.Schema }},
 	{api: postgresv1alpha1.ExtensionObjectTables, engine: extKindTables, member: postgres.MemberTables,
 		privileges: []string{postgres.PrivilegeSelect, postgres.PrivilegeInsert, postgres.PrivilegeUpdate, postgres.PrivilegeDelete,
 			postgres.PrivilegeTruncate, postgres.PrivilegeReferences, postgres.PrivilegeMaintain},
 		all: []string{postgres.PrivilegeSelect, postgres.PrivilegeInsert, postgres.PrivilegeUpdate, postgres.PrivilegeDelete,
 			postgres.PrivilegeTruncate, postgres.PrivilegeReferences},
-		spec: func(g postgresv1alpha1.ExtensionGrantSpec) []string { return g.Tables }},
+		readOnly: []string{postgres.PrivilegeSelect},
+		spec:     func(g postgresv1alpha1.ExtensionGrantSpec) []string { return g.Tables }},
 	{api: postgresv1alpha1.ExtensionObjectSequences, engine: extKindSequences, member: postgres.MemberSequences,
 		privileges: []string{postgres.PrivilegeUsage, postgres.PrivilegeSelect, postgres.PrivilegeUpdate},
 		all:        []string{postgres.PrivilegeUsage, postgres.PrivilegeSelect, postgres.PrivilegeUpdate},
+		readOnly:   []string{postgres.PrivilegeSelect},
 		spec:       func(g postgresv1alpha1.ExtensionGrantSpec) []string { return g.Sequences }},
 	{api: postgresv1alpha1.ExtensionObjectFunctions, engine: extKindFunctions, member: postgres.MemberRoutines,
 		privileges: []string{postgres.PrivilegeExecute},
 		all:        []string{postgres.PrivilegeExecute},
+		readOnly:   []string{postgres.PrivilegeExecute},
 		spec:       func(g postgresv1alpha1.ExtensionGrantSpec) []string { return g.Functions }},
 }
 
@@ -147,12 +164,14 @@ func extensionTarget(kind postgres.ObjectKind, extension, schema, grantee string
 }
 
 // desiredExtensionGrants converts spec.extensions[].grants to privilege
-// grants, grouped by spec field (in spec order). Only extensions in eligible
-// (installed and allowed) are included. Schema grants on a schema that is
-// not the extension's own (public, a system schema, one listed in
-// spec.schemas) are left out and reported in notAllowed; MAINTAIN on a
-// server older than PostgreSQL 17 in unsupported.
-func desiredExtensionGrants(database *postgresv1alpha1.Database, eligible installedExtensions, serverVersion int) (
+// grants, grouped by spec field (in spec order). Only extensions in
+// states.eligible (installed and allowed) are included. Schema grants on a
+// schema that is not the extension's own (public, a system schema, one
+// listed in spec.schemas), and privileges other than the kind's readOnly ones
+// on an extension the server does not trust (states.untrusted), are left
+// out and reported in notAllowed; MAINTAIN on a server older than
+// PostgreSQL 17 in unsupported.
+func desiredExtensionGrants(database *postgresv1alpha1.Database, states extensionStates, serverVersion int) (
 	fields []string, grants map[string][]privilegeGrant, notAllowed, unsupported []string, err error) {
 	specSchemas := map[string]bool{}
 	for _, s := range database.Spec.Schemas {
@@ -160,7 +179,7 @@ func desiredExtensionGrants(database *postgresv1alpha1.Database, eligible instal
 	}
 	grants = map[string][]privilegeGrant{}
 	for _, ext := range database.Spec.Extensions {
-		inst := eligible[ext.Name]
+		inst := states.eligible[ext.Name]
 		if inst == nil || len(ext.Grants) == 0 {
 			continue
 		}
@@ -190,9 +209,19 @@ func desiredExtensionGrants(database *postgresv1alpha1.Database, eligible instal
 				if ek.engine == extKindSchema {
 					schema = inst.Schema
 					if schema == publicSchemaName || systemSchemaName(schema) || specSchemas[schema] {
-						notAllowed = append(notAllowed, fmt.Sprintf("%s[%s].schema: the extension is installed in %s",
-							field, g.Role, schema))
+						notAllowed = append(notAllowed, fmt.Sprintf("%s[%s].schema: the extension is installed in %s, "+
+							"not in a schema of its own (grant on it in spec.schemas[].grants)", field, g.Role, schema))
 						continue
+					}
+				}
+				if states.untrusted[ext.Name] {
+					if denied := subtract(privs, ek.readOnly); len(denied) > 0 {
+						notAllowed = append(notAllowed, fmt.Sprintf("%s[%s].%s: %s, because the server does not trust the "+
+							"extension (only the Cluster's allowedExtensions allows it): only %s", field, g.Role, ek.api,
+							strings.Join(denied, ", "), strings.Join(ek.readOnly, ", ")))
+						if privs = intersect(privs, ek.readOnly); len(privs) == 0 {
+							continue
+						}
 					}
 				}
 				if slices.Contains(privs, postgres.PrivilegeMaintain) && serverVersion < postgres.MinMaintainPrivilegeVersion {
@@ -340,7 +369,7 @@ func reconcileExtensionGrants(ctx context.Context, pg extensionGrantClient, data
 	if states.allUnknown {
 		return nil
 	}
-	fields, all, notAllowed, unsupported, err := desiredExtensionGrants(database, states.eligible, serverVersion)
+	fields, all, notAllowed, unsupported, err := desiredExtensionGrants(database, states, serverVersion)
 	if err != nil {
 		return err
 	}
@@ -391,8 +420,7 @@ func reconcileExtensionGrants(ctx context.Context, pg extensionGrantClient, data
 	errs := []error{err, held.err(), revokeFromIneligibleObjects(ctx, pg, database, desired, after)}
 	if len(notAllowed) > 0 {
 		errs = append(errs, &conditionError{reason: ReasonExtensionGrantNotAllowed, err: fmt.Errorf(
-			"extension schema grants not applied (only on a schema of the extension's own: not public, a system schema "+
-				"or a schema listed in spec.schemas; grant on those in spec.schemas[].grants): %s", strings.Join(notAllowed, "; "))})
+			"extension grants not applied (and revoked if pgop granted them): %s", strings.Join(notAllowed, "; "))})
 	}
 	if len(unsupported) > 0 {
 		errs = append(errs, &conditionError{reason: ReasonUnsupportedServerVersion, err: fmt.Errorf(
