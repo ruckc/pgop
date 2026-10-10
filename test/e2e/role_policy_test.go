@@ -518,7 +518,7 @@ spec:
 
 		It("does not let a Role or Database follow its name to another or re-created Cluster", func() {
 			By("refusing to retarget clusterRef")
-			for _, res := range []string{roleRes + "pol-old", dbRes + "pol-db"} {
+			for _, res := range []string{roleRes + "pol-old"} {
 				_, err := utils.Run(exec.Command("kubectl", "patch", res, "-n", namespace, "--type=merge",
 					"-p", `{"spec":{"clusterRef":{"name":"cluster-b"}}}`))
 				Expect(err).To(HaveOccurred(), res)
@@ -548,6 +548,10 @@ spec:
 `)).To(Succeed())
 			waitReady(roleRes + "pol-uid")
 			waitReady(dbRes + "pol-uid-db")
+			_, err := utils.Run(exec.Command("kubectl", "patch", dbRes+"pol-uid-db", "-n", namespace, "--type=merge",
+				"-p", `{"spec":{"clusterRef":{"name":"cluster-b"}}}`))
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("clusterRef is immutable"))
 			var password string
 			Eventually(func(g Gomega) { password = passwordOf(g, "pol_uid") }).Should(Succeed())
 			// Simulate a re-created Cluster: the recorded clusterUID no longer
@@ -563,7 +567,7 @@ spec:
 					g.Expect(jsonpath(g, res, availableReason)).To(Or(Equal("RoleNotManaged"), Equal("DatabaseNotManaged")))
 				}, 2*time.Minute, 5*time.Second).Should(Succeed())
 			}
-			_, err := utils.Run(exec.Command("kubectl", "annotate", roleRes+"pol-uid", "-n", namespace, "--overwrite",
+			_, err = utils.Run(exec.Command("kubectl", "annotate", roleRes+"pol-uid", "-n", namespace, "--overwrite",
 				"pgop.ruck.io/rotate-password=after-uid-change"))
 			Expect(err).NotTo(HaveOccurred())
 			Consistently(func(g Gomega) { g.Expect(passwordOf(g, "pol_uid")).To(Equal(password)) }, 20*time.Second, 2*time.Second).
