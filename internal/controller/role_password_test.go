@@ -394,7 +394,7 @@ var _ = Describe("Role password Secrets", func() {
 
 			_, err := rr().readPasswordSecretRef(ctx, role)
 			Expect(err).To(HaveOccurred())
-			res, uerr := rr().updateStatus(ctx, role, false, "", err)
+			res, uerr := rr().updateStatus(ctx, role, "", err)
 			Expect(uerr).NotTo(HaveOccurred())
 			Expect(res.RequeueAfter).To(BeNumerically(">", 0))
 			cond := meta.FindStatusCondition(role.Status.Conditions, ConditionTypeAvailable)

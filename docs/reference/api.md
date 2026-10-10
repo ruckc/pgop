@@ -206,6 +206,21 @@ spec:
       privileges:          # Only SET (the default); ALTER SYSTEM is not offered
         - SET
       withGrantOption: boolean # WITH GRANT OPTION (default: false)
+
+  # Defaults for this role's sessions (ALTER ROLE ... SET name TO value).
+  # Same rules as Database spec.settings: user-context and custom parameters
+  # only (others: SettingNotAllowed), same denylist, list syntax for
+  # search_path/temp_tablespaces. pgop-set entries removed are RESET.
+  settings:                # max 256
+    string: string         # parameter name: value (value max 4096 chars)
+
+  # Defaults for this role's sessions in one database
+  # (ALTER ROLE ... IN DATABASE db SET name TO value).
+  databaseSettings:        # max 32, each database at most once
+    - database: string     # PostgreSQL database name (required); a missing
+                           # database is pending, not an error
+      settings:            # max 64, same rules as settings
+        string: string
 ```
 
 Annotation `pgop.ruck.io/rotate-password: <any new value>` requests an
@@ -226,6 +241,11 @@ status:
     - parameter: string    # Lowercased parameter name
       privileges: [string]
       withGrantOption: boolean
+  managedSettings:         # Lowercased parameter names pgop set (reset when removed)
+    - string
+  managedDatabaseSettings: # Per database, the names pgop set (reset when removed)
+    - database: string
+      settings: [string]
   passwordHash: string     # DEPRECATED: no longer written, cleared on reconcile
   passwordRotatedAt: string # When the operator last generated the password (RFC 3339)
   passwordRotationRequest: string # Last rotate-password annotation value acted on
@@ -243,7 +263,10 @@ The `Available` condition is `False` with reason `PasswordSecretNotFound` when
 or is already a password hash (`SCRAM-SHA-256$...` or `md5` + 32 hex digits),
 `UnsupportedServerVersion` when `parameterGrants` is set on a server older
 than PostgreSQL 15, `ParameterNotAllowed` when `parameterGrants` names a
-denylisted parameter, `RolePolicyViolation` when the Role requests a
+denylisted parameter, `SettingNotAllowed` when `settings` or
+`databaseSettings` name a parameter that is not `user`-context or custom (the
+others are applied; refused ones pgop set before are reset),
+`RolePolicyViolation` when the Role requests a
 privileged attribute the Cluster's `rolePolicy` does not allow (the role then
 has none of `createRole`, `replication`, `bypassRLS`), names an existing role
 pgop must not take over, or names a pgop-managed Secret in `passwordSecretRef`,

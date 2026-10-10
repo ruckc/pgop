@@ -15,7 +15,9 @@ The Role controller:
    it granted), refusing memberships the [membership policy](#membership-policy)
    does not allow
 5. Grants privileges on configuration parameters (`parameterGrants`, PostgreSQL 15+)
-6. Cleans up the role on deletion, revoking its privileges first (see [Deletion](#deletion))
+6. Sets per-role defaults for configuration parameters (`settings`,
+   `databaseSettings`, see [Role Settings](#role-settings))
+7. Cleans up the role on deletion, revoking its privileges first (see [Deletion](#deletion))
 
 See [Security model](#security-model) for what a Role writer can and cannot
 obtain.
@@ -57,6 +59,8 @@ spec:
 | `passwordSecretRef` | SecretKeySelector | - | Take the password from a key of a Secret you manage (see [Password Source](#password-source)) |
 | `passwordRotation.every` | duration | - | Rotate the generated password on this interval, e.g. `720h` (minimum `1h`; see [Password Rotation](#password-rotation)) |
 | `parameterGrants` | []ParameterGrantSpec | - | `GRANT SET ON PARAMETER` privileges (see [Parameter Grants](#parameter-grants)) |
+| `settings` | map[string]string | - | `ALTER ROLE ... SET` defaults for this role's sessions (see [Role Settings](#role-settings)) |
+| `databaseSettings` | []RoleDatabaseSettings | - | `ALTER ROLE ... IN DATABASE ... SET` defaults, per PostgreSQL database (see [Role Settings](#role-settings)) |
 
 ## Status
 
@@ -67,6 +71,8 @@ spec:
 | `secretName` | Name of the auto-generated credentials secret (`<cluster>-<role>-credentials`) |
 | `managedMemberships` | PostgreSQL roles whose membership pgop granted to this role |
 | `managedParameterGrants` | Parameter privileges pgop granted to this role |
+| `managedSettings` | Parameter names pgop set with `ALTER ROLE ... SET` |
+| `managedDatabaseSettings` | Per database, the parameter names pgop set with `ALTER ROLE ... IN DATABASE ... SET` |
 | `passwordHash` | **Deprecated**, no longer written and cleared on the next reconcile (the fingerprint moved to the credentials Secret, see [Password Source](#password-source)) |
 | `passwordRotatedAt` | When the operator last generated the password; the rotation schedule counts from it |
 | `passwordRotationRequest` | Last `pgop.ruck.io/rotate-password` annotation value acted on |
@@ -394,6 +400,91 @@ spec:
   logging parameters only to roles that do not own databases, or accept that
   risk. Grant only what the role needs.
 
+## Role Settings
+
+`spec.settings` sets defaults for configuration parameters in this role's
+sessions, like `ALTER ROLE <role> SET <name> TO <value>`.
+`spec.databaseSettings` does the same for the role's sessions in one database
+(`ALTER ROLE <role> IN DATABASE <db> SET ...`), which takes precedence over
+both `settings` and the database's own [settings](databases.md#database-settings).
+
+```yaml
+spec:
+  settings:
+    statement_timeout: 30s
+    idle_in_transaction_session_timeout: 60s
+    # The YAML single quotes only quote the string; the value is
+    # "$user", app (with the double quotes).
+    search_path: '"$user", app'
+    myapp.tenant: acme            # custom parameters are allowed
+  databaseSettings:
+    - database: app_db            # PostgreSQL database name
+      settings:
+        work_mem: 64MB
+```
+
+- Keys and values follow the rules of
+  [Database settings](databases.md#database-settings): parameter names
+  (identifiers optionally separated by dots, at most 127 characters,
+  case-insensitive), values sent as SQL string literals (at most 4096
+  characters), and comma-separated lists for `search_path` and
+  `temp_tablespaces` (an empty list is rejected). `settings` takes up to 256
+  entries; `databaseSettings` up to 32 databases with 64 entries each.
+- They apply to sessions that **log in** as the role after the change, not to
+  sessions that switch to it with `SET ROLE`. `NOLOGIN` roles accept settings
+  too, but they only take effect if the role later logs in.
+- `databaseSettings[].database` is a raw PostgreSQL database name (not a
+  Database resource name) and may be any database of the Cluster, including
+  ones pgop does not manage: the setting only affects this role's sessions
+  there. A database that does not exist yet does not fail the Role: it stays
+  `Available` (a Database owned by this Role waits for that), the condition
+  message lists the pending databases, and pgop applies the settings once the
+  database appears (it watches Databases and retries every 30 seconds).
+  Dropping a database removes the role's settings in it; pgop then forgets
+  them.
+- Settings are re-applied on every reconcile, which repairs drift. pgop
+  records the names it set in `status.managedSettings` and
+  `status.managedDatabaseSettings`, and resets (`ALTER ROLE ... RESET <name>`)
+  any of them removed from the spec. Settings made outside pgop are never
+  reset. Without that status (a re-created Role, a restore without status, or
+  a Cluster re-created under the same name) removed settings are not reset.
+- The same parameter policy as for Database settings applies (see
+  [Which parameters may be set](databases.md#which-parameters-may-be-set)):
+  only `user`-context parameters and custom placeholders are set. A refused
+  setting is skipped, the others are applied, and the Role reports
+  `Available=False` with reason `SettingNotAllowed` naming each one; a setting
+  pgop applied earlier that is no longer allowed is reset. The denylisted
+  names (`role`, `session_authorization`, `*_preload_libraries`,
+  `dynamic_library_path`, `jit_provider`, `session_replication_role`,
+  `lo_compat_privileges`, `pgaudit.*`, `set_user.*`, `anon.*`, `sepgsql.*`)
+  are rejected by the API server. A `superuser`-context parameter is refused
+  even when the role holds a [parameter grant](#parameter-grants) for it; the
+  role can still `SET` it in its own sessions.
+- Nothing is applied to a role pgop does not own (`RoleNotManaged`,
+  `DuplicateRoleName`, `ReservedName`) or whose attributes violate the
+  Cluster's role policy (`RolePolicyViolation`); the settings ledger is kept
+  until the Role is reconciled normally again. Reserved roles (`postgres`,
+  `pgop_*`, `pg_*`) can never be targeted, so the operator's own sessions are
+  never affected (they also pin their settings, see
+  [Databases: settings](databases.md#which-parameters-may-be-set)).
+- Settings are deleted with the role: `DROP ROLE` removes them.
+
+!!! warning "Settings are not secret"
+    Role settings are stored in `pg_db_role_setting` and shown in
+    `pg_roles.rolconfig`, which every role on the server can read. Do not put
+    passwords or tokens in them.
+
+**Why this is safe to hand to Role writers.** A role-level default only
+affects sessions of that role, so it cannot change other roles' sessions.
+For `user`-context parameters it gives the role nothing it could not do
+itself: any role may run `ALTER ROLE <itself> [IN DATABASE ...] SET` for such
+parameters. The only difference is that pgop runs the statement as a
+superuser, which is why superuser-only parameters are refused. As with
+Database settings, custom placeholders are accepted without a context check;
+if an extension that defines them as superuser-only is loaded later, the
+stored value applies with that extension's rules (the security extensions'
+namespaces above are denied for that reason).
+
 ## Deletion
 
 When a Role is deleted, pgop drops the PostgreSQL role recorded in
@@ -479,7 +570,7 @@ all of them form one trust domain for the Cluster.
 | Who | Can | Cannot |
 |-----|-----|--------|
 | **Cluster editors** | Everything pgop offers, including widening `spec.rolePolicy`: privileged attributes, predefined roles, memberships in existing roles, untrusted extensions, and **taking over existing roles and databases** (`adoptableRoles`, `adoptableDatabases`). Cluster editors are trusted with the whole server. | — |
-| **Role writers** | Create non-superuser roles with `login`, `createDB`, `inherit`, `connectionLimit`, passwords, parameter grants (with a denylist), and memberships in roles that pass the [membership policy](#membership-policy). Read the other Secrets of the namespace via `passwordSecretRef`. | Create superusers (the field no longer exists; roles are always `NOSUPERUSER`). Read pgop's own Secrets (the Cluster's superuser credentials, TLS keys) through `passwordSecretRef`. Get `createRole`, `replication` or `bypassRLS`, or membership in predefined `pg_*` roles, unless the Cluster allows it. Become a member of a superuser, `postgres`, `pgop_*` or the server-file roles, or of any role that leads to them. Take over, reset the password of, or drop an existing role pgop did not create for them, whatever its comment says, unless a Cluster editor allowlists it (`RoleNotManaged`); reuse another Role's PostgreSQL name (`DuplicateRoleName`). Join roles that no Role of the Cluster manages unless the Cluster lists them. Grant `SET` on parameters that are not `user`/`superuser` context or on the denylist. Use the `pgop_` prefix, `pg_` prefix or `postgres` as role names. |
+| **Role writers** | Create non-superuser roles with `login`, `createDB`, `inherit`, `connectionLimit`, passwords, parameter grants (with a denylist), role settings (user-context parameters only), and memberships in roles that pass the [membership policy](#membership-policy). Read the other Secrets of the namespace via `passwordSecretRef`. | Create superusers (the field no longer exists; roles are always `NOSUPERUSER`). Read pgop's own Secrets (the Cluster's superuser credentials, TLS keys) through `passwordSecretRef`. Get `createRole`, `replication` or `bypassRLS`, or membership in predefined `pg_*` roles, unless the Cluster allows it. Become a member of a superuser, `postgres`, `pgop_*` or the server-file roles, or of any role that leads to them. Take over, reset the password of, or drop an existing role pgop did not create for them, whatever its comment says, unless a Cluster editor allowlists it (`RoleNotManaged`); reuse another Role's PostgreSQL name (`DuplicateRoleName`). Join roles that no Role of the Cluster manages unless the Cluster lists them. Grant `SET` on parameters that are not `user`/`superuser` context or on the denylist. Set role defaults (`settings`, `databaseSettings`) other than `user`-context or custom parameters, or on any role but their own. Use the `pgop_` prefix, `pg_` prefix or `postgres` as role names. |
 | **Database writers** | Everything inside *their* database: owner, schemas, grants, settings (user-context parameters only), trusted extensions (see [Databases: security model](databases.md#security-model)). | Take over or drop a database pgop did not create for them (`DatabaseNotManaged`, `DuplicateDatabaseName`). Install untrusted extensions unless the Cluster lists them. Manage the `postgres`, `template0` or `template1` databases or system schemas (`pg_*`, `information_schema`). Change the operator's session settings (`search_path`, `role`, timeouts, read-only) with `ALTER DATABASE ... SET`. |
 
 Because the policy lives on the **Cluster**, granting someone RBAC to create

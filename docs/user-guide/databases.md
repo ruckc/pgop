@@ -300,6 +300,8 @@ restricts what a Database author can set:
   reports `Available=False` with reason `SettingNotAllowed` naming the
   parameter. A setting pgop applied earlier that is no longer allowed is
   reset.
+- The same policy (and code) applies to a Role's
+  [`settings` and `databaseSettings`](roles.md#role-settings).
 
 !!! warning "Remaining risk"
     User-context parameters still affect every other session in the
