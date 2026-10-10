@@ -330,6 +330,8 @@ spec:
             - clusterRef
             type: object
             x-kubernetes-validations:
+            - message: clusterRef is immutable; create a new Role for another Cluster
+              rule: self.clusterRef.name == oldSelf.clusterRef.name
             - message: passwordRotation cannot be combined with passwordSecretRef;
                 rotate the referenced Secret instead
               rule: '!(has(self.passwordSecretRef) && has(self.passwordRotation))'
@@ -342,6 +344,13 @@ spec:
           status:
             description: status defines the observed state of Role
             properties:
+              clusterUID:
+                description: |-
+                  clusterUID is the UID of the Cluster on which roleName was created or
+                  adopted. pgop only treats roleName as this Role's own when it matches
+                  the UID of the Cluster the Role references; a Cluster deleted and
+                  re-created under the same name has a new UID.
+                type: string
               conditions:
                 description: conditions represent the current state of the Role resource.
                 items:

@@ -65,6 +65,7 @@ type PasswordRotationSpec struct {
 }
 
 // RoleSpec defines the desired state of Role
+// +kubebuilder:validation:XValidation:rule="self.clusterRef.name == oldSelf.clusterRef.name",message="clusterRef is immutable; create a new Role for another Cluster"
 // +kubebuilder:validation:XValidation:rule="!(has(self.passwordSecretRef) && has(self.passwordRotation))",message="passwordRotation cannot be combined with passwordSecretRef; rotate the referenced Secret instead"
 // +kubebuilder:validation:XValidation:rule="has(oldSelf.roleName) == has(self.roleName) && (!has(self.roleName) || self.roleName == oldSelf.roleName)",message="roleName is immutable"
 // +kubebuilder:validation:XValidation:rule="!has(self.memberOf) || !has(self.memberships) || self.memberOf.all(r, !self.memberships.exists(m, m.role == r))",message="a role must not be listed in both memberOf and memberships"
@@ -265,6 +266,13 @@ type RoleStatus struct {
 	// roleName is the effective PostgreSQL role name that was reconciled.
 	// +optional
 	RoleName string `json:"roleName,omitempty"`
+
+	// clusterUID is the UID of the Cluster on which roleName was created or
+	// adopted. pgop only treats roleName as this Role's own when it matches
+	// the UID of the Cluster the Role references; a Cluster deleted and
+	// re-created under the same name has a new UID.
+	// +optional
+	ClusterUID string `json:"clusterUID,omitempty"`
 
 	// secretName is the name of the Secret containing the role's credentials.
 	// The secret contains 'username' and 'password' keys.

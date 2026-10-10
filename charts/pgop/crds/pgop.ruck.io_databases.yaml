@@ -268,12 +268,21 @@ spec:
             - clusterRef
             type: object
             x-kubernetes-validations:
+            - message: clusterRef is immutable; create a new Database for another
+                Cluster
+              rule: self.clusterRef.name == oldSelf.clusterRef.name
             - message: databaseName is immutable
               rule: has(oldSelf.databaseName) == has(self.databaseName) && (!has(self.databaseName)
                 || self.databaseName == oldSelf.databaseName)
           status:
             description: status defines the observed state of Database
             properties:
+              clusterUID:
+                description: |-
+                  clusterUID is the UID of the Cluster on which databaseName was created
+                  or adopted. pgop only treats databaseName as this Database's own when
+                  it matches the UID of the Cluster the Database references.
+                type: string
               conditions:
                 description: conditions represent the current state of the Database
                   resource.

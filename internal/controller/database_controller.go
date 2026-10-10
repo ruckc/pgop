@@ -156,7 +156,11 @@ func (r *DatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	if err != nil {
 		return r.updateStatus(ctx, database, false, nil, nil, err)
 	}
-	if err := ensureDatabase(ctx, adminClient, database, signer, cluster.Spec.RolePolicy, pgName, ownerPGName); err != nil {
+	recorded, err := r.databaseRecorded(ctx, database, cluster, pgName)
+	if err != nil {
+		return r.updateStatus(ctx, database, false, nil, nil, err)
+	}
+	if err := ensureDatabase(ctx, adminClient, database, cluster, signer, pgName, ownerPGName, recorded); err != nil {
 		log.Error(err, "Failed to create database")
 		return r.updateStatus(ctx, database, false, nil, nil, err)
 	}
@@ -279,7 +283,7 @@ func reconcileSchemas(ctx context.Context, pg *postgres.Client, database *postgr
 type databaseOwnershipClient interface {
 	DatabaseComment(ctx context.Context, name string) (exists bool, comment string, err error)
 	CommentOnDatabase(ctx context.Context, name, comment string) error
-	CreateDatabase(ctx context.Context, name, owner string) error
+	CreateDatabase(ctx context.Context, name, owner string, createOnly bool) error
 }
 
 // ensureDatabase creates the PostgreSQL database pgName with the Database's
@@ -289,27 +293,63 @@ type databaseOwnershipClient interface {
 // existing database is left alone (reason DatabaseNotManaged). It records
 // pgName in status.databaseName once the database exists.
 func ensureDatabase(ctx context.Context, pg databaseOwnershipClient, database *postgresv1alpha1.Database,
-	signer markerSigner, policy *postgresv1alpha1.RolePolicySpec, pgName, owner string) error {
+	cluster *postgresv1alpha1.Cluster, signer markerSigner, pgName, owner string, recorded bool) error {
 	marker := signer.marker(markerKindDatabase, database.Name)
 	exists, comment, err := pg.DatabaseComment(ctx, pgName)
 	if err != nil {
 		return err
 	}
-	recorded := database.Status.DatabaseName == pgName
-	if decideOwnership(signer, markerKindDatabase, database.Name, exists, comment, recorded,
-		policy.AllowsAdoptingDatabase(pgName)) == notOwned {
+	decision := decideOwnership(signer, markerKindDatabase, database.Name, exists, comment, recorded,
+		cluster.Spec.RolePolicy.AllowsAdoptingDatabase(pgName))
+	if decision == notOwned {
 		return &conditionError{reason: ReasonDatabaseNotManaged, err: errors.New(notManagedMessage("database", pgName, recorded))}
 	}
-	if err := pg.CreateDatabase(ctx, pgName, owner); err != nil {
+	// A database pgop decided to create is only ever created: if someone
+	// created it in the meantime, pgop does not change its owner.
+	if err := pg.CreateDatabase(ctx, pgName, owner, decision == ownedAbsent); err != nil {
+		if errors.Is(err, postgres.ErrObjectExists) {
+			return &conditionError{reason: ReasonDatabaseNotManaged, err: fmt.Errorf(
+				"the PostgreSQL database %s was created by someone else while pgop was creating it; "+
+					"pgop does not take it over: %w", pgName, err)}
+		}
 		return err
 	}
-	// Record the name now, so a failed COMMENT is retried as a legacy
-	// database (and deletion still finds it).
+	// Record the name (and Cluster) now, so a failed COMMENT is retried as
+	// a recorded database and deletion still finds it.
 	database.Status.DatabaseName = pgName
+	database.Status.ClusterUID = string(cluster.UID)
 	if comment != marker {
 		return pg.CommentOnDatabase(ctx, pgName, marker)
 	}
 	return nil
+}
+
+// databaseRecorded reports whether database's status records pgName as
+// created or adopted on cluster, the Cluster it references now (see
+// roleRecorded). A status written before clusterUID existed counts only when
+// the Database's credentials Secret exists, is controlled by the Database and
+// points at this Cluster's host.
+func (r *DatabaseReconciler) databaseRecorded(ctx context.Context, database *postgresv1alpha1.Database,
+	cluster *postgresv1alpha1.Cluster, pgName string) (bool, error) {
+	if pgName == "" || database.Status.DatabaseName != pgName {
+		return false, nil
+	}
+	if database.Status.ClusterUID != "" {
+		return database.Status.ClusterUID == string(cluster.UID), nil
+	}
+	if database.Spec.Owner == "" {
+		return false, nil
+	}
+	secret := &corev1.Secret{}
+	err := r.Get(ctx, types.NamespacedName{Name: database.Name + "-" + database.Spec.Owner + "-credentials",
+		Namespace: database.Namespace}, secret)
+	if apierrors.IsNotFound(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return metav1.IsControlledBy(secret, database) && string(secret.Data[SecretKeyHost]) == clusterHost(cluster), nil
 }
 
 // checkDatabaseName returns a ReservedName error for a reserved PostgreSQL
@@ -343,8 +383,12 @@ func (r *DatabaseReconciler) checkDatabaseName(ctx context.Context, database *po
 func (r *DatabaseReconciler) dropPostgresDatabase(ctx context.Context, cluster *postgresv1alpha1.Cluster, database *postgresv1alpha1.Database) error {
 	log := logf.FromContext(ctx)
 	pgName := database.Status.DatabaseName
-	if pgName == "" {
-		log.Info("No PostgreSQL database recorded for this Database, nothing to drop")
+	recorded, err := r.databaseRecorded(ctx, database, cluster, pgName)
+	if err != nil {
+		return err
+	}
+	if pgName == "" || !recorded {
+		log.Info("No PostgreSQL database recorded for this Database on this Cluster, nothing to drop")
 		return nil
 	}
 	if err := r.checkDatabaseName(ctx, database, pgName); err != nil {

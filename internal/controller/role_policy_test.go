@@ -218,6 +218,8 @@ var _ = Describe("Role policy", func() {
 			Entry("recorded, no comment", true, "", true, false, ownedRemark),
 			Entry("recorded, v1 marker", true, "pgop:v1:Role/me", true, false, ownedRemark),
 			Entry("recorded, marker from a lost key", true, otherKeySigner.marker(markerKindRole, "me"), true, false, ownedRemark),
+			Entry("recorded, current key id with a bad signature", true, "pgop:v2:Role/me:"+testSigner.keyID()+".AAAA", true, false, notOwned),
+			Entry("recorded, v2 prefix without key id", true, "pgop:v2:Role/me:AAAA", true, false, notOwned),
 			Entry("recorded, DBA comment", true, "app team", true, false, notOwned),
 			Entry("recorded, another resource's marker", true, ownerMarker(markerKindRole, "other"), true, false, notOwned),
 			Entry("unrecorded, valid marker (copied)", true, ownerMarker(markerKindRole, "me"), false, false, notOwned),

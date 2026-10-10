@@ -266,6 +266,23 @@ type RoleOptions struct {
 	// Comment, when set, is stored with COMMENT ON ROLE in the same
 	// transaction as the CREATE/ALTER ROLE (pgop's ownership marker).
 	Comment string
+	// CreateOnly makes CreateRole only ever run CREATE ROLE: when the role
+	// exists (for example created by someone else after the caller checked),
+	// it fails with ErrObjectExists instead of altering it.
+	CreateOnly bool
+}
+
+// ErrObjectExists reports that CREATE ROLE / CREATE DATABASE found the object
+// already there although the caller asked for a create only.
+var ErrObjectExists = errors.New("the object already exists")
+
+// duplicateObjectError wraps err in ErrObjectExists when it is PostgreSQL's
+// duplicate_object (42710, roles) or duplicate_database (42P04) error.
+func duplicateObjectError(what string, err error) error {
+	if pqErr, ok := errors.AsType[*pq.Error](err); ok && (pqErr.Code == "42710" || pqErr.Code == "42P04") {
+		return fmt.Errorf("%s: %w", what, ErrObjectExists)
+	}
+	return nil
 }
 
 // CreateRole creates a new PostgreSQL role with the given options, or updates
@@ -275,9 +292,12 @@ type RoleOptions struct {
 func (c *Client) CreateRole(ctx context.Context, name string, opts RoleOptions) error {
 	// Check if role exists
 	var exists bool
-	err := c.db.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname = $1)", name).Scan(&exists)
-	if err != nil {
-		return fmt.Errorf("failed to check role existence: %w", err)
+	var err error
+	if !opts.CreateOnly {
+		err = c.db.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname = $1)", name).Scan(&exists)
+		if err != nil {
+			return fmt.Errorf("failed to check role existence: %w", err)
+		}
 	}
 
 	if exists && opts.KeepExistingPassword {
@@ -293,6 +313,9 @@ func (c *Client) CreateRole(ctx context.Context, name string, opts RoleOptions) 
 	query := c.buildRoleQuery(name, exists, opts)
 	if opts.Comment == "" {
 		if _, err = c.db.ExecContext(ctx, query); err != nil {
+			if dup := duplicateObjectError(fmt.Sprintf("role %q", name), err); dup != nil {
+				return dup
+			}
 			return redactedError(fmt.Sprintf("failed to create/alter role %q", name), err, plaintext, opts.Password)
 		}
 		return nil
@@ -303,6 +326,9 @@ func (c *Client) CreateRole(ctx context.Context, name string, opts RoleOptions) 
 	}
 	defer func() { _ = tx.Rollback() }()
 	if _, err = tx.ExecContext(ctx, query); err != nil {
+		if dup := duplicateObjectError(fmt.Sprintf("role %q", name), err); dup != nil {
+			return dup
+		}
 		return redactedError(fmt.Sprintf("failed to create/alter role %q", name), err, plaintext, opts.Password)
 	}
 	if _, err = tx.ExecContext(ctx, buildCommentQuery("ROLE", name, opts.Comment)); err != nil {
@@ -685,37 +711,38 @@ WHERE u.rolname = $1`
 	return out, nil
 }
 
-// CreateDatabase creates a new database
-func (c *Client) CreateDatabase(ctx context.Context, name, owner string) error {
-	// Check if database exists
-	var exists bool
-	err := c.db.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)", name).Scan(&exists)
-	if err != nil {
-		return fmt.Errorf("failed to check database existence: %w", err)
-	}
-
-	if exists {
-		// Update owner if needed
-		if owner != "" {
-			query := fmt.Sprintf("ALTER DATABASE %s OWNER TO %s", quoteIdent(name), quoteIdent(owner))
-			_, err = c.db.ExecContext(ctx, query)
-			if err != nil {
-				return fmt.Errorf("failed to alter database owner: %w", err)
-			}
+// CreateDatabase creates a new database, or, unless createOnly is set, sets
+// the owner of an existing one. With createOnly it only ever runs CREATE
+// DATABASE and fails with ErrObjectExists when the database exists (for
+// example created by someone else after the caller checked).
+func (c *Client) CreateDatabase(ctx context.Context, name, owner string, createOnly bool) error {
+	if !createOnly {
+		var exists bool
+		err := c.db.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)", name).Scan(&exists)
+		if err != nil {
+			return fmt.Errorf("failed to check database existence: %w", err)
 		}
-		return nil
+		if exists {
+			if owner != "" {
+				query := fmt.Sprintf("ALTER DATABASE %s OWNER TO %s", quoteIdent(name), quoteIdent(owner))
+				if _, err := c.db.ExecContext(ctx, query); err != nil {
+					return fmt.Errorf("failed to alter database owner: %w", err)
+				}
+			}
+			return nil
+		}
 	}
 
 	query := fmt.Sprintf("CREATE DATABASE %s", quoteIdent(name))
 	if owner != "" {
 		query += fmt.Sprintf(" OWNER %s", quoteIdent(owner))
 	}
-
-	_, err = c.db.ExecContext(ctx, query)
-	if err != nil {
+	if _, err := c.db.ExecContext(ctx, query); err != nil {
+		if dup := duplicateObjectError(fmt.Sprintf("database %q", name), err); dup != nil {
+			return dup
+		}
 		return fmt.Errorf("failed to create database: %w", err)
 	}
-
 	return nil
 }
 

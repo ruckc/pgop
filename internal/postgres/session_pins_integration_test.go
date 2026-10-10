@@ -19,6 +19,7 @@ package postgres
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"os"
 	"strconv"
 	"testing"
@@ -150,6 +151,17 @@ func checkCatalogHelpers(ctx context.Context, t *testing.T, admin, c *Client, db
 	}
 	if exists, _, err := admin.RoleComment(ctx, "pgop_pin_missing"); err != nil || exists {
 		t.Errorf("RoleComment of a missing role = %t %v", exists, err)
+	}
+	// Create-only never turns into an ALTER of an object someone else created.
+	err := admin.CreateRole(ctx, "pgop_pin_marked", RoleOptions{Inherit: true, ConnectionLimit: -1, Comment: "x", CreateOnly: true})
+	if !errors.Is(err, ErrObjectExists) {
+		t.Errorf("CreateRole(CreateOnly) on an existing role = %v, want ErrObjectExists", err)
+	}
+	if exists, comment, _ := admin.RoleComment(ctx, "pgop_pin_marked"); !exists || comment != marker {
+		t.Errorf("the existing role was changed: comment %q", comment)
+	}
+	if err := admin.CreateDatabase(ctx, db, "", true); !errors.Is(err, ErrObjectExists) {
+		t.Errorf("CreateDatabase(createOnly) on an existing database = %v, want ErrObjectExists", err)
 	}
 	closure, err := admin.MembershipClosure(ctx, "pgop_pin_marked")
 	if err != nil || len(closure) != 1 || closure[0].Comment != marker {

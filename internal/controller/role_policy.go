@@ -87,11 +87,32 @@ func newMarkerSigner(cluster *postgresv1alpha1.Cluster, key []byte) markerSigner
 	return markerSigner{key: key, namespace: cluster.Namespace, cluster: cluster.Name}
 }
 
-// marker returns the marker of the resource kind/name.
+// keyID identifies the key (a short hash of it), so a marker signed with a
+// lost key can be told apart from one forged under the current key.
+func (s markerSigner) keyID() string {
+	sum := sha256.Sum256(s.key)
+	return base64.RawURLEncoding.EncodeToString(sum[:6])
+}
+
+// marker returns the marker of the resource kind/name:
+// pgop:v2:<Kind>/<name>:<key id>.<HMAC>.
 func (s markerSigner) marker(kind, name string) string {
 	mac := hmac.New(sha256.New, s.key)
 	mac.Write([]byte(kind + "|" + s.namespace + "|" + s.cluster + "|" + name))
-	return markerV2Prefix + kind + "/" + name + ":" + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+	return markerV2Prefix + kind + "/" + name + ":" + s.keyID() + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+}
+
+// otherKeyMarker reports whether comment is a v2 marker of kind/name that
+// names a key other than the current one (the key Secret was lost and
+// regenerated). A v2 marker naming the current key is only accepted if its
+// signature verifies.
+func (s markerSigner) otherKeyMarker(comment, kind, name string) bool {
+	rest, ok := strings.CutPrefix(comment, markerV2Prefix+kind+"/"+name+":")
+	if !ok {
+		return false
+	}
+	id, _, ok := strings.Cut(rest, ".")
+	return ok && id != s.keyID()
 }
 
 // verify reports, in constant time, whether comment is the marker of
@@ -105,12 +126,13 @@ func legacyMarker(kind, name string) string {
 	return markerV1Prefix + kind + "/" + name
 }
 
-// ownMarkerComment reports whether comment is, or was, the marker of
-// kind/name: empty, the unsigned v1 marker, or a v2 marker of that name
-// (whose signature may come from a lost key).
-func ownMarkerComment(comment, kind, name string) bool {
-	return comment == "" || comment == legacyMarker(kind, name) ||
-		strings.HasPrefix(comment, markerV2Prefix+kind+"/"+name+":")
+// refreshableComment reports whether comment, on an object the resource's
+// status records on this Cluster, is a marker pgop should refresh: empty,
+// the unsigned v1 marker of an earlier build, or a v2 marker of that name
+// signed with a key that is no longer the Cluster's. A v2 marker that names
+// the current key but does not verify is not (it was not written by pgop).
+func refreshableComment(s markerSigner, comment, kind, name string) bool {
+	return comment == "" || comment == legacyMarker(kind, name) || s.otherKeyMarker(comment, kind, name)
 }
 
 // ownership is how a resource relates to the PostgreSQL object of its name.
@@ -131,16 +153,16 @@ const (
 )
 
 // decideOwnership classifies the PostgreSQL object of kind/name. recorded
-// reports whether the resource's status records the name; allowlisted
-// whether the Cluster's rolePolicy lists it as adoptable. The comment never
-// grants ownership on its own.
+// reports whether the resource's status records the name on the referenced
+// Cluster (same Cluster UID); allowlisted whether the Cluster's rolePolicy
+// lists it as adoptable. The comment never grants ownership on its own.
 func decideOwnership(s markerSigner, kind, name string, exists bool, comment string, recorded, allowlisted bool) ownership {
 	switch {
 	case !exists:
 		return ownedAbsent
 	case recorded && s.verify(comment, kind, name):
 		return owned
-	case recorded && ownMarkerComment(comment, kind, name):
+	case recorded && refreshableComment(s, comment, kind, name):
 		return ownedRemark
 	case allowlisted:
 		return adoptable

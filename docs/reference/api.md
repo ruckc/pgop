@@ -138,7 +138,7 @@ Condition types:
 
 ```yaml
 spec:
-  # Reference to the cluster (required, same namespace)
+  # Reference to the cluster (required, same namespace, immutable)
   clusterRef:
     name: string           # Cluster name
 
@@ -218,6 +218,7 @@ password). Each value is acted on once.
 status:
   ready: boolean           # Role exists in PostgreSQL
   roleName: string         # Effective PostgreSQL role name
+  clusterUID: string       # UID of the Cluster roleName was created/adopted on
   secretName: string       # Auto-generated credentials secret
   managedMemberships:      # Roles whose membership pgop granted (revoked when removed)
     - string
@@ -286,7 +287,7 @@ to subjects that may already read the namespace's other Secrets. See
 
 ```yaml
 spec:
-  # Reference to the cluster (required, same namespace)
+  # Reference to the cluster (required, same namespace, immutable)
   clusterRef:
     name: string
 
@@ -356,6 +357,8 @@ role that does not exist yet.
 ```yaml
 status:
   ready: boolean
+  databaseName: string     # Effective PostgreSQL database name
+  clusterUID: string       # UID of the Cluster databaseName was created/adopted on
   installedExtensions:
     - string               # List of installed extension names
   createdSchemas:

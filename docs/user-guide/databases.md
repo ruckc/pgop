@@ -431,8 +431,11 @@ escalation for the writer).
 
 As for [roles](roles.md#ownership-of-the-postgresql-role), pgop only changes
 the owner, settings, grants, extensions and schemas of, or drops, a database
-this Database owns: one its `status.databaseName` records, one pgop creates in
-this reconcile, or an existing one a **Cluster editor** listed in the
+this Database owns: one its `status.databaseName` records on the referenced
+Cluster (`status.clusterUID` matches the Cluster's UID; `clusterRef` is
+immutable), one pgop creates in this reconcile (a plain `CREATE DATABASE`; one
+created by someone else in the meantime is reported, not altered), or an
+existing one a **Cluster editor** listed in the
 Cluster's [`spec.rolePolicy.adoptableDatabases`](clusters.md#role-policy)
 (then taken over and recorded). Any other existing database (created by a
 DBA, a restore tool, another Database, or a role with `CREATEDB`) is left
@@ -448,8 +451,12 @@ Database never drops it. A database's comment never authorizes a take-over
   marker is refreshed;
 - of two Databases of a Cluster with the same PostgreSQL name only the older
   one is reconciled; the other reports `DuplicateDatabaseName`;
-- a Database re-created without its status reports `DatabaseNotManaged` until
-  a Cluster editor lists the database in `adoptableDatabases`;
+- a Database re-created without its status, or whose Cluster was deleted and
+  re-created, reports `DatabaseNotManaged` (and deleting it drops nothing)
+  until a Cluster editor lists the database in `adoptableDatabases`; removing
+  the name from the list later does not un-adopt it. Databases recorded by an
+  earlier pgop (no `status.clusterUID`) count as recorded when their
+  credentials Secret, controlled by the Database, points at this Cluster;
 - a database whose owner turned connections off (`ALTER DATABASE ... WITH
   ALLOW_CONNECTIONS false`, which also locks out superusers) reports
   `DatabaseNotConnectable`: its settings and grants are still applied, its

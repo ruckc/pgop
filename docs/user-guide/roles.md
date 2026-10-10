@@ -141,9 +141,14 @@ spec:
 pgop only creates, alters, sets the password of, or drops a PostgreSQL role
 that this Role **owns**:
 
-- a role the Role's own `status.roleName` records: pgop created or adopted it
-  earlier (Role writers cannot write status);
-- a role pgop creates in this reconcile; or
+- a role the Role's own `status.roleName` records **on this Cluster**: pgop
+  created or adopted it earlier, and `status.clusterUID` is the UID of the
+  Cluster the Role references (Role writers cannot write status; a Cluster
+  deleted and re-created under the same name has a new UID, and `clusterRef`
+  cannot be changed after creation);
+- a role pgop creates in this reconcile (with a plain `CREATE ROLE`: if
+  someone creates the role in the meantime, pgop reports `RoleNotManaged`
+  instead of altering theirs); or
 - an existing role a **Cluster editor** listed in the Cluster's
   [`spec.rolePolicy.adoptableRoles`](clusters.md#role-policy). pgop then takes
   it over (sets its attributes and password, hands the password out, drops it
@@ -164,8 +169,8 @@ pgop also stores a signed marker with every role it owns, in the
 transaction that creates it:
 
 ```sql
--- pgop:v2:Role/<Role name>:<HMAC-SHA256 of kind, namespace, Cluster and name>
-COMMENT ON ROLE app_user IS 'pgop:v2:Role/app-user:3q2-...'
+-- pgop:v2:Role/<Role name>:<key id>.<HMAC-SHA256 of kind, namespace, Cluster and name>
+COMMENT ON ROLE app_user IS 'pgop:v2:Role/app-user:Xk3f9a.3q2-...'
 ```
 
 The HMAC key is a random per-Cluster key in the Secret
@@ -185,14 +190,22 @@ ownership by itself.
   below).
 - **Upgrade from earlier pgop, lost key:** a role recorded in
   `status.roleName` whose comment is empty, the unsigned `pgop:v1:Role/<name>`
-  marker of an earlier build, or a `pgop:v2:Role/<name>:...` marker signed with
-  a lost key is re-marked on the next reconcile. If `<cluster>-marker-key` is
+  marker of an earlier build, or a `pgop:v2:Role/<name>:...` marker naming
+  another (lost) key is re-marked on the next reconcile. A marker that names
+  the current key but does not verify is never accepted. Roles recorded by an
+  earlier pgop (no `status.clusterUID` yet) count as recorded only when the
+  Role's credentials Secret for that Cluster (`<cluster>-<role>-credentials`,
+  controlled by the Role) proves it; NOLOGIN roles without a Secret need the
+  allowlist once. If `<cluster>-marker-key` is
   deleted, the Cluster generates a new key and recorded roles are re-marked
   automatically; nothing has to be done by hand.
-- **Re-created Role without status** (restored from Git or a backup without
-  status): its role is no longer recorded, so it reports `RoleNotManaged`
-  until a Cluster editor lists the role in `adoptableRoles` (the entry can be
-  removed again once the Role is ready and has recorded it).
+- **Re-created Role without status, or re-created Cluster** (restored from
+  Git or a backup without status, or a Cluster deleted and re-created under
+  the same name): the role is no longer recorded for that Cluster, so the Role
+  reports `RoleNotManaged` and deleting it drops nothing, until a Cluster
+  editor lists the role in `adoptableRoles`. Removing a name from
+  `adoptableRoles` later does not un-adopt it: once adopted, the role is
+  recorded in the Role's status and stays managed.
 
 ## Memberships
 

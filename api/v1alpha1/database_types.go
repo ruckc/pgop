@@ -21,6 +21,7 @@ import (
 )
 
 // DatabaseSpec defines the desired state of Database
+// +kubebuilder:validation:XValidation:rule="self.clusterRef.name == oldSelf.clusterRef.name",message="clusterRef is immutable; create a new Database for another Cluster"
 // +kubebuilder:validation:XValidation:rule="has(oldSelf.databaseName) == has(self.databaseName) && (!has(self.databaseName) || self.databaseName == oldSelf.databaseName)",message="databaseName is immutable"
 type DatabaseSpec struct {
 	// clusterRef references the PostgreSQL Cluster this database belongs to
@@ -206,6 +207,12 @@ type DatabaseStatus struct {
 	// databaseName is the effective PostgreSQL database name that was reconciled.
 	// +optional
 	DatabaseName string `json:"databaseName,omitempty"`
+
+	// clusterUID is the UID of the Cluster on which databaseName was created
+	// or adopted. pgop only treats databaseName as this Database's own when
+	// it matches the UID of the Cluster the Database references.
+	// +optional
+	ClusterUID string `json:"clusterUID,omitempty"`
 
 	// installedExtensions lists extensions that have been successfully installed
 	// +optional

@@ -104,7 +104,7 @@ func RegisterRolePolicyTests() {
 
 		AfterAll(func() {
 			for _, res := range []string{dbRes + "pol-db", dbRes + "pol-db-dup", dbRes + "pol-dbaowned", dbRes + "pol-squat",
-				roleRes + "pol-svc", roleRes + "pol-steal",
+				roleRes + "pol-svc", roleRes + "pol-uid", dbRes + "pol-uid-db", roleRes + "pol-steal",
 				roleRes + "pol-mem2", roleRes + "pol-old", roleRes + "pol-priv", roleRes + "pol-mem", roleRes + "pol-adopt",
 				roleRes + "pol-adopt-su", roleRes + "pol-dup"} {
 				_, _ = utils.Run(exec.Command("kubectl", "delete", "-n", namespace, "--ignore-not-found",
@@ -112,7 +112,8 @@ func RegisterRolePolicyTests() {
 			}
 			_, _ = psql(`DROP DATABASE IF EXISTS pol_dbaowned`)
 			_, _ = psql(`DROP DATABASE IF EXISTS pol_squat`)
-			for _, role := range []string{"pol_dba", "pol_adopt_su", "pol_dba_app", "pol_analytics", "pol_svc", "pol_w", "pol_squatter"} {
+			_, _ = psql(`DROP DATABASE IF EXISTS pol_uid_db`)
+			for _, role := range []string{"pol_dba", "pol_adopt_su", "pol_dba_app", "pol_analytics", "pol_svc", "pol_w", "pol_squatter", "pol_uid"} {
 				_, _ = psql(`DROP ROLE IF EXISTS ` + role)
 			}
 			_, _ = utils.Run(exec.Command("kubectl", "patch", clusterRes, "-n", namespace,
@@ -511,6 +512,72 @@ spec:
 			_, err = utils.Run(exec.Command("kubectl", "delete", "-n", namespace, "--wait=true", "--timeout=2m", dbRes+"pol-squat"))
 			Expect(err).NotTo(HaveOccurred())
 			Expect(psql(`SELECT count(*) FROM pg_database WHERE datname = 'pol_squat'`)).To(Equal("1"))
+		})
+
+		It("does not let a Role or Database follow its name to another or re-created Cluster", func() {
+			By("refusing to retarget clusterRef")
+			for _, res := range []string{roleRes + "pol-old", dbRes + "pol-db"} {
+				_, err := utils.Run(exec.Command("kubectl", "patch", res, "-n", namespace, "--type=merge",
+					"-p", `{"spec":{"clusterRef":{"name":"cluster-b"}}}`))
+				Expect(err).To(HaveOccurred(), res)
+				Expect(err.Error()).To(ContainSubstring("clusterRef is immutable"))
+			}
+
+			By("treating names recorded on a Cluster with another UID (deleted and re-created) as not this resource's")
+			Expect(apply(`
+apiVersion: pgop.ruck.io/v1alpha1
+kind: Role
+metadata:
+  name: pol-uid
+spec:
+  clusterRef:
+    name: example-cluster
+  roleName: pol_uid
+---
+apiVersion: pgop.ruck.io/v1alpha1
+kind: Database
+metadata:
+  name: pol-uid-db
+spec:
+  clusterRef:
+    name: example-cluster
+  databaseName: pol_uid_db
+  owner: pol-old
+`)).To(Succeed())
+			waitReady(roleRes + "pol-uid")
+			waitReady(dbRes + "pol-uid-db")
+			var password string
+			Eventually(func(g Gomega) { password = passwordOf(g, "pol_uid") }).Should(Succeed())
+			// Simulate a re-created Cluster: the recorded clusterUID no longer
+			// matches the Cluster the resources reference.
+			for _, res := range []string{roleRes + "pol-uid", dbRes + "pol-uid-db"} {
+				Eventually(func(g Gomega) {
+					_, err := utils.Run(exec.Command("kubectl", "patch", res, "-n", namespace, "--subresource=status",
+						"--type=merge", "-p", `{"status":{"clusterUID":"uid-of-a-deleted-cluster"}}`))
+					g.Expect(err).NotTo(HaveOccurred())
+					_, err = utils.Run(exec.Command("kubectl", "annotate", res, "-n", namespace, "--overwrite",
+						"pgop.ruck.io/nudge="+time.Now().Format("150405.000")))
+					g.Expect(err).NotTo(HaveOccurred())
+					g.Expect(jsonpath(g, res, availableReason)).To(Or(Equal("RoleNotManaged"), Equal("DatabaseNotManaged")))
+				}, 2*time.Minute, 5*time.Second).Should(Succeed())
+			}
+			_, err := utils.Run(exec.Command("kubectl", "annotate", roleRes+"pol-uid", "-n", namespace, "--overwrite",
+				"pgop.ruck.io/rotate-password=after-uid-change"))
+			Expect(err).NotTo(HaveOccurred())
+			Consistently(func(g Gomega) { g.Expect(passwordOf(g, "pol_uid")).To(Equal(password)) }, 20*time.Second, 2*time.Second).
+				Should(Succeed())
+
+			By("never dropping them on delete")
+			for _, res := range []string{dbRes + "pol-uid-db", roleRes + "pol-uid"} {
+				_, err = utils.Run(exec.Command("kubectl", "delete", "-n", namespace, "--wait=true", "--timeout=2m", res))
+				Expect(err).NotTo(HaveOccurred())
+			}
+			Expect(psql(`SELECT count(*) FROM pg_roles WHERE rolname = 'pol_uid'`)).To(Equal("1"))
+			Expect(psql(`SELECT count(*) FROM pg_database WHERE datname = 'pol_uid_db'`)).To(Equal("1"))
+			_, err = psql(`DROP DATABASE pol_uid_db`)
+			Expect(err).NotTo(HaveOccurred())
+			_, err = psql(`DROP ROLE pol_uid`)
+			Expect(err).NotTo(HaveOccurred())
 		})
 
 		It("re-marks recorded objects after the marker key is lost, and still refuses unrecorded ones", func() {

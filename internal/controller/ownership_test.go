@@ -25,9 +25,11 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	postgresv1alpha1 "github.com/ruckc/pgop/api/v1alpha1"
 	"github.com/ruckc/pgop/internal/postgres"
@@ -39,7 +41,10 @@ type fakeOwnershipClient struct {
 	roles     map[string]string // role -> comment
 	closures  map[string][]postgres.ReachableRole
 	databases map[string]string // database -> comment
-	calls     []string
+	// raceDatabase makes CreateDatabase find the database created by
+	// someone else after DatabaseComment reported it missing.
+	raceDatabase bool
+	calls        []string
 }
 
 func (f *fakeOwnershipClient) RoleComment(_ context.Context, name string) (bool, string, error) {
@@ -62,9 +67,13 @@ func (f *fakeOwnershipClient) CommentOnDatabase(_ context.Context, name, comment
 	return nil
 }
 
-func (f *fakeOwnershipClient) CreateDatabase(_ context.Context, name, owner string) error {
+func (f *fakeOwnershipClient) CreateDatabase(_ context.Context, name, owner string, createOnly bool) error {
+	_, exists := f.databases[name]
+	if createOnly && (exists || f.raceDatabase) {
+		return fmt.Errorf("database %q: %w", name, postgres.ErrObjectExists)
+	}
 	f.calls = append(f.calls, fmt.Sprintf("create-or-alter %s owner=%s", name, owner))
-	if _, ok := f.databases[name]; !ok {
+	if !exists {
 		f.databases[name] = ""
 	}
 	return nil
@@ -86,16 +95,22 @@ var otherKeySigner = newMarkerSigner(&postgresv1alpha1.Cluster{ObjectMeta: metav
 // test database.
 const createAppDB = "create-or-alter app owner=owner"
 
+// forgedCurrentKey is a v2 marker naming the Cluster's current key with a
+// signature that does not verify.
+func forgedCurrentKey(kind string) string {
+	return markerV2Prefix + kind + "/" + grantTestRole + ":" + testSigner.keyID() + ".AAAA"
+}
+
 // forgedMarkers are comments that are not the Cluster's valid marker for
 // the test resource of kind.
 func forgedMarkers(kind string) []string {
 	name := grantTestRole
 	valid := ownerMarker(kind, name)
 	return []string{
-		legacyMarker(kind, name),                     // the unsigned v1 text
-		markerV2Prefix + kind + "/" + name + ":AAAA", // a v2 marker with a wrong HMAC
-		otherKeySigner.marker(kind, name),            // signed with another (or a lost) key
-		valid[:len(valid)-1] + "x",                   // a valid marker, altered
+		legacyMarker(kind, name),          // the unsigned v1 text
+		otherKeySigner.marker(kind, name), // signed with another (or a lost) key
+		forgedCurrentKey(kind),            // names the current key, wrong HMAC
+		valid[:len(valid)-1] + "x",        // a valid marker, altered
 	}
 }
 
@@ -106,14 +121,22 @@ var _ = Describe("Ownership of PostgreSQL roles and databases", func() {
 	myDBMarker := ownerMarker(markerKindDatabase, grantTestRole)
 	adoptRole := &postgresv1alpha1.RolePolicySpec{AdoptableRoles: []string{grantTestRole}}
 	adoptDB := &postgresv1alpha1.RolePolicySpec{AdoptableDatabases: []string{grantTestRole}}
+	testCluster := func(policy *postgresv1alpha1.RolePolicySpec) *postgresv1alpha1.Cluster {
+		return &postgresv1alpha1.Cluster{ObjectMeta: metav1.ObjectMeta{Name: "c", Namespace: "ns", UID: "cluster-uid"},
+			Spec: postgresv1alpha1.ClusterSpec{RolePolicy: policy}}
+	}
 
 	newRole := func(recorded string) *postgresv1alpha1.Role {
 		r := &postgresv1alpha1.Role{ObjectMeta: metav1.ObjectMeta{Name: grantTestRole, Namespace: "ns", UID: "uid-me"}}
 		r.Status.RoleName = recorded
 		return r
 	}
+	// check runs checkRoleOwnership; the role counts as recorded when its
+	// status names the role (roleRecorded is tested separately).
 	check := func(f *fakeOwnershipClient, role *postgresv1alpha1.Role, policy *postgresv1alpha1.RolePolicySpec) (string, error) {
-		return rr().checkRoleOwnership(ctx, f, role, grantTestRole, policy, testSigner)
+		marker, _, err := rr().checkRoleOwnership(ctx, f, role, testCluster(policy), grantTestRole, policy, testSigner,
+			role.Status.RoleName == grantTestRole)
+		return marker, err
 	}
 
 	Describe("markers", func() {
@@ -132,10 +155,17 @@ var _ = Describe("Ownership of PostgreSQL roles and databases", func() {
 	})
 
 	Describe("checkRoleOwnership", func() {
-		It("creates a missing role with the marker", func() {
-			marker, err := check(&fakeOwnershipClient{roles: map[string]string{}}, newRole(""), nil)
+		It("creates a missing role with the marker, create-only", func() {
+			marker, createOnly, err := rr().checkRoleOwnership(ctx, &fakeOwnershipClient{roles: map[string]string{}}, newRole(""),
+				testCluster(nil), grantTestRole, nil, testSigner, false)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(marker).To(Equal(myMarker))
+			Expect(createOnly).To(BeTrue(), "a concurrent CREATE by someone else must fail, not turn into an ALTER")
+
+			_, createOnly, err = rr().checkRoleOwnership(ctx, &fakeOwnershipClient{roles: map[string]string{grantTestRole: ""}},
+				newRole(grantTestRole), testCluster(nil), grantTestRole, nil, testSigner, true)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(createOnly).To(BeFalse())
 		})
 
 		It("manages a role recorded in status that carries its marker", func() {
@@ -145,10 +175,17 @@ var _ = Describe("Ownership of PostgreSQL roles and databases", func() {
 		})
 
 		It("re-marks a recorded role whose marker is missing, unsigned or from a lost key", func() {
-			for _, comment := range append([]string{""}, forgedMarkers(markerKindRole)...) {
+			for _, comment := range []string{"", legacyMarker(markerKindRole, grantTestRole), otherKeySigner.marker(markerKindRole, grantTestRole)} {
 				marker, err := check(&fakeOwnershipClient{roles: map[string]string{grantTestRole: comment}}, newRole(grantTestRole), nil)
 				Expect(err).NotTo(HaveOccurred(), comment)
 				Expect(marker).To(Equal(myMarker), comment)
+			}
+		})
+
+		It("never counts a marker naming the current key with a bad signature, even when recorded", func() {
+			for _, comment := range []string{forgedCurrentKey(markerKindRole), myMarker[:len(myMarker)-1] + "x"} {
+				_, err := check(&fakeOwnershipClient{roles: map[string]string{grantTestRole: comment}}, newRole(grantTestRole), nil)
+				Expect(reasonOf(err)).To(Equal(ReasonRoleNotManaged), comment)
 			}
 		})
 
@@ -201,7 +238,8 @@ var _ = Describe("Ownership of PostgreSQL roles and databases", func() {
 			return d
 		}
 		ensure := func(f *fakeOwnershipClient, db *postgresv1alpha1.Database, policy *postgresv1alpha1.RolePolicySpec, owner string) error {
-			return ensureDatabase(ctx, f, db, testSigner, policy, grantTestRole, owner)
+			return ensureDatabase(ctx, f, db, testCluster(policy), testSigner, grantTestRole, owner,
+				db.Status.DatabaseName == grantTestRole)
 		}
 
 		It("creates and marks a missing database", func() {
@@ -219,7 +257,7 @@ var _ = Describe("Ownership of PostgreSQL roles and databases", func() {
 		})
 
 		It("re-marks a recorded database whose marker is missing, unsigned or from a lost key", func() {
-			for _, comment := range append([]string{""}, forgedMarkers(markerKindDatabase)...) {
+			for _, comment := range []string{"", legacyMarker(markerKindDatabase, grantTestRole), otherKeySigner.marker(markerKindDatabase, grantTestRole)} {
 				f := &fakeOwnershipClient{databases: map[string]string{grantTestRole: comment}}
 				Expect(ensure(f, newDB(grantTestRole), nil, "")).To(Succeed())
 				Expect(f.calls).To(ContainElement("comment app "+myDBMarker), comment)
@@ -239,6 +277,22 @@ var _ = Describe("Ownership of PostgreSQL roles and databases", func() {
 			}
 		})
 
+		It("does not take over a database someone created between the check and the create", func() {
+			f := &fakeOwnershipClient{databases: map[string]string{}, raceDatabase: true}
+			db := newDB("")
+			err := ensure(f, db, nil, "owner")
+			Expect(reasonOf(err)).To(Equal(ReasonDatabaseNotManaged))
+			Expect(errors.Is(err, postgres.ErrObjectExists)).To(BeTrue())
+			Expect(f.calls).To(BeEmpty(), "no ALTER DATABASE ... OWNER")
+			Expect(db.Status.DatabaseName).To(BeEmpty())
+		})
+
+		It("records the Cluster UID with the database name", func() {
+			db := newDB("")
+			Expect(ensure(&fakeOwnershipClient{databases: map[string]string{}}, db, nil, "owner")).To(Succeed())
+			Expect(db.Status.ClusterUID).To(Equal("cluster-uid"))
+		})
+
 		It("takes over an unrecorded database a Cluster editor allowlisted", func() {
 			f := &fakeOwnershipClient{databases: map[string]string{grantTestRole: "reporting db"}}
 			db := newDB("")
@@ -248,6 +302,12 @@ var _ = Describe("Ownership of PostgreSQL roles and databases", func() {
 		})
 	})
 })
+
+// Names used by the recorded-name tests.
+const (
+	recTestRole = "dbauser"
+	recTestUIDA = "uid-a"
+)
 
 // envtest: name collisions between resources and the namespace boundary.
 var _ = Describe("Name collisions and namespaces", func() {
@@ -348,6 +408,126 @@ var _ = Describe("Name collisions and namespaces", func() {
 		_, err = (&RoleReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}).readPasswordSecretRef(ctx, role)
 		Expect(reasonOf(err)).To(Equal(ReasonRolePolicyViolation))
 		DeferCleanup(func() { _ = k8sClient.Delete(ctx, secret) })
+	})
+
+	It("makes clusterRef immutable on Roles and Databases", func() {
+		role := &postgresv1alpha1.Role{ObjectMeta: metav1.ObjectMeta{Name: "imm-role-" + suffix, Namespace: ns},
+			Spec: postgresv1alpha1.RoleSpec{ClusterRef: postgresv1alpha1.ClusterReference{Name: "cluster-a"}}}
+		create(role)
+		role.Spec.ClusterRef.Name = "cluster-b"
+		Expect(apierrors.IsInvalid(k8sClient.Update(ctx, role))).To(BeTrue())
+
+		db := &postgresv1alpha1.Database{ObjectMeta: metav1.ObjectMeta{Name: "imm-db-" + suffix, Namespace: ns},
+			Spec: postgresv1alpha1.DatabaseSpec{ClusterRef: postgresv1alpha1.ClusterReference{Name: "cluster-a"}}}
+		create(db)
+		db.Spec.ClusterRef.Name = "cluster-b"
+		Expect(apierrors.IsInvalid(k8sClient.Update(ctx, db))).To(BeTrue())
+	})
+
+	It("treats a name as recorded only on the Cluster (UID) it was recorded on", func() {
+		clusterA := &postgresv1alpha1.Cluster{ObjectMeta: metav1.ObjectMeta{Name: "rec-a-" + suffix, Namespace: ns, UID: recTestUIDA}}
+		clusterB := &postgresv1alpha1.Cluster{ObjectMeta: metav1.ObjectMeta{Name: "rec-b-" + suffix, Namespace: ns, UID: "uid-b"}}
+		recreatedA := clusterA.DeepCopy()
+		recreatedA.UID = "uid-a-2"
+		rr := &RoleReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		dr := &DatabaseReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+
+		role := &postgresv1alpha1.Role{ObjectMeta: metav1.ObjectMeta{Name: "rec-role-" + suffix, Namespace: ns},
+			Spec: postgresv1alpha1.RoleSpec{ClusterRef: postgresv1alpha1.ClusterReference{Name: clusterA.Name}}}
+		create(role)
+		role.Status.RoleName = recTestRole
+		role.Status.ClusterUID = recTestUIDA
+		for _, tc := range []struct {
+			cluster *postgresv1alpha1.Cluster
+			name    string
+			want    bool
+		}{
+			{clusterA, recTestRole, true},
+			{clusterB, recTestRole, false},   // retargeted to another Cluster
+			{recreatedA, recTestRole, false}, // the Cluster was deleted and re-created
+			{clusterA, "other_name", false},  // a different name
+		} {
+			got, err := rr.roleRecorded(ctx, role, tc.cluster, tc.name)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(got).To(Equal(tc.want), "%s/%s", tc.cluster.UID, tc.name)
+		}
+
+		By("a status written before clusterUID existed counts only with the Role's Secret for that Cluster")
+		role.Status.ClusterUID = ""
+		got, err := rr.roleRecorded(ctx, role, clusterA, recTestRole)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(got).To(BeFalse(), "no credentials Secret")
+		secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: credentialsSecretName(role, clusterA), Namespace: ns}}
+		Expect(controllerutil.SetControllerReference(role, secret, k8sClient.Scheme())).To(Succeed())
+		create(secret)
+		Eventually(func(g Gomega) {
+			got, err := rr.roleRecorded(ctx, role, clusterA, recTestRole)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(got).To(BeTrue())
+		}).Should(Succeed())
+		got, err = rr.roleRecorded(ctx, role, clusterB, recTestRole)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(got).To(BeFalse(), "the Secret of cluster A does not prove ownership on cluster B")
+
+		By("the same rules for Databases")
+		db := &postgresv1alpha1.Database{ObjectMeta: metav1.ObjectMeta{Name: "rec-db-" + suffix, Namespace: ns},
+			Spec: postgresv1alpha1.DatabaseSpec{ClusterRef: postgresv1alpha1.ClusterReference{Name: clusterA.Name}, Owner: "owner-x"}}
+		create(db)
+		db.Status.DatabaseName = "appdb"
+		db.Status.ClusterUID = recTestUIDA
+		for _, tc := range []struct {
+			cluster *postgresv1alpha1.Cluster
+			want    bool
+		}{{clusterA, true}, {clusterB, false}, {recreatedA, false}} {
+			got, err := dr.databaseRecorded(ctx, db, tc.cluster, "appdb")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(got).To(Equal(tc.want), string(tc.cluster.UID))
+		}
+		db.Status.ClusterUID = ""
+		dbSecret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: db.Name + "-owner-x-credentials", Namespace: ns},
+			Data: map[string][]byte{SecretKeyHost: []byte(clusterHost(clusterA))}}
+		Expect(controllerutil.SetControllerReference(db, dbSecret, k8sClient.Scheme())).To(Succeed())
+		create(dbSecret)
+		Eventually(func(g Gomega) {
+			got, err := dr.databaseRecorded(ctx, db, clusterA, "appdb")
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(got).To(BeTrue())
+		}).Should(Succeed())
+		got, err = dr.databaseRecorded(ctx, db, clusterB, "appdb")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(got).To(BeFalse(), "the Secret points at cluster A's host")
+
+		By("never dropping a database recorded on another Cluster")
+		db.Status.ClusterUID = "uid-b"
+		Expect(dr.dropPostgresDatabase(ctx, clusterA, db)).To(Succeed(), "returns without connecting")
+	})
+
+	It("counts a role as managed only when its Role recorded it on this Cluster", func() {
+		cluster := &postgresv1alpha1.Cluster{ObjectMeta: metav1.ObjectMeta{Name: "mg-" + suffix, Namespace: ns, UID: "uid-mg"}}
+		newRole := func(name, pgName string) *postgresv1alpha1.Role {
+			r := &postgresv1alpha1.Role{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+				Spec: postgresv1alpha1.RoleSpec{ClusterRef: postgresv1alpha1.ClusterReference{Name: cluster.Name}, RoleName: pgName}}
+			create(r)
+			return r
+		}
+		recordedRole := newRole("mg-rec-"+suffix, "mg_rec")
+		recordedRole.Status.RoleName, recordedRole.Status.ClusterUID = "mg_rec", "uid-mg"
+		Expect(k8sClient.Status().Update(ctx, recordedRole)).To(Succeed())
+		specOnly := newRole("mg-spec-"+suffix, "mg_squatted") // names a role someone else built
+		otherCluster := newRole("mg-other-"+suffix, "mg_other")
+		otherCluster.Status.RoleName, otherCluster.Status.ClusterUID = "mg_other", "uid-old"
+		Expect(k8sClient.Status().Update(ctx, otherCluster)).To(Succeed())
+
+		rr := &RoleReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		Eventually(func(g Gomega) {
+			managed, err := rr.managedRoles(ctx, specOnly, cluster, testSigner)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(managed).To(HaveKey("mg_rec"))
+			g.Expect(managed).NotTo(HaveKey("mg_squatted"))
+			g.Expect(managed).NotTo(HaveKey("mg_other"))
+			g.Expect(managed.manages(postgres.ReachableRole{Name: "mg_squatted",
+				Comment: testSigner.marker(markerKindRole, specOnly.Name)})).To(BeFalse())
+		}).Should(Succeed())
 	})
 
 	It("cannot reach a Cluster in another namespace", func() {
