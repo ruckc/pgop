@@ -322,7 +322,9 @@ spec:
 			Expect(err).NotTo(HaveOccurred())
 			mac := hmac.New(sha256.New, key)
 			mac.Write([]byte(kind + "|" + namespace + "|" + clusterName + "|" + name))
-			return "pgop:v2:" + kind + "/" + name + ":" + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+			keyID := sha256.Sum256(key)
+			return "pgop:v2:" + kind + "/" + name + ":" + base64.RawURLEncoding.EncodeToString(keyID[:6]) + "." +
+				base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 		}
 		nudge := func(res string) {
 			_, err := utils.Run(exec.Command("kubectl", "annotate", res, "-n", namespace, "--overwrite",
