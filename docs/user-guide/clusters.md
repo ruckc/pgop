@@ -233,6 +233,9 @@ server):
 | `pg_create_subscription` (PG 16) | Create logical replication subscriptions | Outbound connections from the server |
 | `pg_read_all_data`, `pg_write_all_data` | Read / write every table, bypassing privileges | **All databases of the Cluster**, other teams' included |
 
+Allowing `pg_monitor` also allows the roles PostgreSQL makes it a member of
+(`pg_read_all_settings`, `pg_read_all_stats`, `pg_stat_scan_tables`).
+
 `pg_execute_server_program`, `pg_read_server_files` and
 `pg_write_server_files` give shell or file access on the server and can never
 be allowed.

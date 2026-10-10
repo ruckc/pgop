@@ -125,6 +125,26 @@ func reachableRoleProblem(r postgres.ReachableRole, policy *postgresv1alpha1.Rol
 	return attributeProblem(r, policy)
 }
 
+// builtinContainedRoles are the predefined roles PostgreSQL itself makes
+// members of another predefined role (pg_monitor includes the roles that read
+// settings and statistics).
+var builtinContainedRoles = map[string][]string{
+	"pg_monitor": {"pg_read_all_settings", "pg_read_all_stats", "pg_stat_scan_tables"},
+}
+
+// containedPredefinedRole reports whether reached is a predefined role that
+// PostgreSQL places inside a predefined role of the closure that the policy
+// allows, so allowing the outer role (for example pg_monitor) allows what it
+// contains.
+func containedPredefinedRole(reached string, closure []postgres.ReachableRole, policy *postgresv1alpha1.RolePolicySpec) bool {
+	for _, r := range closure {
+		if policy.AllowsPredefinedRole(r.Name) && slices.Contains(builtinContainedRoles[r.Name], reached) {
+			return true
+		}
+	}
+	return false
+}
+
 // membershipProblem explains why membership in target is not allowed, or
 // returns "" when it is. closure is target's MembershipClosure (target
 // itself followed by every role it is a member of, empty when target does
@@ -136,6 +156,9 @@ func membershipProblem(target string, closure []postgres.ReachableRole, policy *
 		return fmt.Sprintf("%s %s", target, p)
 	}
 	for _, r := range closure {
+		if r.Name != target && containedPredefinedRole(r.Name, closure, policy) {
+			continue
+		}
 		p := reachableRoleProblem(r, policy)
 		switch {
 		case p == "":
@@ -161,6 +184,9 @@ func adoptionProblem(name string, closure []postgres.ReachableRole, policy *post
 			if r.Superuser {
 				return fmt.Sprintf("pgop does not take over the existing PostgreSQL role %s: it is a superuser", name)
 			}
+			continue
+		}
+		if containedPredefinedRole(r.Name, closure, policy) {
 			continue
 		}
 		if p := reachableRoleProblem(r, policy); p != "" {

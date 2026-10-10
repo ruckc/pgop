@@ -36,15 +36,16 @@ func (f fakeExtensionClient) ExtensionTrusted(_ context.Context, name, _ string)
 
 // Role names used by the policy tests.
 const (
-	polOps         = "ops"
-	polDBA         = "dba"
-	polExecProgram = "pg_execute_server_program"
-	polReadAllData = "pg_read_all_data"
-	polMonitor     = "pg_monitor"
-	polFileFDW     = "file_fdw"
-	polTrgm        = "pg_trgm"
-	polUUID        = "uuid-ossp"
-	polGrantA      = "grant a to app"
+	polOps          = "ops"
+	polDBA          = "dba"
+	polExecProgram  = "pg_execute_server_program"
+	polReadAllData  = "pg_read_all_data"
+	polReadSettings = "pg_read_all_settings"
+	polMonitor      = "pg_monitor"
+	polFileFDW      = "file_fdw"
+	polTrgm         = "pg_trgm"
+	polUUID         = "uuid-ossp"
+	polGrantA       = "grant a to app"
 )
 
 var _ = Describe("Role policy", func() {
@@ -143,6 +144,20 @@ var _ = Describe("Role policy", func() {
 			Expect(membershipProblem("repl", closure, nil)).To(ContainSubstring("has REPLICATION, BYPASSRLS"))
 			Expect(membershipProblem("repl", closure, allowAll)).To(BeEmpty())
 		})
+		It("allows the predefined roles an allowed predefined role contains", func() {
+			monitor := &postgresv1alpha1.RolePolicySpec{AllowedPredefinedRoles: []string{polMonitor}}
+			closure := []rr{{Name: polMonitor}, {Name: polReadSettings, Via: polReadSettings}}
+			Expect(membershipProblem(polMonitor, closure, monitor)).To(BeEmpty())
+			Expect(adoptionProblem("app_mon", []rr{{Name: "app_mon"}, {Name: polMonitor, Via: polMonitor},
+				{Name: polReadSettings, Via: polMonitor}}, monitor)).To(BeEmpty())
+			By("but not a server-file role, even inside an allowed predefined role")
+			withExec := []rr{{Name: polMonitor}, {Name: polReadSettings, Via: polReadSettings}, {Name: polExecProgram, Via: polExecProgram}}
+			Expect(membershipProblem(polMonitor, withExec, monitor)).To(ContainSubstring(polExecProgram))
+			By("and not the contained roles when the outer role is not allowed")
+			Expect(membershipProblem("ops", []rr{{Name: "ops"}, {Name: polMonitor, Via: polMonitor},
+				{Name: polReadSettings, Via: polMonitor}}, nil)).To(ContainSubstring(polMonitor))
+		})
+
 		It("refuses a role that reaches a superuser or a forbidden role indirectly", func() {
 			Expect(membershipProblem(polOps, []rr{{Name: polOps}, {Name: bootstrapRoleName, Via: "admins", Superuser: true}}, allowAll)).
 				To(Equal("ops is a member of postgres, which is reserved (bootstrap superuser)"))
