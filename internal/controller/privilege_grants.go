@@ -196,23 +196,41 @@ func executorOps(pg privilegeExecutor, gone func(ctx context.Context, t grantTar
 // same maxItems.
 type ledgerLimit int
 
+// ledgerPersist records ledger in the resource's status, durably, before pgop
+// grants what it lists. nil skips the step (tests, and callers that only
+// revoke).
+type ledgerPersist func(ctx context.Context, ledger []privilegeGrant) error
+
+// plannedGrant is what grantMissing found missing for one desired grant.
+type plannedGrant struct {
+	target       grantTarget
+	plain        []string // privileges to grant without the grant option
+	grantOptions []string // privileges to grant WITH GRANT OPTION
+	added        privilegeGrant
+}
+
 // applyPrivilegeGrants brings the privileges to desired and returns the
 // ledger to record in status: the privileges and grant options pgop added
 // and has not revoked. It applies as much as it can: an error on one target
-// is reported (joined) and the others are still processed, and the returned
-// ledger always reflects what was actually done, so nothing pgop added is
-// forgotten. Revokes PostgreSQL refuses because of dependent privileges that
-// pgop did not make possible are dropped from the ledger and reported with
-// reason RevokeSkipped.
-func applyPrivilegeGrants(ctx context.Context, desired, managed []privilegeGrant, ops privilegeOps, limit ledgerLimit) ([]privilegeGrant, error) {
+// is reported (joined) and the others are still processed.
+//
+// The ledger works as an intent log: what pgop is about to add is recorded
+// (persist) before any GRANT runs, so a status update that is lost after the
+// GRANT (a conflict, an operator restart) cannot leave a privilege pgop
+// granted untracked: on the next reconcile the grantee holds it, and only
+// the ledger tells that pgop added it. An entry recorded for a GRANT that
+// then failed is harmless: the privilege is granted again while it is
+// declared, and revoking a privilege the grantee does not hold is a no-op.
+// When persist fails, nothing is granted.
+//
+// Revokes PostgreSQL refuses because of dependent privileges that pgop did
+// not make possible are dropped from the ledger and reported with reason
+// RevokeSkipped.
+func applyPrivilegeGrants(ctx context.Context, desired, managed []privilegeGrant, ops privilegeOps, limit ledgerLimit,
+	persist ledgerPersist) ([]privilegeGrant, error) {
 	tracked := make(map[string]privilegeGrant, len(managed))
 	for _, m := range managed {
-		t := tracked[m.key()]
-		tracked[m.key()] = privilegeGrant{
-			Target:       m.Target,
-			Privileges:   union(t.Privileges, m.Privileges),
-			GrantOptions: union(t.GrantOptions, m.GrantOptions),
-		}
+		tracked[m.key()] = mergeGrant(tracked[m.key()], m)
 	}
 	want := make(map[string]privilegeGrant, len(desired))
 	for _, d := range desired {
@@ -225,18 +243,41 @@ func applyPrivilegeGrants(ctx context.Context, desired, managed []privilegeGrant
 	}
 
 	var errs []error
+	var plan []plannedGrant
 	for _, d := range desired {
-		added, err := grantMissing(ctx, d, ops)
-		if !added.empty() {
-			t := tracked[d.key()]
-			tracked[d.key()] = privilegeGrant{
-				Target:       d.Target,
-				Privileges:   union(t.Privileges, added.Privileges),
-				GrantOptions: union(t.GrantOptions, added.GrantOptions),
-			}
-		}
+		p, err := planMissing(ctx, d, ops)
 		if err != nil {
 			errs = append(errs, err)
+			continue
+		}
+		if !p.added.empty() {
+			plan = append(plan, p)
+		}
+	}
+	if len(plan) > 0 {
+		intended := maps.Clone(tracked)
+		for _, p := range plan {
+			intended[p.target.key()] = mergeGrant(intended[p.target.key()], p.added)
+		}
+		if persist != nil {
+			if err := persist(ctx, sortedGrants(intended)); err != nil {
+				return sortedGrants(tracked), errors.Join(append(errs,
+					fmt.Errorf("recording the grants pgop is about to make failed, nothing was granted: %w", err))...)
+			}
+		}
+		tracked = intended
+	}
+	for _, p := range plan {
+		if len(p.grantOptions) > 0 {
+			if err := ops.grant(ctx, p.target, p.grantOptions, true); err != nil {
+				errs = append(errs, err)
+				continue
+			}
+		}
+		if len(p.plain) > 0 {
+			if err := ops.grant(ctx, p.target, p.plain, false); err != nil {
+				errs = append(errs, err)
+			}
 		}
 	}
 
@@ -260,30 +301,28 @@ func applyPrivilegeGrants(ctx context.Context, desired, managed []privilegeGrant
 	return sortedGrants(tracked), errors.Join(errs...)
 }
 
-// grantMissing grants what d declares and the grantee does not hold yet, and
-// returns what it added.
-func grantMissing(ctx context.Context, d privilegeGrant, ops privilegeOps) (privilegeGrant, error) {
-	added := privilegeGrant{Target: d.Target}
+// mergeGrant returns the union of two ledger entries of the same target.
+func mergeGrant(a, b privilegeGrant) privilegeGrant {
+	return privilegeGrant{
+		Target:       b.Target,
+		Privileges:   union(a.Privileges, b.Privileges),
+		GrantOptions: union(a.GrantOptions, b.GrantOptions),
+	}
+}
+
+// planMissing finds what d declares and the grantee does not hold yet.
+func planMissing(ctx context.Context, d privilegeGrant, ops privilegeOps) (plannedGrant, error) {
+	p := plannedGrant{target: d.Target, added: privilegeGrant{Target: d.Target}}
 	held, grantable, err := ops.held(ctx, d.Target)
 	if err != nil {
-		return added, err
+		return p, err
 	}
 	missing := subtract(d.Privileges, held)
-	missingGrantOptions := subtract(d.GrantOptions, grantable)
-	if len(missingGrantOptions) > 0 {
-		if err := ops.grant(ctx, d.Target, missingGrantOptions, true); err != nil {
-			return added, err
-		}
-		added.GrantOptions = missingGrantOptions
-		added.Privileges = intersect(missing, missingGrantOptions)
-	}
-	if plain := subtract(missing, missingGrantOptions); len(plain) > 0 {
-		if err := ops.grant(ctx, d.Target, plain, false); err != nil {
-			return added, err
-		}
-		added.Privileges = union(added.Privileges, plain)
-	}
-	return added, nil
+	p.grantOptions = subtract(d.GrantOptions, grantable)
+	p.plain = subtract(missing, p.grantOptions)
+	p.added.Privileges = missing
+	p.added.GrantOptions = p.grantOptions
+	return p, nil
 }
 
 // revokeRemoved revokes what the ledger entry m records and d (the desired
@@ -329,11 +368,18 @@ func revokeRemoved(ctx context.Context, m, d privilegeGrant, ops privilegeOps, s
 		err := ops.revoke(ctx, m.Target, plain, postgres.RevokeMode{})
 		switch {
 		case postgres.DependentPrivilegesExist(err):
-			// The grantee got the grant option elsewhere and passed the
-			// privileges on. pgop did not make that possible, so it does not
-			// cascade into it.
-			*skipped = append(*skipped, fmt.Sprintf("%s on %s", strings.Join(plain, ", "), m.Target))
-			m.Privileges = subtract(m.Privileges, plain)
+			// One of the privileges was passed on with a grant option pgop did
+			// not give, and PostgreSQL refuses the whole statement: revoke
+			// them one at a time, and do not cascade into the ones that fail.
+			done, blocked, err := revokeEach(ctx, m.Target, plain, ops)
+			m.Privileges = subtract(m.Privileges, done)
+			if len(blocked) > 0 {
+				*skipped = append(*skipped, fmt.Sprintf("%s on %s", strings.Join(blocked, ", "), m.Target))
+				m.Privileges = subtract(m.Privileges, blocked)
+			}
+			if err != nil {
+				errs = append(errs, err)
+			}
 		case err != nil:
 			errs = append(errs, err)
 		default:
@@ -341,6 +387,25 @@ func revokeRemoved(ctx context.Context, m, d privilegeGrant, ops privilegeOps, s
 		}
 	}
 	return m, errors.Join(errs...)
+}
+
+// revokeEach revokes privileges one at a time without CASCADE and returns
+// the ones revoked and the ones PostgreSQL refused because of dependent
+// privileges.
+func revokeEach(ctx context.Context, t grantTarget, privileges []string, ops privilegeOps) (done, blocked []string, err error) {
+	var errs []error
+	for _, p := range privileges {
+		e := ops.revoke(ctx, t, []string{p}, postgres.RevokeMode{})
+		switch {
+		case postgres.DependentPrivilegesExist(e):
+			blocked = append(blocked, p)
+		case e != nil:
+			errs = append(errs, e)
+		default:
+			done = append(done, p)
+		}
+	}
+	return done, blocked, errors.Join(errs...)
 }
 
 // sortedGrants returns the non-empty grants in m sorted by key, or nil.

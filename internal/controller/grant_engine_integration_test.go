@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"testing"
 
 	_ "github.com/lib/pq"
@@ -33,8 +34,9 @@ import (
 
 // Names used by TestGrantEngineIntegration.
 const (
-	engX    = "eng_x"
-	engHand = "hand"
+	engX     = "eng_x"
+	engHand  = "hand"
+	engOwner = "eng_owner"
 )
 
 // TestGrantEngineIntegration runs the grant reconcilers against a real
@@ -76,7 +78,7 @@ func TestGrantEngineIntegration(t *testing.T) {
 			t.Fatalf("%s: %v", q, err)
 		}
 	}
-	roles := []string{"eng_owner", engX, "eng_y"}
+	roles := []string{engOwner, engX, "eng_y"}
 	cleanup := func() {
 		_, _ = admin.ExecContext(ctx, `DROP DATABASE IF EXISTS `+db)
 		for _, r := range roles {
@@ -117,14 +119,14 @@ func TestGrantEngineIntegration(t *testing.T) {
 		Grants: []postgresv1alpha1.DatabaseGrantSpec{{Role: postgres.PublicGrantee, Privileges: []string{postgres.PrivilegeConnect}}},
 		Schemas: []postgresv1alpha1.SchemaSpec{
 			{Name: publicSchemaName, Grants: []postgresv1alpha1.GrantSpec{{Role: postgres.PublicGrantee, Privileges: []string{postgres.PrivilegeUsage}}}},
-			{Name: grantTestRole, Grants: []postgresv1alpha1.GrantSpec{{Role: "eng_owner", Privileges: []string{postgres.PrivilegeAll}, WithGrantOption: true}}},
+			{Name: grantTestRole, Grants: []postgresv1alpha1.GrantSpec{{Role: engOwner, Privileges: []string{postgres.PrivilegeAll}, WithGrantOption: true}}},
 		},
 	}}
 	managedSchemas := setOf([]string{publicSchemaName, grantTestRole, engHand})
 	reconcile := func() error {
 		return errors.Join(
-			reconcileDatabaseGrants(ctx, adminPG, database, db, checker),
-			reconcileSchemaGrants(ctx, pg, database, managedSchemas, checker),
+			reconcileDatabaseGrants(ctx, adminPG, database, db, checker, nil),
+			reconcileSchemaGrants(ctx, pg, database, managedSchemas, checker, nil),
 		)
 	}
 
@@ -172,7 +174,7 @@ func TestGrantEngineIntegration(t *testing.T) {
 	step("a revoke blocked by dependents pgop did not enable is skipped, not retried forever")
 	exec(conn, `REVOKE USAGE ON SCHEMA hand FROM eng_x CASCADE`)
 	database.Spec.Schemas = []postgresv1alpha1.SchemaSpec{{Name: engHand, Grants: []postgresv1alpha1.GrantSpec{
-		{Role: engX, Privileges: []string{postgres.PrivilegeUsage}}}}}
+		{Role: engX, Privileges: []string{postgres.PrivilegeUsage, postgres.PrivilegeCreate}}}}}
 	if err := reconcile(); err != nil {
 		t.Fatal(err)
 	}
@@ -190,7 +192,44 @@ func TestGrantEngineIntegration(t *testing.T) {
 	if len(database.Status.ManagedSchemaGrants) != 0 {
 		t.Errorf("the skipped revoke stays tracked: %+v", database.Status.ManagedSchemaGrants)
 	}
+	if has(`SELECT has_schema_privilege('eng_x', 'hand', 'CREATE')`) {
+		t.Error("CREATE, which has no dependents, was stranded by the blocked USAGE")
+	}
+	if !strings.Contains(err.Error(), "USAGE") || strings.Contains(err.Error(), "CREATE") {
+		t.Errorf("only USAGE should be reported as skipped: %v", err)
+	}
 	if err := reconcile(); err != nil {
 		t.Errorf("the next reconcile still fails: %v", err)
+	}
+
+	step("schema public: grants only when the bootstrap superuser owns it (PostgreSQL 14), never re-owned")
+	checkPublicSchemaIntegration(ctx, t, pg, database)
+}
+
+// checkPublicSchemaIntegration checks how reconcileSchemas treats the schema
+// public on the server's major version (see TestGrantEngineIntegration).
+func checkPublicSchemaIntegration(ctx context.Context, t *testing.T, pg *postgres.Client, database *postgresv1alpha1.Database) {
+	t.Helper()
+	database.Spec.Schemas = []postgresv1alpha1.SchemaSpec{{Name: publicSchemaName, Owner: engOwner}}
+	database.Status.CreatedSchemas = nil
+	managed, refused, err := reconcileSchemas(ctx, pg, database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, _, err := pg.SchemaOwner(ctx, publicSchemaName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, err := pg.ServerVersionNum(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	switch {
+	case version < 150000 && (!info.OwnerIsBootstrap || refused != nil || len(managed) != 1 || info.Owner == engOwner):
+		t.Errorf("PostgreSQL 14: public = %+v, managed %v, refused %v; want managed for grants, owner unchanged", info, managed, refused)
+	case version >= 150000 && (info.Owner != engOwner || refused != nil):
+		// pg_database_owner owns public: a non-superuser, so it is managed
+		// and re-owned like any schema the database owner owns.
+		t.Errorf("PostgreSQL 15+: public = %+v, refused %v", info, refused)
 	}
 }

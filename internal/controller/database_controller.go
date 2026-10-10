@@ -52,6 +52,16 @@ const (
 type DatabaseReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+	// APIReader re-reads a Database uncached when a status write conflicts,
+	// so its grant ledgers can be merged. Optional: when nil the cached
+	// client is used.
+	APIReader client.Reader
+}
+
+// statusSaver returns the saver the grant reconcilers record their intended
+// additions with: a status write that never drops ledger entries.
+func (r *DatabaseReconciler) statusSaver(database *postgresv1alpha1.Database) statusSaver {
+	return func(ctx context.Context) error { return r.saveStatus(ctx, database) }
 }
 
 // +kubebuilder:rbac:groups=pgop.ruck.io,resources=databases,verbs=get;list;watch;create;update;patch;delete
@@ -209,7 +219,7 @@ func (r *DatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	// Schema grants and PUBLIC's privileges on the schema public, once every
 	// schema exists. Like the database grants, a problem here is reported
 	// after the credentials Secret is reconciled.
-	accessErr = errors.Join(refusedErr, accessErr, reconcileSchemaAccess(ctx, dbClient, database, pgName, createdSchemas, checker))
+	accessErr = errors.Join(refusedErr, accessErr, reconcileSchemaAccess(ctx, dbClient, database, pgName, createdSchemas, checker, r.statusSaver(database)))
 
 	if err := r.reconcileCredentialsSecret(ctx, database, ownerRole, cluster); err != nil {
 		log.Error(err, "Failed to reconcile database credentials secret")
@@ -256,7 +266,7 @@ func installExtensions(ctx context.Context, pg *postgres.Client, policy *postgre
 // schemaClient is the subset of *postgres.Client used to create schemas and
 // decide which existing schemas a Database manages.
 type schemaClient interface {
-	SchemaOwner(ctx context.Context, name string) (owner string, exists bool, err error)
+	SchemaOwner(ctx context.Context, name string) (info postgres.SchemaInfo, exists bool, err error)
 	CurrentDatabaseOwner(ctx context.Context) (string, error)
 	CreateSchema(ctx context.Context, name, owner string) error
 	AlterSchemaOwner(ctx context.Context, name, owner string) error
@@ -277,7 +287,9 @@ const pgDatabaseOwnerRole = "pg_database_owner"
 // database's owner, or pg_database_owner. Any other existing schema (one an
 // extension script, the operator or another role created) is left alone:
 // its owner is not changed and no grants are applied on it (reason
-// SchemaNotManaged). System schemas are refused (SchemaNotAllowed). A schema
+// SchemaNotManaged), except the schema public owned by the bootstrap
+// superuser (databases created before PostgreSQL 15), which is managed for
+// grants but never re-owned. System schemas are refused (SchemaNotAllowed). A schema
 // without a declared owner is created owned by the database's owner. It
 // returns the managed schemas, an error listing the refused ones (nil when
 // none) and the error that stopped it.
@@ -306,7 +318,8 @@ func reconcileSchemas(ctx context.Context, pg schemaClient, database *postgresv1
 			system = append(system, schema.Name)
 			continue
 		}
-		owner, exists, err := pg.SchemaOwner(ctx, schema.Name)
+		info, exists, err := pg.SchemaOwner(ctx, schema.Name)
+		owner := info.Owner
 		if err != nil {
 			return keepRecorded(i), nil, err
 		}
@@ -323,6 +336,13 @@ func reconcileSchemas(ctx context.Context, pg schemaClient, database *postgresv1
 			if err != nil {
 				return keepRecorded(i), nil, fmt.Errorf("schema %q: %w", schema.Name, err)
 			}
+			managed = append(managed, schema.Name)
+			continue
+		}
+		if schema.Name == publicSchemaName && info.OwnerIsBootstrap {
+			// Before PostgreSQL 15 every database's schema public is owned by
+			// the bootstrap superuser (and PUBLIC may create in it). It is
+			// managed for grants only: pgop never changes its owner.
 			managed = append(managed, schema.Name)
 			continue
 		}
@@ -521,11 +541,11 @@ func extensionAllowed(ctx context.Context, pg extensionClient, policy *postgresv
 // database-level grants and PUBLIC's database privileges. Each is attempted
 // even when another fails.
 func reconcileSettingsAndGrants(ctx context.Context, pg databaseGrantClient,
-	database *postgresv1alpha1.Database, pgName string, checker *granteeChecker) error {
+	database *postgresv1alpha1.Database, pgName string, checker *granteeChecker, save statusSaver) error {
 	return errors.Join(
 		reconcileDatabaseSettings(ctx, pg, database, pgName),
-		reconcileDatabaseGrants(ctx, pg, database, pgName, checker),
-		reconcilePublicPrivileges(ctx, pg, database, pgName, postgres.ObjectDatabase),
+		reconcileDatabaseGrants(ctx, pg, database, pgName, checker, save),
+		reconcilePublicPrivileges(ctx, pg, database, pgName, postgres.ObjectDatabase, save),
 	)
 }
 
@@ -539,7 +559,7 @@ func (r *DatabaseReconciler) reconcileDatabaseAccess(ctx context.Context, pg *po
 	if err != nil {
 		return nil, nil, err
 	}
-	accessErr = reconcileSettingsAndGrants(ctx, pg, database, pgName, checker)
+	accessErr = reconcileSettingsAndGrants(ctx, pg, database, pgName, checker, r.statusSaver(database))
 	if accessErr != nil {
 		logf.FromContext(ctx).Error(accessErr, "Failed to reconcile database settings or grants")
 	}
@@ -559,10 +579,10 @@ func setOf(s []string) map[string]bool {
 // manages and PUBLIC's privileges on the schema public, on a connection to
 // the database.
 func reconcileSchemaAccess(ctx context.Context, pg *postgres.Client, database *postgresv1alpha1.Database, pgName string,
-	managedSchemas []string, checker *granteeChecker) error {
+	managedSchemas []string, checker *granteeChecker, save statusSaver) error {
 	err := errors.Join(
-		reconcileSchemaGrants(ctx, pg, database, setOf(managedSchemas), checker),
-		reconcilePublicPrivileges(ctx, pg, database, pgName, postgres.ObjectSchema),
+		reconcileSchemaGrants(ctx, pg, database, setOf(managedSchemas), checker, save),
+		reconcilePublicPrivileges(ctx, pg, database, pgName, postgres.ObjectSchema, save),
 	)
 	if err != nil {
 		logf.FromContext(ctx).Error(err, "Failed to reconcile schema grants")
@@ -724,7 +744,7 @@ func (r *DatabaseReconciler) updateStatus(ctx context.Context, database *postgre
 
 	meta.SetStatusCondition(&database.Status.Conditions, condition)
 
-	if err := r.Status().Update(ctx, database); err != nil {
+	if err := r.saveStatus(ctx, database); err != nil {
 		return ctrl.Result{}, err
 	}
 

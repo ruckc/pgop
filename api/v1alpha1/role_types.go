@@ -261,6 +261,12 @@ type ManagedParameterGrant struct {
 	// +optional
 	// +listType=set
 	GrantOptions []string `json:"grantOptions,omitempty"`
+
+	// withGrantOption is deprecated and no longer written: pgop v0.15 recorded
+	// with it that all privileges were granted with the grant option. A
+	// ledger that still has it is read as grantOptions = privileges.
+	// +optional
+	WithGrantOption bool `json:"withGrantOption,omitempty"`
 }
 
 // RoleStatus defines the observed state of Role.

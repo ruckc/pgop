@@ -333,7 +333,7 @@ func (r *RoleReconciler) dropPostgresRole(ctx context.Context, cluster *postgres
 			Reason:             ReasonRoleDropBlocked,
 			Message:            msg,
 		})
-		if statusErr := r.Status().Update(ctx, role); statusErr != nil {
+		if statusErr := r.saveStatus(ctx, role); statusErr != nil {
 			return ctrl.Result{}, statusErr
 		}
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
@@ -572,7 +572,7 @@ func (r *RoleReconciler) reconcileRoleGrants(ctx context.Context, pgClient *post
 	}
 	return errors.Join(
 		reconcileMemberships(ctx, pgClient, role, pgName, policy, managed),
-		reconcileParameterGrants(ctx, pgClient, role, pgName),
+		reconcileParameterGrants(ctx, pgClient, role, pgName, func(ctx context.Context) error { return r.saveStatus(ctx, role) }),
 	)
 }
 
@@ -771,7 +771,7 @@ func (r *RoleReconciler) updateStatus(ctx context.Context, role *postgresv1alpha
 
 	meta.SetStatusCondition(&role.Status.Conditions, condition)
 
-	if err := r.Status().Update(ctx, role); err != nil {
+	if err := r.saveStatus(ctx, role); err != nil {
 		return ctrl.Result{}, err
 	}
 

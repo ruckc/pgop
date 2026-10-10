@@ -111,20 +111,11 @@ func desiredParameterGrants(grants []postgresv1alpha1.ParameterGrantSpec, member
 }
 
 func managedParameterGrants(role *postgresv1alpha1.Role, member string) []privilegeGrant {
-	out := make([]privilegeGrant, 0, len(role.Status.ManagedParameterGrants))
-	for _, m := range role.Status.ManagedParameterGrants {
-		out = append(out, privilegeGrant{Target: parameterTarget(m.Parameter, member), Privileges: m.Privileges, GrantOptions: m.GrantOptions})
-	}
-	return out
+	return parameterLedger(member, role.Status.ManagedParameterGrants)
 }
 
 func recordParameterGrants(role *postgresv1alpha1.Role, grants []privilegeGrant) {
-	role.Status.ManagedParameterGrants = nil
-	for _, g := range grants {
-		role.Status.ManagedParameterGrants = append(role.Status.ManagedParameterGrants, postgresv1alpha1.ManagedParameterGrant{
-			Parameter: g.Target.Name, Privileges: g.Privileges, GrantOptions: g.GrantOptions,
-		})
-	}
+	role.Status.ManagedParameterGrants = parameterLedgerStatus(grants)
 }
 
 // reconcileParameterGrants brings member's privileges on configuration
@@ -134,7 +125,7 @@ func recordParameterGrants(role *postgresv1alpha1.Role, grants []privilegeGrant)
 // server a non-empty parameterGrants is reported with reason
 // UnsupportedServerVersion. Denylisted parameters are not granted (a managed
 // grant on one is revoked) and are reported with reason ParameterNotAllowed.
-func reconcileParameterGrants(ctx context.Context, pg parameterGrantClient, role *postgresv1alpha1.Role, member string) error {
+func reconcileParameterGrants(ctx context.Context, pg parameterGrantClient, role *postgresv1alpha1.Role, member string, save statusSaver) error {
 	desired, denied, err := desiredParameterGrants(role.Spec.ParameterGrants, member)
 	if err != nil {
 		return err
@@ -174,7 +165,14 @@ func reconcileParameterGrants(ctx context.Context, pg parameterGrantClient, role
 			strings.Join(refused, ", "))})
 	}
 
-	after, err := applyPrivilegeGrants(ctx, desired, managed, executorOps(pg, nil), parameterGrantLedgerLimit)
+	persist := func(ctx context.Context, ledger []privilegeGrant) error {
+		recordParameterGrants(role, ledger)
+		if save == nil {
+			return nil
+		}
+		return save(ctx)
+	}
+	after, err := applyPrivilegeGrants(ctx, desired, managed, executorOps(pg, nil), parameterGrantLedgerLimit, persist)
 	recordParameterGrants(role, after)
 	if err != nil {
 		return err
@@ -194,7 +192,7 @@ func revokeManagedParameterGrants(ctx context.Context, pg parameterGrantClient, 
 	if err != nil || !exists {
 		return err
 	}
-	after, err := applyPrivilegeGrants(ctx, nil, managed, executorOps(pg, nil), parameterGrantLedgerLimit)
+	after, err := applyPrivilegeGrants(ctx, nil, managed, executorOps(pg, nil), parameterGrantLedgerLimit, nil)
 	recordParameterGrants(role, after)
 	return err
 }

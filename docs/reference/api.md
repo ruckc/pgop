@@ -368,7 +368,8 @@ applied, and revoked if pgop granted them), `PublicPrivilegeConflict` when
 `publicPrivileges` revokes what a `PUBLIC` grant grants, `TooManyGrants` when
 the declared grants plus those pgop still tracks exceed the status ledger,
 `RevokeSkipped` (reported once) when a revoke was blocked by dependent
-privileges pgop did not enable, `SchemaNotManaged` for an existing schema the
+privileges pgop did not enable, `PublicPrivilegeStillHeld` when PUBLIC keeps a
+revoked privilege from another grantor, `SchemaNotManaged` for an existing schema the
 Database neither created nor owns (in all these cases the other
 settings, grants, extensions and schemas are still reconciled), `ReservedName` for a reserved
 database name, `DatabaseNotManaged` when the database exists but the Database neither
@@ -395,6 +396,7 @@ status:
     - role: string         # Role name or PUBLIC
       privileges: [string] # Normalized: CONNECT, CREATE, TEMPORARY
       grantOptions: [string]   # Privileges whose grant option pgop added
+      withGrantOption: boolean # Deprecated (v0.15 ledgers), read as grantOptions = privileges; no longer written
   managedSchemaGrants:     # max 2048
     - schema: string
       role: string         # Role name or PUBLIC

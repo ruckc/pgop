@@ -196,6 +196,12 @@ type ManagedDatabaseGrant struct {
 	// +optional
 	// +listType=set
 	GrantOptions []string `json:"grantOptions,omitempty"`
+
+	// withGrantOption is deprecated and no longer written: pgop v0.15 recorded
+	// with it that all privileges were granted with the grant option. A
+	// ledger that still has it is read as grantOptions = privileges.
+	// +optional
+	WithGrantOption bool `json:"withGrantOption,omitempty"`
 }
 
 // ExtensionSpec defines a PostgreSQL extension to install
@@ -303,6 +309,12 @@ type ManagedSchemaGrant struct {
 	// +optional
 	// +listType=set
 	GrantOptions []string `json:"grantOptions,omitempty"`
+
+	// withGrantOption is deprecated and no longer written: pgop v0.15 recorded
+	// with it that all privileges were granted with the grant option. A
+	// ledger that still has it is read as grantOptions = privileges.
+	// +optional
+	WithGrantOption bool `json:"withGrantOption,omitempty"`
 }
 
 // DatabaseStatus defines the observed state of Database.

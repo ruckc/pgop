@@ -457,6 +457,33 @@ func (c *Client) HeldPrivileges(ctx context.Context, obj PrivilegeObject, grante
 	return slices.Compact(privileges), slices.Compact(grantable), found, nil
 }
 
+// heldFromAnyGrantorQueries report whether a grantee holds a privilege
+// directly on a database or schema from any grantor.
+var heldFromAnyGrantorQueries = map[ObjectKind]string{
+	ObjectDatabase: `SELECT EXISTS(SELECT 1 FROM pg_catalog.pg_database d,
+  pg_catalog.aclexplode(COALESCE(d.datacl, pg_catalog.acldefault('d', d.datdba))) a
+WHERE d.datname = $1 AND a.grantee = ` + granteeOIDExpr + ` AND a.privilege_type = $4)`,
+	ObjectSchema: `SELECT EXISTS(SELECT 1 FROM pg_catalog.pg_namespace n,
+  pg_catalog.aclexplode(COALESCE(n.nspacl, pg_catalog.acldefault('n', n.nspowner))) a
+WHERE n.nspname = $1 AND a.grantee = ` + granteeOIDExpr + ` AND a.privilege_type = $4)`,
+}
+
+// HeldFromAnyGrantor reports whether grantee holds privilege directly on obj
+// (a database, or a schema of the connected database) from any grantor. A
+// privilege granted by a role other than the owner (one with the grant
+// option) survives a REVOKE a superuser issues, which acts as the owner.
+func (c *Client) HeldFromAnyGrantor(ctx context.Context, obj PrivilegeObject, grantee, privilege string) (bool, error) {
+	query, ok := heldFromAnyGrantorQueries[obj.Kind]
+	if !ok {
+		return false, fmt.Errorf("unsupported object kind %q", obj.Kind)
+	}
+	var held bool
+	if err := c.db.QueryRowContext(ctx, query, obj.Name, IsPublic(grantee), grantee, privilege).Scan(&held); err != nil {
+		return false, fmt.Errorf("failed to read the privileges of %q on %s: %w", grantee, obj, err)
+	}
+	return held, nil
+}
+
 // DependentPrivilegesExist reports whether err is PostgreSQL's
 // "dependent privileges exist" error (SQLSTATE 2BP01): a REVOKE without
 // CASCADE of a privilege the grantee passed on to others.

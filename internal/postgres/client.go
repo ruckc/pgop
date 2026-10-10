@@ -847,18 +847,29 @@ func (c *Client) CreateExtension(ctx context.Context, name, schema, version stri
 	return nil
 }
 
+// SchemaInfo describes an existing schema.
+type SchemaInfo struct {
+	// Owner is the name of the schema's owner.
+	Owner string
+	// OwnerIsBootstrap reports whether the owner is the bootstrap superuser
+	// (OID 10), which owns the schema public of databases created before
+	// PostgreSQL 15.
+	OwnerIsBootstrap bool
+}
+
 // SchemaOwner returns the owner of a schema in the current database, and
 // whether the schema exists.
-func (c *Client) SchemaOwner(ctx context.Context, name string) (owner string, exists bool, err error) {
+func (c *Client) SchemaOwner(ctx context.Context, name string) (info SchemaInfo, exists bool, err error) {
 	err = c.db.QueryRowContext(ctx,
-		"SELECT pg_catalog.pg_get_userbyid(nspowner) FROM pg_catalog.pg_namespace WHERE nspname = $1", name).Scan(&owner)
+		"SELECT pg_catalog.pg_get_userbyid(nspowner), nspowner = 10 FROM pg_catalog.pg_namespace WHERE nspname = $1",
+		name).Scan(&info.Owner, &info.OwnerIsBootstrap)
 	if errors.Is(err, sql.ErrNoRows) {
-		return "", false, nil
+		return SchemaInfo{}, false, nil
 	}
 	if err != nil {
-		return "", false, fmt.Errorf("failed to look up schema %q: %w", name, err)
+		return SchemaInfo{}, false, fmt.Errorf("failed to look up schema %q: %w", name, err)
 	}
-	return owner, true, nil
+	return info, true, nil
 }
 
 // CurrentDatabaseOwner returns the owner of the database the client is

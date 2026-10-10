@@ -162,6 +162,9 @@ func checkHeldPrivilegesIntegration(ctx context.Context, t *testing.T, c *Client
 		t.Errorf("the cascade left %v to the dependent role", p)
 	}
 
+	if v, err := c.ServerVersionNum(ctx); err != nil || v < MinParameterPrivilegesVersion {
+		return // no parameter privileges before PostgreSQL 15
+	}
 	param := PrivilegeObject{Kind: ObjectParameter, Name: "Log_Statement"}
 	if p, _ := held(param, "pgop_priv_reader"); len(p) != 0 {
 		t.Errorf("parameter privileges before any grant = %v", p)
@@ -194,6 +197,36 @@ func checkRoleGrantsIntegration(ctx context.Context, t *testing.T, admin *Client
 	if r, err := admin.LookupRole(ctx, "pgop_priv_reader"); err != nil || r == nil || r.Superuser || r.Name != "pgop_priv_reader" {
 		t.Errorf("LookupRole = %+v %v", r, err)
 	}
+	// PUBLIC holding CONNECT from a grantor other than the owner survives a
+	// superuser's REVOKE: HeldPrivileges (owner as grantor) no longer shows
+	// it, HeldFromAnyGrantor does.
+	for _, q := range []string{
+		`GRANT CONNECT ON DATABASE ` + quoteIdent(dbObj.Name) + ` TO pgop_priv_reader WITH GRANT OPTION`,
+		`SET ROLE pgop_priv_reader; GRANT CONNECT ON DATABASE ` + quoteIdent(dbObj.Name) + ` TO PUBLIC; RESET ROLE`,
+	} {
+		if _, err := admin.db.ExecContext(ctx, q); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+	if err := admin.RevokePrivileges(ctx, dbObj, PublicGrantee, []string{PrivilegeConnect}, RevokeMode{}); err != nil {
+		t.Fatal(err)
+	}
+	if p, _, _, err := admin.HeldPrivileges(ctx, dbObj, PublicGrantee); err != nil || slices.Contains(p, PrivilegeConnect) {
+		t.Errorf("PUBLIC still holds CONNECT from the owner: %v %v", p, err)
+	}
+	if held, err := admin.HeldFromAnyGrantor(ctx, dbObj, PublicGrantee, PrivilegeConnect); err != nil || !held {
+		t.Errorf("HeldFromAnyGrantor = %t %v, want true", held, err)
+	}
+	if err := admin.RevokePrivileges(ctx, dbObj, "pgop_priv_reader", []string{PrivilegeConnect}, RevokeMode{Cascade: true}); err != nil {
+		t.Fatal(err)
+	}
+	if held, err := admin.HeldFromAnyGrantor(ctx, dbObj, PublicGrantee, PrivilegeConnect); err != nil || held {
+		t.Errorf("after the cascade, HeldFromAnyGrantor = %t %v, want false", held, err)
+	}
+	if err := admin.GrantPrivileges(ctx, dbObj, PublicGrantee, []string{PrivilegeConnect}, false); err != nil {
+		t.Fatal(err)
+	}
+
 	if r, err := admin.LookupRole(ctx, operator); err != nil || r == nil || !r.Superuser {
 		t.Errorf("LookupRole(operator) = %+v %v, want a superuser", r, err)
 	}

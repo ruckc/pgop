@@ -32,7 +32,7 @@ import (
 // database grants, PUBLIC's database privileges and settings; it is an
 // interface so the logic can be tested without a server.
 type databaseGrantClient interface {
-	privilegeExecutor
+	publicPrivilegeClient
 	RoleExists(ctx context.Context, name string) (bool, error)
 	SetDatabaseParameter(ctx context.Context, database, parameter, value string) error
 	ResetDatabaseParameter(ctx context.Context, database, parameter string) error
@@ -96,16 +96,16 @@ func roleGone(pg interface {
 // grantees the checker holds back (refused by the grantee policy, missing, or
 // whose Role is being deleted) are not applied, revoked as far as pgop added
 // them, and reported after the others are applied.
+//
+// Before granting, the intended additions are recorded with save (see
+// applyPrivilegeGrants); save may be nil in tests.
 func reconcileDatabaseGrants(ctx context.Context, pg databaseGrantClient, database *postgresv1alpha1.Database, pgName string,
-	checker *granteeChecker) error {
+	checker *granteeChecker, save statusSaver) error {
 	all, err := desiredDatabaseGrants(database.Spec.Grants, pgName)
 	if err != nil {
 		return err
 	}
-	managed := make([]privilegeGrant, 0, len(database.Status.ManagedGrants))
-	for _, m := range database.Status.ManagedGrants {
-		managed = append(managed, privilegeGrant{Target: databaseTarget(pgName, m.Role), Privileges: m.Privileges, GrantOptions: m.GrantOptions})
-	}
+	managed := databaseLedger(pgName, database.Status.ManagedGrants)
 	if len(all) == 0 && len(managed) == 0 {
 		return nil
 	}
@@ -115,13 +115,15 @@ func reconcileDatabaseGrants(ctx context.Context, pg databaseGrantClient, databa
 		return err
 	}
 
-	after, err := applyPrivilegeGrants(ctx, desired, managed, executorOps(pg, roleGone(pg)), databaseGrantLedgerLimit)
-	database.Status.ManagedGrants = nil
-	for _, g := range after {
-		database.Status.ManagedGrants = append(database.Status.ManagedGrants, postgresv1alpha1.ManagedDatabaseGrant{
-			Role: g.Target.Grantee, Privileges: g.Privileges, GrantOptions: g.GrantOptions,
-		})
+	persist := func(ctx context.Context, ledger []privilegeGrant) error {
+		database.Status.ManagedGrants = databaseLedgerStatus(ledger)
+		if save == nil {
+			return nil
+		}
+		return save(ctx)
 	}
+	after, err := applyPrivilegeGrants(ctx, desired, managed, executorOps(pg, roleGone(pg)), databaseGrantLedgerLimit, persist)
+	database.Status.ManagedGrants = databaseLedgerStatus(after)
 	return errors.Join(err, held.err())
 }
 
@@ -186,15 +188,12 @@ func desiredSchemaGrants(schemas []postgresv1alpha1.SchemaSpec, managedSchemas m
 // whole schema entry is removed (the schema is not dropped); a schema or
 // grantee that no longer exists holds nothing to revoke.
 func reconcileSchemaGrants(ctx context.Context, pg schemaGrantClient, database *postgresv1alpha1.Database,
-	managedSchemas map[string]bool, checker *granteeChecker) error {
+	managedSchemas map[string]bool, checker *granteeChecker, save statusSaver) error {
 	fields, all, err := desiredSchemaGrants(database.Spec.Schemas, managedSchemas)
 	if err != nil {
 		return err
 	}
-	managed := make([]privilegeGrant, 0, len(database.Status.ManagedSchemaGrants))
-	for _, m := range database.Status.ManagedSchemaGrants {
-		managed = append(managed, privilegeGrant{Target: schemaTarget(m.Schema, m.Role), Privileges: m.Privileges, GrantOptions: m.GrantOptions})
-	}
+	managed := schemaLedger(database.Status.ManagedSchemaGrants)
 	if len(fields) == 0 && len(managed) == 0 {
 		return nil
 	}
@@ -216,13 +215,15 @@ func reconcileSchemaGrants(ctx context.Context, pg schemaGrantClient, database *
 		}
 		return roleIsGone(ctx, t)
 	}
-	after, err := applyPrivilegeGrants(ctx, desired, managed, executorOps(pg, gone), schemaGrantLedgerLimit)
-	database.Status.ManagedSchemaGrants = nil
-	for _, g := range after {
-		database.Status.ManagedSchemaGrants = append(database.Status.ManagedSchemaGrants, postgresv1alpha1.ManagedSchemaGrant{
-			Schema: g.Target.Name, Role: g.Target.Grantee, Privileges: g.Privileges, GrantOptions: g.GrantOptions,
-		})
+	persist := func(ctx context.Context, ledger []privilegeGrant) error {
+		database.Status.ManagedSchemaGrants = schemaLedgerStatus(ledger)
+		if save == nil {
+			return nil
+		}
+		return save(ctx)
 	}
+	after, err := applyPrivilegeGrants(ctx, desired, managed, executorOps(pg, gone), schemaGrantLedgerLimit, persist)
+	database.Status.ManagedSchemaGrants = schemaLedgerStatus(after)
 	return errors.Join(err, held.err())
 }
 
@@ -281,6 +282,14 @@ func publicGrantConflict(database *postgresv1alpha1.Database, it publicPrivilege
 	return false
 }
 
+// publicPrivilegeClient is what reconcilePublicPrivileges needs.
+type publicPrivilegeClient interface {
+	privilegeExecutor
+	HeldFromAnyGrantor(ctx context.Context, obj postgres.PrivilegeObject, grantee, privilege string) (bool, error)
+}
+
+var _ publicPrivilegeClient = (*postgres.Client)(nil)
+
 // reconcilePublicPrivileges applies spec.publicPrivileges for the items of
 // kind (the database items run on the admin connection, the schema items on
 // a connection to the database) and records what pgop revoked in
@@ -289,12 +298,16 @@ func publicGrantConflict(database *postgresv1alpha1.Database, it publicPrivilege
 // A privilege is revoked from PUBLIC, and recorded, only while PUBLIC holds
 // it (from the object's owner, the grantor pgop's statements act as), so the
 // record lists exactly what pgop took away; once the spec no longer asks for
-// the revoke, pgop grants exactly that back to PUBLIC. The check runs on
+// the revoke, pgop grants exactly that back to PUBLIC. The record is written
+// with save before the REVOKE (an intent log, as for grants), so a lost
+// status update cannot make pgop forget what it revoked. The check runs on
 // every reconcile, so a privilege granted back to PUBLIC outside pgop is
-// revoked again. A privilege the spec also grants to PUBLIC is left alone and
-// reported (reason PublicPrivilegeConflict).
-func reconcilePublicPrivileges(ctx context.Context, pg privilegeExecutor, database *postgresv1alpha1.Database,
-	pgName string, kind postgres.ObjectKind) error {
+// revoked again. A privilege the spec also grants to PUBLIC is left alone
+// (reason PublicPrivilegeConflict); one PUBLIC still holds from another
+// grantor, which a superuser's REVOKE does not remove, is reported (reason
+// PublicPrivilegeStillHeld).
+func reconcilePublicPrivileges(ctx context.Context, pg publicPrivilegeClient, database *postgresv1alpha1.Database,
+	pgName string, kind postgres.ObjectKind, save statusSaver) error {
 	recorded := map[postgresv1alpha1.PublicPrivilege]bool{}
 	for _, p := range database.Status.RevokedPublicPrivileges {
 		recorded[p] = true
@@ -326,7 +339,7 @@ func reconcilePublicPrivileges(ctx context.Context, pg privilegeExecutor, databa
 		return cache[obj], nil
 	}
 
-	var conflicts []string
+	var conflicts, stillHeld []string
 	var errs []error
 	for _, it := range publicPrivilegeItems {
 		if it.kind != kind {
@@ -359,11 +372,22 @@ func reconcilePublicPrivileges(ctx context.Context, pg privilegeExecutor, databa
 		holds := slices.Contains(h.privileges, it.privilege)
 		switch {
 		case wantRevoked && holds:
+			if !recorded[it.field] {
+				recorded[it.field] = true
+				if save != nil {
+					record()
+					if err := save(ctx); err != nil {
+						delete(recorded, it.field)
+						errs = append(errs, fmt.Errorf("recording the PUBLIC privilege pgop is about to revoke failed, "+
+							"nothing was revoked: %w", err))
+						continue
+					}
+				}
+			}
 			if err := pg.RevokePrivileges(ctx, obj, postgres.PublicGrantee, []string{it.privilege}, postgres.RevokeMode{}); err != nil {
 				errs = append(errs, err)
 				continue
 			}
-			recorded[it.field] = true
 		case !wantRevoked:
 			if !holds {
 				if err := pg.GrantPrivileges(ctx, obj, postgres.PublicGrantee, []string{it.privilege}, false); err != nil {
@@ -373,11 +397,25 @@ func reconcilePublicPrivileges(ctx context.Context, pg privilegeExecutor, databa
 			}
 			delete(recorded, it.field)
 		}
+		if wantRevoked {
+			still, err := pg.HeldFromAnyGrantor(ctx, obj, postgres.PublicGrantee, it.privilege)
+			if err != nil {
+				errs = append(errs, err)
+			} else if still {
+				stillHeld = append(stillHeld, string(it.field))
+			}
+		}
 	}
 	if len(conflicts) > 0 {
 		errs = append(errs, &conditionError{reason: ReasonPublicPrivilegeConflict, err: fmt.Errorf(
 			"publicPrivileges %s: the same privilege is granted to PUBLIC in grants or schemas[public].grants; "+
 				"PUBLIC's privilege is left as it is", strings.Join(conflicts, ", "))})
+	}
+	if len(stillHeld) > 0 {
+		errs = append(errs, &conditionError{reason: ReasonPublicPrivilegeStillHeld, err: fmt.Errorf(
+			"publicPrivileges %s: PUBLIC still holds the privilege, granted by a role other than the owner "+
+				"(with the grant option); pgop revokes only as the owner. Revoke it as that role, or with CASCADE "+
+				"from that role's grant option", strings.Join(stillHeld, ", "))})
 	}
 	return errors.Join(errs...)
 }

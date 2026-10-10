@@ -453,6 +453,12 @@ spec:
                         type: string
                       type: array
                       x-kubernetes-list-type: set
+                    withGrantOption:
+                      description: |-
+                        withGrantOption is deprecated and no longer written: pgop v0.15 recorded
+                        with it that all privileges were granted with the grant option. A
+                        ledger that still has it is read as grantOptions = privileges.
+                      type: boolean
                   required:
                   - parameter
                   type: object

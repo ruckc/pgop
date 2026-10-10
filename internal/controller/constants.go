@@ -162,6 +162,11 @@ const (
 	// privilege from PUBLIC that spec.grants or schemas[public].grants grant
 	// to PUBLIC. That PUBLIC privilege is left as it is.
 	ReasonPublicPrivilegeConflict = "PublicPrivilegeConflict"
+	// ReasonPublicPrivilegeStillHeld: Database.spec.publicPrivileges revokes
+	// a privilege that PUBLIC still holds from a grantor other than the
+	// object's owner (a role with the grant option), which pgop's REVOKE,
+	// issued as the owner, does not remove.
+	ReasonPublicPrivilegeStillHeld = "PublicPrivilegeStillHeld"
 	// ReasonTooManyGrants: the grants declared, together with those pgop
 	// still tracks, exceed what the status ledger can hold. Nothing of that
 	// kind is granted or revoked until grants are removed from the spec.

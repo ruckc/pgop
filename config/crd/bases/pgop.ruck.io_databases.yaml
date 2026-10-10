@@ -491,6 +491,12 @@ spec:
                       description: role is the PostgreSQL role the privileges were
                         granted to.
                       type: string
+                    withGrantOption:
+                      description: |-
+                        withGrantOption is deprecated and no longer written: pgop v0.15 recorded
+                        with it that all privileges were granted with the grant option. A
+                        ledger that still has it is read as grantOptions = privileges.
+                      type: boolean
                   required:
                   - role
                   type: object
@@ -531,6 +537,12 @@ spec:
                     schema:
                       description: schema is the schema the privileges are on.
                       type: string
+                    withGrantOption:
+                      description: |-
+                        withGrantOption is deprecated and no longer written: pgop v0.15 recorded
+                        with it that all privileges were granted with the grant option. A
+                        ledger that still has it is read as grantOptions = privileges.
+                      type: boolean
                   required:
                   - role
                   - schema
