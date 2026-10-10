@@ -150,8 +150,13 @@ func (r *DatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		}
 	}
 
-	// Create the database, or update the owner of one this Database owns.
-	if err := ensureDatabase(ctx, adminClient, database, pgName, ownerPGName); err != nil {
+	// Create the database, or update the owner of one this Database owns
+	// (it carries the Database's signed ownership marker).
+	signer, err := loadMarkerSigner(ctx, r.Client, cluster)
+	if err != nil {
+		return r.updateStatus(ctx, database, false, nil, nil, err)
+	}
+	if err := ensureDatabase(ctx, adminClient, database, signer, pgName, ownerPGName); err != nil {
 		log.Error(err, "Failed to create database")
 		return r.updateStatus(ctx, database, false, nil, nil, err)
 	}
@@ -165,7 +170,16 @@ func (r *DatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		log.Error(accessErr, "Failed to reconcile database settings or grants")
 	}
 
-	// Get a connection to the new database to install extensions and create schemas
+	// Get a connection to the new database to install extensions and create
+	// schemas. Its owner can turn connections off, for superusers too.
+	if allow, err := adminClient.DatabaseAllowsConnections(ctx, pgName); err != nil || !allow {
+		if err == nil {
+			err = &conditionError{reason: ReasonDatabaseNotConnectable, err: fmt.Errorf(
+				"the database %s does not allow connections (ALTER DATABASE %s WITH ALLOW_CONNECTIONS true); "+
+					"its extensions and schemas cannot be reconciled", pgName, pgName)}
+		}
+		return r.updateStatus(ctx, database, false, nil, nil, errors.Join(err, accessErr))
+	}
 	dbClient, err := newOperatorClient(ctx, r.Client, cluster, pgName)
 	if err != nil {
 		log.Error(err, "Failed to create PostgreSQL database client")
@@ -266,23 +280,50 @@ type databaseOwnershipClient interface {
 	DatabaseComment(ctx context.Context, name string) (exists bool, comment string, err error)
 	CommentOnDatabase(ctx context.Context, name, comment string) error
 	CreateDatabase(ctx context.Context, name, owner string) error
+	DatabaseOwner(ctx context.Context, name string) (owner string, superuser bool, err error)
 }
 
 // ensureDatabase creates the PostgreSQL database pgName with the Database's
-// ownership marker (COMMENT ON DATABASE), or, when it already carries the
-// marker, updates its owner. A database without the marker (created outside
-// pgop or by another Database) is left alone (reason DatabaseNotManaged);
-// an unmarked one an earlier pgop recorded in status.databaseName is marked.
-// It records pgName in status.databaseName once the database exists.
+// signed ownership marker (COMMENT ON DATABASE), or updates the owner of a
+// database pgop owns. It records pgName in status.databaseName once the
+// database exists.
+//
+//   - A database without this Database's valid marker (created outside pgop,
+//     by another Database, or marked by someone who copied a marker) is left
+//     alone (reason DatabaseNotManaged).
+//   - A database recorded in status.databaseName (which Database writers
+//     cannot write) without a comment or with an unsigned v1 marker was
+//     created by an earlier pgop and is marked.
+//   - A valid marker on a database pgop has not recorded is a hand-over. The
+//     marker text is not secret (conditions show it) and a database's owner
+//     can set its comment, so a role with CREATEDB could build a database
+//     under a name a Database will use and mark it. The hand-over is
+//     therefore refused unless the database is owned by a superuser or
+//     already by the Database's declared owner.
 func ensureDatabase(ctx context.Context, pg databaseOwnershipClient, database *postgresv1alpha1.Database,
-	pgName, owner string) error {
-	marker := ownerMarker(markerKindDatabase, database.Name)
+	signer markerSigner, pgName, owner string) error {
+	marker := signer.marker(markerKindDatabase, database.Name)
 	exists, comment, err := pg.DatabaseComment(ctx, pgName)
 	if err != nil {
 		return err
 	}
-	if decideOwnership(exists, comment, marker, database.Status.DatabaseName == pgName) == notOwned {
+	recorded := database.Status.DatabaseName == pgName
+	switch decideOwnership(signer, markerKindDatabase, database.Name, exists, comment, recorded) {
+	case notOwned:
 		return &conditionError{reason: ReasonDatabaseNotManaged, err: errors.New(notManagedMessage("database", pgName, comment, marker))}
+	case owned:
+		if !recorded {
+			current, superuser, err := pg.DatabaseOwner(ctx, pgName)
+			if err != nil {
+				return err
+			}
+			if !superuser && (owner == "" || current != owner) {
+				return &conditionError{reason: ReasonDatabaseNotManaged, err: fmt.Errorf(
+					"pgop does not take over the existing PostgreSQL database %s: it is owned by %s, which is neither "+
+						"a superuser nor the Database's owner; a superuser can hand it over with "+
+						"ALTER DATABASE %s OWNER TO <a superuser or the owner role>", pgName, current, pgName)}
+			}
+		}
 	}
 	if err := pg.CreateDatabase(ctx, pgName, owner); err != nil {
 		return err
@@ -344,8 +385,12 @@ func (r *DatabaseReconciler) dropPostgresDatabase(ctx context.Context, cluster *
 	if err != nil || !exists {
 		return err
 	}
-	if comment != "" && comment != ownerMarker(markerKindDatabase, database.Name) {
-		log.Info("Not dropping a database this Database does not own", "database", pgName, "comment", comment)
+	signer, err := loadMarkerSigner(ctx, r.Client, cluster)
+	if err != nil {
+		log.Info("Ownership-marker key not available; only unmarked databases can be dropped", "reason", err.Error())
+	}
+	if decideOwnership(signer, markerKindDatabase, database.Name, true, comment, true) == notOwned {
+		log.Info("Not dropping a database this Database does not own", "database", pgName)
 		return nil
 	}
 	return adminClient.DropDatabase(ctx, pgName)

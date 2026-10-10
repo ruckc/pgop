@@ -94,13 +94,13 @@ func (f fixedAddressDialer) DialContext(ctx context.Context, network, _ string) 
 // versionedSessionPins resets, on a new connection, the session settings
 // that can break the operator's sessions when a database owner sets them with
 // ALTER DATABASE ... SET, but that do not exist in every supported
-// PostgreSQL version (so they cannot be startup parameters, which fail the
-// connection when unknown): idle_session_timeout (14+) and
-// transaction_timeout (17+). The query only uses catalog objects; the
-// startup parameters already pinned search_path.
+// PostgreSQL version (PostgreSQL 14 is the oldest supported; an unknown
+// startup parameter fails the connection): transaction_timeout (17+). The
+// query only uses catalog objects; the startup parameters already pinned
+// search_path.
 const versionedSessionPins = `SELECT pg_catalog.set_config(s.name, '0', false)
 FROM pg_catalog.pg_settings s
-WHERE s.name IN ('idle_session_timeout', 'transaction_timeout')`
+WHERE s.name = 'transaction_timeout'`
 
 // pinningConnector runs versionedSessionPins on every new connection.
 type pinningConnector struct {
@@ -348,6 +348,65 @@ func (c *Client) DatabaseComment(ctx context.Context, name string) (exists bool,
 		return false, "", fmt.Errorf("failed to look up database %q: %w", name, err)
 	}
 	return true, comment, nil
+}
+
+// RoleMember is a role that is a member of another role.
+type RoleMember struct {
+	Name      string
+	Admin     bool
+	Superuser bool
+}
+
+// RoleMembers returns the roles that are members of name (whoever granted
+// the membership).
+func (c *Client) RoleMembers(ctx context.Context, name string) ([]RoleMember, error) {
+	rows, err := c.db.QueryContext(ctx, `SELECT u.rolname, m.admin_option, u.rolsuper
+FROM pg_catalog.pg_auth_members m
+JOIN pg_catalog.pg_roles r ON r.oid = m.roleid
+JOIN pg_catalog.pg_roles u ON u.oid = m.member
+WHERE r.rolname = $1
+ORDER BY u.rolname`, name)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list members of %q: %w", name, err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []RoleMember
+	for rows.Next() {
+		var m RoleMember
+		if err := rows.Scan(&m.Name, &m.Admin, &m.Superuser); err != nil {
+			return nil, fmt.Errorf("failed to scan member: %w", err)
+		}
+		out = append(out, m)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to list members of %q: %w", name, err)
+	}
+	return out, nil
+}
+
+// DatabaseOwner returns the owner of the database and whether the owner is
+// a superuser.
+func (c *Client) DatabaseOwner(ctx context.Context, name string) (owner string, superuser bool, err error) {
+	err = c.db.QueryRowContext(ctx, `SELECT r.rolname, r.rolsuper FROM pg_catalog.pg_database d
+JOIN pg_catalog.pg_roles r ON r.oid = d.datdba WHERE d.datname = $1`, name).Scan(&owner, &superuser)
+	if err != nil {
+		return "", false, fmt.Errorf("failed to look up the owner of database %q: %w", name, err)
+	}
+	return owner, superuser, nil
+}
+
+// DatabaseAllowsConnections reports whether the database accepts
+// connections (pg_database.datallowconn); false when it does not exist.
+func (c *Client) DatabaseAllowsConnections(ctx context.Context, name string) (bool, error) {
+	var allow bool
+	err := c.db.QueryRowContext(ctx, `SELECT datallowconn FROM pg_catalog.pg_database WHERE datname = $1`, name).Scan(&allow)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("failed to look up database %q: %w", name, err)
+	}
+	return allow, nil
 }
 
 // CommentOnDatabase sets the comment of a database. Database comments are

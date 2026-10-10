@@ -209,31 +209,27 @@ var _ = Describe("Role policy", func() {
 	})
 
 	Describe("ownership markers", func() {
-		It("builds markers that identify the resource", func() {
-			Expect(ownerMarker(markerKindRole, "app-user")).To(Equal("pgop:v1:Role/app-user"))
-			Expect(ownerMarker(markerKindDatabase, "app-db")).To(Equal("pgop:v1:Database/app-db"))
-			Expect(isOwnerMarker("pgop:v1:Role/app-user")).To(BeTrue())
-			Expect(isOwnerMarker("owned by the DBA team")).To(BeFalse())
-		})
-
 		DescribeTable("decideOwnership",
 			func(exists bool, comment string, recorded bool, want ownership) {
-				Expect(decideOwnership(exists, comment, "pgop:v1:ns/c/me", recorded)).To(Equal(want))
+				Expect(decideOwnership(testSigner, markerKindRole, "me", exists, comment, recorded)).To(Equal(want))
 			},
 			Entry("absent", false, "", false, ownedAbsent),
-			Entry("own marker", true, "pgop:v1:ns/c/me", false, owned),
-			Entry("own marker, recorded", true, "pgop:v1:ns/c/me", true, owned),
+			Entry("valid marker", true, ownerMarker(markerKindRole, "me"), false, owned),
+			Entry("valid marker, recorded", true, ownerMarker(markerKindRole, "me"), true, owned),
 			Entry("legacy: no comment, recorded in status", true, "", true, ownedLegacy),
+			Entry("legacy: v1 marker, recorded in status", true, "pgop:v1:Role/me", true, ownedLegacy),
+			Entry("v1 marker without status is not trusted", true, "pgop:v1:Role/me", false, notOwned),
 			Entry("pre-existing DBA role", true, "", false, notOwned),
 			Entry("DBA comment, even if recorded", true, "app team", true, notOwned),
-			Entry("another resource's marker", true, "pgop:v1:ns/c/other", true, notOwned),
+			Entry("forged v2 marker", true, "pgop:v2:Role/me:AAAA", true, notOwned),
+			Entry("another resource's marker", true, ownerMarker(markerKindRole, "other"), true, notOwned),
 		)
 
 		It("tells how to hand an object over", func() {
 			Expect(notManagedMessage("role", "analytics", "", "pgop:v1:ns/c/me")).
 				To(ContainSubstring("COMMENT ON ROLE analytics IS 'pgop:v1:ns/c/me'"))
-			Expect(notManagedMessage("database", "app", "pgop:v1:ns/c/other", "pgop:v1:ns/c/me")).
-				To(ContainSubstring("managed by another pgop resource"))
+			Expect(notManagedMessage("database", "app", "pgop:v2:Database/app:AAAA", "pgop:v2:Database/app:me")).
+				To(ContainSubstring("not this resource's valid marker"))
 		})
 	})
 

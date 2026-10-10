@@ -139,40 +139,62 @@ spec:
 ### Ownership of the PostgreSQL role
 
 pgop only alters, sets the password of, or drops a PostgreSQL role it
-created for this Role. When it creates the role it stores an ownership marker
-with it, in the same transaction:
+created for this Role. When it creates the role it stores a **signed**
+ownership marker with it, in the same transaction:
 
 ```sql
-COMMENT ON ROLE app_user IS 'pgop:v1:Role/app-user'   -- pgop:v1:Role/<Role name>
+-- pgop:v2:Role/<Role name>:<HMAC-SHA256 of kind, namespace, Cluster and name>
+COMMENT ON ROLE app_user IS 'pgop:v2:Role/app-user:3q2-...'
 ```
 
-- If the role **already exists without this Role's marker** (created by a DBA,
-  a bootstrap Job, another Role, or another tool), nothing is changed in
-  PostgreSQL and no credentials Secret is written: the Role reports
-  `Available=False` with reason `RoleNotManaged`. Without this check a Role
-  writer could reset the password of any existing role and log in as it.
-- **Deliberate hand-over:** to let a Role manage an existing role, a superuser
-  sets the marker the condition message shows (`COMMENT ON ROLE <role> IS
-  'pgop:v1:Role/<Role name>'`). Setting a role's comment needs superuser (or
-  `CREATEROLE` with `ADMIN` on the role), so a Role writer cannot do it
-  themselves. Even then pgop refuses (`RolePolicyViolation`) a role that is a
-  superuser or that already belongs to roles the
-  [membership policy](#membership-policy) does not allow; privileged
-  attributes beyond the policy are altered down.
+The HMAC key is a random per-Cluster key in the Secret
+`<cluster>-marker-key`, created and owned by the Cluster, labeled as managed by
+pgop (so `passwordSecretRef` cannot read it) and never mounted into a pod.
+Without the key nobody can compute a marker, and markers are compared in
+constant time.
+
+- If the role **already exists without this Role's valid marker** (created by
+  a DBA, a bootstrap Job, another Role or tool, or carrying a copied or forged
+  marker), nothing is changed in PostgreSQL and no credentials Secret is
+  written: the Role reports `Available=False` with reason `RoleNotManaged`.
+  Without this check a Role writer could reset the password of any existing
+  role and log in as it.
+- **Deliberate hand-over:** the condition message shows the exact statement a
+  superuser runs to hand the role over (`COMMENT ON ROLE <role> IS
+  'pgop:v2:...'`). The marker is not secret: it only names this Role on this
+  Cluster, and showing it reveals nothing about the key. But anyone with
+  `ADMIN` on a role can set its comment (on PostgreSQL 16+ a role's creator
+  gets `ADMIN` on it; on 15 and older any `CREATEROLE` role can), so a marker
+  alone is not trusted for a role pgop has not recorded: the hand-over is
+  refused (`RolePolicyViolation`) while any role other than a superuser is a
+  member of the role (with or without `ADMIN`), so whoever created or
+  administers it cannot keep or regain control of a role pgop hands out
+  passwords for. It is also refused for a role that is a superuser or that
+  already belongs to roles the [membership policy](#membership-policy) does
+  not allow; privileged attributes beyond the policy are altered down.
 - **Two Roles, one PostgreSQL name:** of two Roles on the same Cluster that
   resolve to the same PostgreSQL name, only the older one (by creation time)
   is reconciled; the other reports `DuplicateRoleName` and never touches or
   drops the role.
 - **Deletion** drops only the role recorded in `status.roleName`, and only
-  while it carries this Role's marker (or no comment, see below).
-- **Upgrade from earlier pgop:** a role an earlier pgop created has no marker
-  but is recorded in the Role's `status.roleName`; it is marked on the next
-  reconcile. Roles whose status was lost must be handed over as above.
+  while it carries this Role's valid marker (or a legacy one, below).
+- **Upgrade from earlier pgop:** a role recorded in the Role's
+  `status.roleName` that has no comment, or the unsigned
+  `pgop:v1:Role/<name>` marker of an earlier build, is re-marked with the
+  signed marker. Only status (which Role writers cannot change) makes such a
+  role trusted; a bare `pgop:v1:` comment is not. Roles whose status was lost
+  must be handed over as above.
+- **Lost key:** if `<cluster>-marker-key` is deleted, a new key is generated
+  and the existing markers no longer match (everything reports
+  `RoleNotManaged` / `DatabaseNotManaged`; nothing is changed or dropped). To
+  recover, a superuser clears the comments (`COMMENT ON ROLE <role> IS NULL`,
+  `COMMENT ON DATABASE <db> IS NULL`) of the objects the resources managed;
+  those recorded in status are then re-marked with the new key. Back the
+  Secret up with the Cluster's other Secrets.
 
 The marker names the Role, not its UID, so it survives re-creating the Roles
-from Git and restoring a physical backup into a Cluster of another name (the
-Role resources keep their names). Every resource that can reach a Cluster
-lives in the Cluster's namespace and resource names are unique there.
+from Git (the key Secret must survive too). Every resource that can reach a
+Cluster lives in the Cluster's namespace and resource names are unique there.
 
 ## Memberships
 
@@ -350,14 +372,23 @@ spec:
   applied, and a managed grant on such a parameter is revoked.
 - Granting SET on any other superuser-only parameter is a real privilege
   escalation for that role: for example SET on `log_statement` lets it turn
-  statement logging off for its own sessions. Grant only what the role
-  needs.
+  statement logging off for its own sessions. If the role also owns a
+  database, it can set the parameter as a default for **every** session in
+  that database (`ALTER DATABASE ... SET log_statement = 'none'`), including
+  other roles' and the operator's: the logging and auditing of that database
+  is then in its hands. pgop pins the settings that could break its own
+  sessions (`exit_on_error` among them, see
+  [Databases: settings](databases.md#which-parameters-may-be-set)), but not
+  logging parameters, whose server-wide value it does not override. Grant
+  logging parameters only to roles that do not own databases, or accept that
+  risk. Grant only what the role needs.
 
 ## Deletion
 
 When a Role is deleted, pgop drops the PostgreSQL role recorded in
 `status.roleName` (nothing is dropped when no role was recorded, for example
-when pgop refused to take over an [existing role](#existing-roles)).
+when pgop refused to take over an
+[existing role](#ownership-of-the-postgresql-role)).
 PostgreSQL refuses to drop a role that still holds privileges, so pgop first
 revokes:
 
@@ -367,7 +398,11 @@ revokes:
 - every schema privilege the role holds, in every database,
 
 all with `CASCADE` (privileges the role passed on go with it, as with
-`DROP OWNED`). Databases whose `grants` list the role stop granting to it while
+`DROP OWNED`). A database that does not accept connections (its owner can run
+`ALTER DATABASE ... WITH ALLOW_CONNECTIONS false`, which also locks out
+superusers) or cannot be reached is skipped instead of holding the deletion
+up; if privileges there still block `DROP ROLE`, the `RoleDropBlocked`
+condition names the database. Databases whose `grants` list the role stop granting to it while
 it is being deleted, so they do not undo this.
 
 Anything else that depends on the role, such as objects it owns or privileges

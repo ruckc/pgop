@@ -317,11 +317,14 @@ precedence over those per-database and per-role defaults):
 operators in the operator's superuser queries could resolve to objects in a
 schema the owner controls), `role = none` (the owner can otherwise make every
 new session in their database start as their own role), `statement_timeout`,
-`lock_timeout`, `idle_in_transaction_session_timeout` (all `0`),
-`default_transaction_read_only = off`, `check_function_bodies = on`,
-`row_security = on`, `default_tablespace` and `temp_tablespaces` (empty). On
-connecting, `idle_session_timeout` (PostgreSQL 14+) and `transaction_timeout`
-(17+) are reset to `0` as well.
+`lock_timeout`, `idle_in_transaction_session_timeout`, `idle_session_timeout`
+(all `0`), `default_transaction_read_only = off`, `check_function_bodies = on`,
+`row_security = on`, `default_tablespace` and `temp_tablespaces` (empty), and
+`exit_on_error = off` (a superuser parameter an owner could only set with a
+`parameterGrants` grant). On connecting, `transaction_timeout`
+(PostgreSQL 17+, so it cannot be a startup parameter on older servers) is
+reset to `0` as well. Logging parameters are not pinned (see
+[Roles: parameter grants](roles.md#parameter-grants)).
 
 ## Ordering & Dependencies
 
@@ -427,18 +430,32 @@ escalation for the writer).
 ### Ownership of the PostgreSQL database
 
 As for [roles](roles.md#ownership-of-the-postgresql-role), pgop marks a
-database it creates with `COMMENT ON DATABASE <db> IS 'pgop:v1:Database/<Database name>'`
-and only changes the owner, settings, grants, extensions and schemas of, or
-drops, a database carrying this Database's marker:
+database it creates with a signed marker
+(`COMMENT ON DATABASE <db> IS 'pgop:v2:Database/<Database name>:<HMAC>'`, keyed
+by the Cluster's `<cluster>-marker-key` Secret) and only changes the owner,
+settings, grants, extensions and schemas of, or drops, a database carrying
+this Database's valid marker:
 
 - an existing database without it (created by a DBA, a restore tool, another
-  Database) is left alone: reason `DatabaseNotManaged`, nothing is altered and
-  deleting the Database never drops it. A superuser can hand it over with the
-  `COMMENT ON DATABASE` statement the condition message shows;
+  Database, or carrying a copied or forged marker) is left alone: reason
+  `DatabaseNotManaged`, nothing is altered and deleting the Database never
+  drops it;
+- **hand-over:** the condition message shows the `COMMENT ON DATABASE`
+  statement with the marker. A database's owner can set its comment, so a
+  role with `CREATEDB` could create a database under a name a Database will
+  use and copy the marker onto it. A marked database pgop has not recorded is
+  therefore only taken over when it is owned by a superuser or already by the
+  Database's `owner` Role; otherwise it stays `DatabaseNotManaged`
+  (a superuser can `ALTER DATABASE <db> OWNER TO` one of those first);
 - of two Databases of a Cluster with the same PostgreSQL name only the older
   one is reconciled; the other reports `DuplicateDatabaseName`;
-- a database an earlier pgop created (recorded in `status.databaseName`,
-  no comment) is marked on the next reconcile.
+- a database recorded in `status.databaseName` without a comment or with the
+  unsigned `pgop:v1:` marker of an earlier build is re-marked on the next
+  reconcile; a bare `pgop:v1:` comment without status is not trusted;
+- a database whose owner turned connections off (`ALTER DATABASE ... WITH
+  ALLOW_CONNECTIONS false`, which also locks out superusers) reports
+  `DatabaseNotConnectable`: its settings and grants are still applied, its
+  extensions and schemas wait until connections are allowed again.
 
 ### Upgrade / breaking changes
 

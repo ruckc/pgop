@@ -146,6 +146,9 @@ const (
 	// ReasonDatabaseNotManaged: the PostgreSQL database exists but does not
 	// carry this Database's ownership marker; pgop leaves it alone.
 	ReasonDatabaseNotManaged = "DatabaseNotManaged"
+	// ReasonDatabaseNotConnectable: the database does not allow connections
+	// (ALTER DATABASE ... WITH ALLOW_CONNECTIONS false).
+	ReasonDatabaseNotConnectable = "DatabaseNotConnectable"
 	// ReasonDuplicateDatabaseName: an older Database of the same Cluster
 	// resolves to the same PostgreSQL database name.
 	ReasonDuplicateDatabaseName = "DuplicateDatabaseName"

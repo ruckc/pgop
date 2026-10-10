@@ -42,7 +42,7 @@ const (
 var testManaged = func() managedRoles {
 	m := managedRoles{}
 	for _, name := range []string{"a", "b", grantTestOther, memParent, memLegacy, memGone, memOld,
-		"ops", "dba", "tenant_b", "wraps_dba", "app_ro", "repl", "app_mon"} {
+		polOps, polDBA, "tenant_b", "wraps_dba", "app_ro", "repl", "app_mon"} {
 		m[name] = ownerMarker(markerKindRole, name)
 	}
 	return m

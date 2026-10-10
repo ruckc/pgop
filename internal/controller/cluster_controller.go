@@ -171,6 +171,12 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		log.Error(err, "Failed to reconcile Secret")
 		return r.updateStatus(ctx, cluster, false, err)
 	}
+	// The key that signs the ownership markers of the Cluster's roles and
+	// databases (never mounted into a pod).
+	if err := ensureMarkerKeySecret(ctx, r.Client, r.Scheme, cluster); err != nil {
+		log.Error(err, "Failed to reconcile the ownership-marker key Secret")
+		return r.updateStatus(ctx, cluster, false, err)
+	}
 
 	// Whether the pod template carries the replication settings (see
 	// replicationEnabled) depends on the existing StatefulSet.

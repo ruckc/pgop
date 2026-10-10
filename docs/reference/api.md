@@ -240,7 +240,8 @@ privileged attribute the Cluster's `rolePolicy` does not allow (the role then
 has none of `createRole`, `replication`, `bypassRLS`), names an existing role
 pgop must not take over, or names a pgop-managed Secret in `passwordSecretRef`,
 `RoleNotManaged` when the PostgreSQL role exists without this Role's
-ownership marker (`COMMENT ON ROLE ... IS 'pgop:v1:Role/<name>'`),
+signed ownership marker (`COMMENT ON ROLE ... IS 'pgop:v2:Role/<name>:<HMAC>'`;
+the message shows the statement for a superuser hand-over),
 `DuplicateRoleName` when an older Role of the Cluster has the same
 PostgreSQL name, `MembershipNotAllowed` when a membership is refused (the others are applied;
 refused ones pgop granted before are revoked), `ReservedName` when the
@@ -337,8 +338,10 @@ setting is refused, `ExtensionNotAllowed` when an extension is refused,
 `SchemaNotAllowed` for a system schema (the other settings, grants,
 extensions and schemas are still reconciled), `ReservedName` for a reserved
 database name, `DatabaseNotManaged` when the database exists without this
-Database's ownership marker (`COMMENT ON DATABASE ... IS
-'pgop:v1:Database/<name>'`), `DuplicateDatabaseName` when an older Database of
+Database's signed ownership marker (`COMMENT ON DATABASE ... IS
+'pgop:v2:Database/<name>:<HMAC>'`), or carries it but is owned by a role that
+is neither a superuser nor the Database's owner, `DatabaseNotConnectable` when
+the database does not allow connections, `DuplicateDatabaseName` when an older Database of
 the Cluster has the same PostgreSQL name, and `ReconcileError` for other failures, such as a grantee
 role that does not exist yet.
 

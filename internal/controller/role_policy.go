@@ -17,6 +17,9 @@ limitations under the License.
 package controller
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
 	"fmt"
 	"slices"
 	"strings"
@@ -40,31 +43,111 @@ const reservedRolePrefix = "pgop_"
 // pgop's clusters use their own operator role, but the name stays reserved.
 const bootstrapRoleName = "postgres"
 
-// markerVersion starts every ownership marker pgop stores in COMMENT ON ROLE
-// and COMMENT ON DATABASE.
-const markerVersion = "pgop:v1:"
-
-// Kinds used in ownership markers.
+// Ownership markers.
+//
+// pgop records which resource owns a PostgreSQL role or database in the
+// object's comment (COMMENT ON ROLE / COMMENT ON DATABASE):
+//
+//	pgop:v2:<Kind>/<name>:<base64url HMAC-SHA256(key, "<kind>|<namespace>|<cluster>|<name>")>
+//
+// The key is a random per-Cluster secret (markerKeySecretName), so nobody who
+// cannot read that Secret can compute a marker. Printing a marker (the
+// RoleNotManaged / DatabaseNotManaged messages do, so a superuser can hand an
+// object over) only reveals the marker for that one name on that one Cluster.
+// Because a database owner can set the comment of their own database, and a
+// role with ADMIN on a role can set its comment, a marker alone is never
+// enough to adopt an object pgop has not recorded in status: see
+// checkRoleOwnership and ensureDatabase.
+//
+// The marker names the resource, not its UID: re-creating the resources from
+// Git keeps their markers valid. Every resource that can reach a Cluster
+// lives in the Cluster's namespace and resource names are unique there.
 const (
+	markerV2Prefix = "pgop:v2:"
+	// markerV1Prefix marked objects before markers were signed. A v1 marker
+	// is only trusted together with the resource's status (legacy path).
+	markerV1Prefix = "pgop:v1:"
+
 	markerKindRole     = "Role"
 	markerKindDatabase = "Database"
 )
 
-// ownerMarker is the ownership marker pgop stores on the PostgreSQL role or
-// database that the resource kind/name manages: "pgop:v1:Role/<name>" or
-// "pgop:v1:Database/<name>". Only a superuser (or, for a role, a role with
-// CREATEROLE and ADMIN on it; for a database, its owner) can set a comment,
-// so the marker records that pgop created the object, or that a privileged
-// user deliberately handed it over.
-//
-// The marker names the resource, not its UID, namespace or Cluster: every
-// resource that can reach a Cluster lives in the Cluster's namespace (and
-// resource names are unique there), and a name survives what a UID does not:
-// re-creating the resources from Git, or restoring a physical backup into a
-// Cluster with another name. Two resources with the same PostgreSQL name have
-// different markers, and only the older one is reconciled.
-func ownerMarker(kind, name string) string {
-	return markerVersion + kind + "/" + name
+// markerSigner computes and checks the ownership markers of one Cluster.
+type markerSigner struct {
+	key       []byte
+	namespace string
+	cluster   string
+}
+
+func newMarkerSigner(cluster *postgresv1alpha1.Cluster, key []byte) markerSigner {
+	return markerSigner{key: key, namespace: cluster.Namespace, cluster: cluster.Name}
+}
+
+// marker returns the marker of the resource kind/name.
+func (s markerSigner) marker(kind, name string) string {
+	mac := hmac.New(sha256.New, s.key)
+	mac.Write([]byte(kind + "|" + s.namespace + "|" + s.cluster + "|" + name))
+	return markerV2Prefix + kind + "/" + name + ":" + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+}
+
+// verify reports, in constant time, whether comment is the marker of
+// kind/name.
+func (s markerSigner) verify(comment, kind, name string) bool {
+	return len(s.key) > 0 && hmac.Equal([]byte(comment), []byte(s.marker(kind, name)))
+}
+
+// legacyMarker is the unsigned marker an earlier pgop stored.
+func legacyMarker(kind, name string) string {
+	return markerV1Prefix + kind + "/" + name
+}
+
+// isOwnerMarker reports whether comment looks like a pgop ownership marker
+// (signed or not; it says nothing about whether it is valid).
+func isOwnerMarker(comment string) bool {
+	return strings.HasPrefix(comment, markerV2Prefix) || strings.HasPrefix(comment, markerV1Prefix)
+}
+
+// ownership is how a resource relates to an existing PostgreSQL object of
+// its name.
+type ownership int
+
+const (
+	// ownedAbsent: the object does not exist; create it with the marker.
+	ownedAbsent ownership = iota
+	// owned: the object carries this resource's valid (signed) marker.
+	owned
+	// ownedLegacy: the resource's status records that pgop created or took
+	// over the object, which has no comment or an unsigned v1 marker; mark
+	// it. Status cannot be written by Role or Database writers.
+	ownedLegacy
+	// notOwned: the object belongs to someone else; leave it alone.
+	notOwned
+)
+
+// decideOwnership classifies an existing object by its comment.
+func decideOwnership(s markerSigner, kind, name string, exists bool, comment string, recordedInStatus bool) ownership {
+	switch {
+	case !exists:
+		return ownedAbsent
+	case s.verify(comment, kind, name):
+		return owned
+	case recordedInStatus && (comment == "" || comment == legacyMarker(kind, name)):
+		return ownedLegacy
+	}
+	return notOwned
+}
+
+// notManagedMessage explains why pgop leaves an existing object alone and
+// how a superuser can hand it over deliberately.
+func notManagedMessage(kind, name, comment, marker string) string {
+	if isOwnerMarker(comment) {
+		return fmt.Sprintf("the PostgreSQL %s %s carries an ownership marker that is not this resource's valid marker; "+
+			"pgop does not touch it. To hand it over deliberately, a superuser can run: COMMENT ON %s %s IS '%s'",
+			kind, name, strings.ToUpper(kind), name, marker)
+	}
+	return fmt.Sprintf("the PostgreSQL %s %s already exists and was not created by this resource; pgop does not take it over "+
+		"(it would reset its owner, settings or password and could drop it). To hand it over deliberately, a superuser "+
+		"can run: COMMENT ON %s %s IS '%s'", kind, name, strings.ToUpper(kind), name, marker)
 }
 
 // managedRoles maps the PostgreSQL role names of a Cluster's Roles to the
@@ -75,52 +158,7 @@ type managedRoles map[string]string
 // belongs to such a Role and it carries that Role's marker.
 func (m managedRoles) manages(r postgres.ReachableRole) bool {
 	marker, ok := m[r.Name]
-	return ok && r.Comment == marker
-}
-
-// isOwnerMarker reports whether comment is a pgop ownership marker.
-func isOwnerMarker(comment string) bool {
-	return strings.HasPrefix(comment, markerVersion)
-}
-
-// ownership is how a resource relates to an existing PostgreSQL object of
-// its name.
-type ownership int
-
-const (
-	// ownedAbsent: the object does not exist; create it with the marker.
-	ownedAbsent ownership = iota
-	// owned: the object carries this resource's marker.
-	owned
-	// ownedLegacy: the object has no comment and the resource's status
-	// records that an earlier pgop created or took it over; mark it.
-	ownedLegacy
-	// notOwned: the object belongs to someone else; leave it alone.
-	notOwned
-)
-
-// decideOwnership classifies an existing object by its comment.
-func decideOwnership(exists bool, comment, marker string, recordedInStatus bool) ownership {
-	switch {
-	case !exists:
-		return ownedAbsent
-	case comment == marker:
-		return owned
-	case comment == "" && recordedInStatus:
-		return ownedLegacy
-	}
-	return notOwned
-}
-
-// notManagedMessage explains why pgop leaves an existing object alone and
-// how to hand it over deliberately.
-func notManagedMessage(kind, name, comment, marker string) string {
-	if isOwnerMarker(comment) {
-		return fmt.Sprintf("the PostgreSQL %s %s is managed by another pgop resource (%s); pgop does not touch it", kind, name, comment)
-	}
-	return fmt.Sprintf("the PostgreSQL %s %s already exists and was not created by this resource; pgop does not take it over "+
-		"(it would reset its owner, settings or password and could drop it). To hand it over deliberately, a superuser "+
-		"can run: COMMENT ON %s %s IS '%s'", kind, name, strings.ToUpper(kind), name, marker)
+	return ok && hmac.Equal([]byte(r.Comment), []byte(marker))
 }
 
 // reservedRoleName explains why name cannot be managed by a Role resource,

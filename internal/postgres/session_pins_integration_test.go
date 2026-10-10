@@ -74,6 +74,7 @@ func TestOperatorSessionPinsIntegration(t *testing.T) {
 		`default_transaction_read_only = on`,
 		`check_function_bodies = off`,
 		`row_security = off`,
+		`exit_on_error = on`,
 	} {
 		exec(`ALTER DATABASE ` + db + ` SET ` + set)
 	}
@@ -95,9 +96,10 @@ func TestOperatorSessionPinsIntegration(t *testing.T) {
 		settingStatementTimeout:               "0",
 		"lock_timeout":                        "0",
 		"idle_in_transaction_session_timeout": "0",
-		"default_transaction_read_only":       "off",
+		"default_transaction_read_only":       settingOff,
 		"check_function_bodies":               "on",
 		"row_security":                        "on",
+		"exit_on_error":                       settingOff,
 		"idle_session_timeout":                "0",
 		"transaction_timeout":                 "0",
 	}
@@ -128,6 +130,13 @@ func TestOperatorSessionPinsIntegration(t *testing.T) {
 		t.Errorf("statement failed: %v", err)
 	}
 
+	checkCatalogHelpers(ctx, t, admin, c, cfg.Database, exec)
+}
+
+// checkCatalogHelpers checks the ownership-marker and catalog helpers against
+// the server (see TestOperatorSessionPinsIntegration).
+func checkCatalogHelpers(ctx context.Context, t *testing.T, admin, c *Client, db string, exec func(string)) {
+	t.Helper()
 	// Ownership markers: COMMENT ON ROLE in the CREATE ROLE transaction,
 	// COMMENT ON DATABASE from a connection to another database, and the
 	// comment in the membership closure.
@@ -151,5 +160,35 @@ func TestOperatorSessionPinsIntegration(t *testing.T) {
 	}
 	if exists, comment, err := admin.DatabaseComment(ctx, db); err != nil || !exists || comment != marker+"'; DROP ROLE x; --" {
 		t.Errorf("DatabaseComment = %t %q %v", exists, comment, err)
+	}
+
+	// Members (for the hand-over check), database owner and connectability.
+	exec(`CREATE ROLE pgop_pin_member`)
+	t.Cleanup(func() {
+		_, _ = admin.db.ExecContext(ctx, `DROP DATABASE IF EXISTS `+db)
+		_, _ = admin.db.ExecContext(ctx, `DROP ROLE IF EXISTS pgop_pin_member`)
+	})
+	exec(`GRANT pgop_pin_marked TO pgop_pin_member WITH ADMIN OPTION`)
+	if _, err := c.db.ExecContext(ctx, `GRANT USAGE ON SCHEMA public TO pgop_pin_member`); err != nil {
+		t.Fatal(err)
+	}
+	members, err := admin.RoleMembers(ctx, "pgop_pin_marked")
+	if err != nil || len(members) != 1 || members[0] != (RoleMember{Name: "pgop_pin_member", Admin: true}) {
+		t.Errorf("RoleMembers = %+v %v", members, err)
+	}
+	if owner, super, err := admin.DatabaseOwner(ctx, db); err != nil || owner != "pgop_pin_tenant" || super {
+		t.Errorf("DatabaseOwner = %q %t %v", owner, super, err)
+	}
+	if allow, err := admin.DatabaseAllowsConnections(ctx, db); err != nil || !allow {
+		t.Errorf("DatabaseAllowsConnections = %t %v, want true", allow, err)
+	}
+	_ = c.Close()
+	exec(`ALTER DATABASE ` + db + ` WITH ALLOW_CONNECTIONS false`)
+	if allow, err := admin.DatabaseAllowsConnections(ctx, db); err != nil || allow {
+		t.Errorf("DatabaseAllowsConnections = %t %v, want false", allow, err)
+	}
+	dbs, err := admin.DatabasesWithSchemaPrivileges(ctx, "pgop_pin_member")
+	if err != nil || len(dbs) != 1 || dbs[0] != (DatabaseRef{Name: db, AllowConns: false}) {
+		t.Errorf("DatabasesWithSchemaPrivileges = %+v %v", dbs, err)
 	}
 }

@@ -242,6 +242,13 @@ server):
 Allowing `pg_monitor` also allows the roles PostgreSQL makes it a member of
 (`pg_read_all_settings`, `pg_read_all_stats`, `pg_stat_scan_tables`).
 
+The Cluster also owns the Secret `<cluster>-marker-key`: the random key that
+signs the ownership markers pgop stores on the roles and databases it creates
+(see [Roles: ownership](roles.md#ownership-of-the-postgresql-role)). It is
+never mounted into a pod and cannot be used as a `passwordSecretRef`. Keep it
+with the Cluster's other Secrets: if it is lost, existing markers stop
+matching until a superuser clears them.
+
 `pg_execute_server_program`, `pg_read_server_files` and
 `pg_write_server_files` give shell or file access on the server and can never
 be allowed.
@@ -380,7 +387,8 @@ The standard `PG*` env vars are consumed automatically by `libpq`-based clients
 
 ## Supported Images
 
-Any Docker image compatible with the official PostgreSQL image environment variables:
+Any Docker image compatible with the official PostgreSQL image environment
+variables. **PostgreSQL 14 is the oldest supported major version.**
 
 - `postgres:18`
 - `postgres:17`

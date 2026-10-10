@@ -93,19 +93,25 @@ const operatorSearchPath = "pg_catalog, pg_temp"
 //   - role: run the operator's session as their own role
 //     (ALTER DATABASE ... SET role = 'owner' is accepted for the owner);
 //   - statement_timeout, lock_timeout, idle_in_transaction_session_timeout,
-//     default_transaction_read_only, check_function_bodies, row_security,
-//     default_tablespace, temp_tablespaces: make the operator's statements
-//     fail, or behave differently, in their database.
+//     idle_session_timeout, default_transaction_read_only,
+//     check_function_bodies, row_security, default_tablespace,
+//     temp_tablespaces: make the operator's statements fail, or behave
+//     differently, in their database;
+//   - exit_on_error (superuser context, so only with a parameterGrants
+//     grant): end the operator's session on any error.
 //
-// They all exist in every supported PostgreSQL version; settings that only
-// exist in newer versions are pinned after connecting (versionedSessionPins).
+// They all exist in every supported PostgreSQL version (14 and later);
+// settings that only exist in newer versions are pinned after connecting
+// (versionedSessionPins).
 var operatorSessionSettings = []struct{ k, v string }{
 	{settingSearchPath, operatorSearchPath},
 	{settingRole, roleNone},
 	{settingStatementTimeout, "0"},
 	{"lock_timeout", "0"},
 	{"idle_in_transaction_session_timeout", "0"},
-	{"default_transaction_read_only", "off"},
+	{"idle_session_timeout", "0"},
+	{"exit_on_error", settingOff},
+	{"default_transaction_read_only", settingOff},
 	{"check_function_bodies", "on"},
 	{"row_security", "on"},
 	{"default_tablespace", ""},
@@ -119,6 +125,7 @@ const (
 	settingStatementTimeout = "statement_timeout"
 	settingTempTablespaces  = "temp_tablespaces"
 	roleNone                = "none"
+	settingOff              = "off"
 )
 
 // quoteDSNValue quotes a libpq connection-string value: the value is wrapped
