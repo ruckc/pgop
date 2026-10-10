@@ -332,7 +332,7 @@ func (p *objectPlanner) list(ctx context.Context, g *objectGroup) {
 	if g.all {
 		sel.Limit = maxObjectsPerKind + 1
 	} else {
-		for _, n := range g.names {
+		for _, n := range slices.Compact(slices.Sorted(slices.Values(g.names))) {
 			name, args, sig := parseRoutineName(n)
 			if !g.kind.isRoutine() || !sig {
 				sel.Names = append(sel.Names, n)
