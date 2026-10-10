@@ -22,8 +22,10 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	mathrand "math/rand/v2"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -38,8 +40,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	postgresv1alpha1 "github.com/ruckc/pgop/api/v1alpha1"
@@ -61,6 +65,10 @@ type RoleReconciler struct {
 	// stale cache cannot cause a second rotation. Optional: when nil the
 	// cached Role is used.
 	APIReader client.Reader
+
+	// pendingBackoff spaces out retries of Roles whose databaseSettings wait
+	// for a database.
+	pendingBackoff requeueBackoff
 }
 
 // +kubebuilder:rbac:groups=pgop.ruck.io,resources=roles,verbs=get;list;watch;create;update;patch;delete
@@ -68,6 +76,7 @@ type RoleReconciler struct {
 // +kubebuilder:rbac:groups=pgop.ruck.io,resources=roles/finalizers,verbs=update
 // +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
+// +kubebuilder:rbac:groups=pgop.ruck.io,resources=databases,verbs=get;list;watch
 
 func (r *RoleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
@@ -113,14 +122,14 @@ func (r *RoleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// older one is reconciled.
 	pgName := role.PostgresName()
 	if err := r.checkRoleName(ctx, role, pgName); err != nil {
-		return r.updateStatus(ctx, role, false, "", err)
+		return r.updateStatus(ctx, role, "", err)
 	}
 
 	// Get the referenced cluster
 	cluster, err := r.getCluster(ctx, role)
 	if err != nil {
 		log.Error(err, "Failed to get Cluster")
-		return r.updateStatus(ctx, role, false, "", err)
+		return r.updateStatus(ctx, role, "", err)
 	}
 	policy := cluster.Spec.RolePolicy
 
@@ -134,7 +143,7 @@ func (r *RoleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	pgClient, err := newOperatorClient(ctx, r.Client, cluster, defaultDatabaseName)
 	if err != nil {
 		log.Error(err, "Failed to create PostgreSQL client")
-		return r.updateStatus(ctx, role, false, "", err)
+		return r.updateStatus(ctx, role, "", err)
 	}
 	defer func() { _ = pgClient.Close() }()
 
@@ -153,7 +162,7 @@ func (r *RoleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	signer, marker, createOnly, err := r.roleOwnership(ctx, pgClient, cluster, role, pgName, policy)
 	if err != nil {
 		log.Info("Not reconciling the role", "reason", err.Error())
-		return r.updateStatus(ctx, role, false, "", err)
+		return r.updateStatus(ctx, role, "", err)
 	}
 
 	// Resolve the password. NOLOGIN (group) roles get no password and no
@@ -164,11 +173,11 @@ func (r *RoleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	if role.Spec.IsLogin() {
 		if existingSecret, err = r.getCredentialsSecret(ctx, role, cluster); err != nil {
 			log.Error(err, "Failed to get credentials secret")
-			return r.updateStatus(ctx, role, false, "", err)
+			return r.updateStatus(ctx, role, "", err)
 		}
 		if dp, existingSecret, err = r.resolvePassword(ctx, role, existingSecret, now); err != nil {
 			log.Error(err, "Failed to resolve role password")
-			return r.updateStatus(ctx, role, false, "", err)
+			return r.updateStatus(ctx, role, "", err)
 		}
 	}
 
@@ -188,8 +197,10 @@ func (r *RoleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 
 	if err := createOrAlterRole(ctx, pgClient, pgName, opts); err != nil {
 		log.Error(err, "Failed to create/update role")
-		return r.updateStatus(ctx, role, false, role.Status.SecretName, err)
+		return r.updateStatus(ctx, role, role.Status.SecretName, err)
 	}
+	// The settings ledger only counts for the role it was written for.
+	clearStaleRoleSettings(role, pgName, string(cluster.UID))
 	// Record the PostgreSQL name that now exists so deletion drops exactly it.
 	role.Status.RoleName = pgName
 	role.Status.ClusterUID = string(cluster.UID)
@@ -202,7 +213,7 @@ func (r *RoleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	if role.Spec.IsLogin() {
 		if secretName, err = r.reconcileCredentialsSecret(ctx, role, cluster, existingSecret, dp.value, !opts.KeepExistingPassword); err != nil {
 			log.Error(err, "Failed to reconcile credentials secret")
-			return r.updateStatus(ctx, role, false, role.Status.SecretName, err)
+			return r.updateStatus(ctx, role, role.Status.SecretName, err)
 		}
 		recordPassword(role, dp, now)
 		if dp.rotated {
@@ -217,22 +228,106 @@ func (r *RoleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		role.Status.PasswordRotatedAt = nil
 	}
 
-	// Handle role memberships and parameter privileges. They are reconciled
-	// even when the role's attributes violate the policy, so forbidden
-	// memberships pgop granted earlier are revoked.
-	if err := errors.Join(policyErr, r.reconcileRoleGrants(ctx, pgClient, role, cluster, pgName, policy, signer)); err != nil {
+	// Handle role memberships, parameter privileges and settings.
+	pendingSettings, err := r.reconcileGrantsAndSettings(ctx, pgClient, role, cluster, pgName, policy, signer, policyErr)
+	if err != nil {
 		log.Error(err, "Failed to reconcile role")
-		return r.updateStatus(ctx, role, false, secretName, err)
+		return r.updateStatus(ctx, role, secretName, err)
 	}
 
 	log.Info("Role reconciled successfully")
-	result, err := r.updateStatus(ctx, role, true, secretName, nil)
-	if err == nil {
-		if next := nextRotationIn(role, time.Now()); next > 0 {
-			result.RequeueAfter = next
-		}
+	return r.readyResult(ctx, role, secretName, pendingSettings)
+}
+
+// reconcileGrantsAndSettings reconciles the role's memberships, parameter
+// privileges and settings, and joins their errors with policyErr (the
+// role's attributes violate the Cluster's policy). Memberships and
+// parameter privileges are reconciled even under a policy violation, so
+// forbidden memberships pgop granted earlier are revoked; settings are only
+// applied to a role within the policy (a Role reporting RolePolicyViolation
+// gets none, and keeps its ledger). pending lists the databases
+// databaseSettings wait for.
+func (r *RoleReconciler) reconcileGrantsAndSettings(ctx context.Context, pgClient *postgres.Client, role *postgresv1alpha1.Role,
+	cluster *postgresv1alpha1.Cluster, pgName string, policy *postgresv1alpha1.RolePolicySpec, signer markerSigner,
+	policyErr error) (pending []string, err error) {
+	var settingsErr error
+	if policyErr == nil {
+		pending, settingsErr = reconcileRoleSettings(ctx, pgClient, role, pgName, policy)
 	}
-	return result, err
+	return pending, errors.Join(policyErr, r.reconcileRoleGrants(ctx, pgClient, role, cluster, pgName, policy, signer), settingsErr)
+}
+
+// readyResult records a ready Role and schedules the next reconcile: the
+// next password rotation, or sooner while databaseSettings wait for the
+// databases in pendingSettings.
+func (r *RoleReconciler) readyResult(ctx context.Context, role *postgresv1alpha1.Role, secretName string,
+	pendingSettings []string) (ctrl.Result, error) {
+	note := ""
+	if len(pendingSettings) > 0 {
+		note = "databaseSettings are pending until these databases exist: " + strings.Join(pendingSettings, ", ")
+	}
+	result, err := r.writeStatus(ctx, role, true, secretName, nil, note)
+	if err != nil {
+		return result, err
+	}
+	if next := nextRotationIn(role, time.Now()); next > 0 {
+		result.RequeueAfter = next
+	}
+	if len(pendingSettings) == 0 {
+		r.pendingBackoff.reset(role.UID)
+		return result, nil
+	}
+	if wait := r.pendingBackoff.next(role.UID); result.RequeueAfter == 0 || result.RequeueAfter > wait {
+		result.RequeueAfter = wait
+	}
+	return result, nil
+}
+
+// Retry interval of a Role whose databaseSettings name a missing database:
+// it starts at pendingSettingsMinRequeue and doubles up to
+// pendingSettingsMaxRequeue (with jitter), because each retry reconnects and
+// re-applies the whole Role. A Database event for one of the databases
+// resets it and wakes the Role up immediately.
+const (
+	pendingSettingsMinRequeue = 30 * time.Second
+	pendingSettingsMaxRequeue = 5 * time.Minute
+)
+
+// requeueBackoff tracks, per Role, how many reconciles in a row ended with
+// pending databaseSettings. The zero value is ready to use.
+type requeueBackoff struct {
+	mu       sync.Mutex
+	attempts map[types.UID]int
+}
+
+// next returns the delay before the next retry for uid and counts the
+// attempt: min * 2^attempts, capped at max, plus up to 20% jitter.
+func (b *requeueBackoff) next(uid types.UID) time.Duration {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.attempts == nil {
+		b.attempts = map[types.UID]int{}
+	}
+	n := b.attempts[uid]
+	b.attempts[uid] = n + 1
+	return backoffDelay(n, mathrand.Float64())
+}
+
+// reset forgets the attempts of uid.
+func (b *requeueBackoff) reset(uid types.UID) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	delete(b.attempts, uid)
+}
+
+// backoffDelay returns pendingSettingsMinRequeue * 2^attempt capped at
+// pendingSettingsMaxRequeue, plus jitter (0 <= jitter < 1) times 20% of it.
+func backoffDelay(attempt int, jitter float64) time.Duration {
+	d := pendingSettingsMaxRequeue
+	if attempt < 16 {
+		d = min(pendingSettingsMinRequeue<<attempt, pendingSettingsMaxRequeue)
+	}
+	return d + time.Duration(jitter*0.2*float64(d))
 }
 
 // dropPostgresRole drops the Role's PostgreSQL role during deletion. Privileges
@@ -729,7 +824,16 @@ func (r *RoleReconciler) getCluster(ctx context.Context, role *postgresv1alpha1.
 	return cluster, nil
 }
 
-func (r *RoleReconciler) updateStatus(ctx context.Context, role *postgresv1alpha1.Role, ready bool, secretName string, reconcileErr error) (ctrl.Result, error) {
+// updateStatus records a Role that is not ready (yet), with reconcileErr as
+// the reason when set.
+func (r *RoleReconciler) updateStatus(ctx context.Context, role *postgresv1alpha1.Role, secretName string, reconcileErr error) (ctrl.Result, error) {
+	return r.writeStatus(ctx, role, false, secretName, reconcileErr, "")
+}
+
+// writeStatus persists the Role's status and Available condition; note is
+// appended to the message of a ready Role's condition.
+func (r *RoleReconciler) writeStatus(ctx context.Context, role *postgresv1alpha1.Role, ready bool, secretName string,
+	reconcileErr error, note string) (ctrl.Result, error) {
 	role.Status.Ready = ready
 	role.Status.SecretName = secretName
 
@@ -743,6 +847,9 @@ func (r *RoleReconciler) updateStatus(ctx context.Context, role *postgresv1alpha
 		condition.Status = metav1.ConditionTrue
 		condition.Reason = "RoleReady"
 		condition.Message = "Role has been created in PostgreSQL"
+		if note != "" {
+			condition.Message += "; " + note
+		}
 	} else if reconcileErr != nil {
 		condition.Status = metav1.ConditionFalse
 		condition.Reason = ReasonReconcileError
@@ -778,6 +885,9 @@ func (r *RoleReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&postgresv1alpha1.Cluster{},
 			handler.EnqueueRequestsFromMapFunc(r.rolesForCluster),
 			builder.WithPredicates(clusterConnectionOrPolicyChanged)).
+		Watches(&postgresv1alpha1.Database{},
+			handler.EnqueueRequestsFromMapFunc(r.rolesForDatabase),
+			builder.WithPredicates(databaseAppeared)).
 		Named("role").
 		Complete(r)
 }
@@ -795,6 +905,51 @@ func (r *RoleReconciler) rolesForCluster(ctx context.Context, obj client.Object)
 	for i := range roles.Items {
 		if roles.Items[i].Spec.ClusterRef.Name == obj.GetName() {
 			requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&roles.Items[i])})
+		}
+	}
+	return requests
+}
+
+// databaseAppeared passes Database events that can make a database a Role's
+// databaseSettings name start (or stop) existing: creation, deletion and
+// changes of status.ready or status.databaseName.
+var databaseAppeared = predicate.Funcs{
+	UpdateFunc: func(e event.UpdateEvent) bool {
+		oldDB, okOld := e.ObjectOld.(*postgresv1alpha1.Database)
+		newDB, okNew := e.ObjectNew.(*postgresv1alpha1.Database)
+		if !okOld || !okNew {
+			return false
+		}
+		return oldDB.Status.Ready != newDB.Status.Ready || oldDB.Status.DatabaseName != newDB.Status.DatabaseName
+	},
+	GenericFunc: func(event.GenericEvent) bool { return false },
+}
+
+// rolesForDatabase maps a Database to the Roles of its Cluster whose
+// databaseSettings name its PostgreSQL database, so settings pending on a
+// missing database are applied once it is created.
+func (r *RoleReconciler) rolesForDatabase(ctx context.Context, obj client.Object) []reconcile.Request {
+	db, ok := obj.(*postgresv1alpha1.Database)
+	if !ok {
+		return nil
+	}
+	roles := &postgresv1alpha1.RoleList{}
+	if err := r.List(ctx, roles, client.InNamespace(db.Namespace)); err != nil {
+		logf.FromContext(ctx).Error(err, "Failed to list Roles for Database", "database", db.Name)
+		return nil
+	}
+	pgName := db.PostgresName()
+	var requests []reconcile.Request
+	for i := range roles.Items {
+		role := &roles.Items[i]
+		if role.Spec.ClusterRef.Name != db.Spec.ClusterRef.Name {
+			continue
+		}
+		if slices.ContainsFunc(role.Spec.DatabaseSettings, func(s postgresv1alpha1.RoleDatabaseSettings) bool {
+			return s.Database == pgName
+		}) {
+			r.pendingBackoff.reset(role.UID)
+			requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(role)})
 		}
 	}
 	return requests

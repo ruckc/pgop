@@ -211,6 +211,12 @@ func TestParameterNames(t *testing.T) {
 		if _, err := buildAlterDatabaseResetQuery("d", in); err == nil {
 			t.Errorf("reset %q: expected error", in)
 		}
+		if _, err := buildAlterRoleSetQuery("r", "", in, "1"); err == nil {
+			t.Errorf("role set %q: expected error", in)
+		}
+		if _, err := buildAlterRoleResetQuery("r", "d", in); err == nil {
+			t.Errorf("role reset %q: expected error", in)
+		}
 		if _, err := buildGrantParameterQuery(in, "r", []string{PrivilegeSet}, false); err == nil {
 			t.Errorf("grant on %q: expected error", in)
 		}
@@ -291,6 +297,67 @@ func TestBuildAlterDatabaseSetQuery(t *testing.T) {
 	}
 	if want := `ALTER DATABASE "d""b" RESET "work_mem"`; got != want {
 		t.Errorf("reset: got %q, want %q", got, want)
+	}
+}
+
+// Names used by the ALTER ROLE builder tests.
+const (
+	testWorkMem     = "work_mem"
+	testOneMB       = "1MB"
+	testTenantParam = "myapp.tenant"
+)
+
+func TestBuildAlterRoleQueries(t *testing.T) {
+	tests := []struct {
+		role, database, param, value, want string
+	}{
+		{testMember, "", "statement_timeout", "30s", `ALTER ROLE "app" SET "statement_timeout" TO '30s'`},
+		{testMember, "app_db", "Work_Mem", "64MB", `ALTER ROLE "app" IN DATABASE "app_db" SET "work_mem" TO '64MB'`},
+		{testMember, "", paramSearchPath, `"$user", App`, `ALTER ROLE "app" SET "search_path" TO '$user', 'app'`},
+		{testMember, "", testTenantParam, "x'; ALTER ROLE app SUPERUSER; --",
+			`ALTER ROLE "app" SET "myapp"."tenant" TO 'x''; ALTER ROLE app SUPERUSER; --'`},
+		{testMember, "", "myapp.path", `C:\temp`, `ALTER ROLE "app" SET "myapp"."path" TO E'C:\\temp'`},
+		// Identifiers are always quoted: a role named all or public is that
+		// role, never the ALL / PUBLIC keyword.
+		{"all", "", testWorkMem, testOneMB, `ALTER ROLE "all" SET "work_mem" TO '1MB'`},
+		{`a" SUPERUSER; --`, `d"; DROP DATABASE x; --`, testWorkMem, testOneMB,
+			`ALTER ROLE "a"" SUPERUSER; --" IN DATABASE "d""; DROP DATABASE x; --" SET "work_mem" TO '1MB'`},
+		{"", "", testWorkMem, testOneMB, ""},
+		{testMember, "", paramSearchPath, "", ""},
+		{testMember, "", paramSearchPath, `x'); DROP ROLE app; --`, ""},
+	}
+	for _, tt := range tests {
+		got, err := buildAlterRoleSetQuery(tt.role, tt.database, tt.param, tt.value)
+		if tt.want == "" {
+			if err == nil {
+				t.Errorf("%s/%s %s=%q: expected error, got %q", tt.role, tt.database, tt.param, tt.value, got)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("%s/%s %s=%q: %v", tt.role, tt.database, tt.param, tt.value, err)
+			continue
+		}
+		if got != tt.want {
+			t.Errorf("%s/%s %s=%q: got %q, want %q", tt.role, tt.database, tt.param, tt.value, got, tt.want)
+		}
+	}
+
+	resets := []struct{ role, database, param, want string }{
+		{testMember, "", "Work_Mem", `ALTER ROLE "app" RESET "work_mem"`},
+		{testMember, `d"b`, testTenantParam, `ALTER ROLE "app" IN DATABASE "d""b" RESET "myapp"."tenant"`},
+	}
+	for _, tt := range resets {
+		got, err := buildAlterRoleResetQuery(tt.role, tt.database, tt.param)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != tt.want {
+			t.Errorf("reset: got %q, want %q", got, tt.want)
+		}
+	}
+	if _, err := buildAlterRoleResetQuery("", "", testWorkMem); err == nil {
+		t.Error("reset with an empty role name: expected error")
 	}
 }
 

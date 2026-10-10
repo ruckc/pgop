@@ -381,7 +381,9 @@ func formatSettingValue(parameter, value string) (string, error) {
 	return strings.Join(lits, ", "), nil
 }
 
-func buildAlterDatabaseSetQuery(database, parameter, value string) (string, error) {
+// buildSetClause renders "SET <name> TO <value>" for parameter, with the
+// name quoted part by part and the value formatted by formatSettingValue.
+func buildSetClause(parameter, value string) (string, error) {
 	name, err := quoteParameterName(parameter)
 	if err != nil {
 		return "", err
@@ -391,15 +393,104 @@ func buildAlterDatabaseSetQuery(database, parameter, value string) (string, erro
 	if err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("ALTER DATABASE %s SET %s TO %s", quoteIdent(database), name, v), nil
+	return fmt.Sprintf("SET %s TO %s", name, v), nil
 }
 
-func buildAlterDatabaseResetQuery(database, parameter string) (string, error) {
+// buildResetClause renders "RESET <name>" for parameter.
+func buildResetClause(parameter string) (string, error) {
 	name, err := quoteParameterName(parameter)
 	if err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("ALTER DATABASE %s RESET %s", quoteIdent(database), name), nil
+	return "RESET " + name, nil
+}
+
+func buildAlterDatabaseSetQuery(database, parameter, value string) (string, error) {
+	clause, err := buildSetClause(parameter, value)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("ALTER DATABASE %s %s", quoteIdent(database), clause), nil
+}
+
+func buildAlterDatabaseResetQuery(database, parameter string) (string, error) {
+	clause, err := buildResetClause(parameter)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("ALTER DATABASE %s %s", quoteIdent(database), clause), nil
+}
+
+// alterRoleTarget renders "ALTER ROLE <role> [IN DATABASE <database>]". The
+// role is always a quoted identifier, never the keyword ALL, so the statement
+// cannot change the defaults of every role.
+func alterRoleTarget(role, database string) (string, error) {
+	if role == "" {
+		return "", errors.New("role name must not be empty")
+	}
+	target := "ALTER ROLE " + quoteIdent(role)
+	if database != "" {
+		target += " IN DATABASE " + quoteIdent(database)
+	}
+	return target, nil
+}
+
+func buildAlterRoleSetQuery(role, database, parameter, value string) (string, error) {
+	target, err := alterRoleTarget(role, database)
+	if err != nil {
+		return "", err
+	}
+	clause, err := buildSetClause(parameter, value)
+	if err != nil {
+		return "", err
+	}
+	return target + " " + clause, nil
+}
+
+func buildAlterRoleResetQuery(role, database, parameter string) (string, error) {
+	target, err := alterRoleTarget(role, database)
+	if err != nil {
+		return "", err
+	}
+	clause, err := buildResetClause(parameter)
+	if err != nil {
+		return "", err
+	}
+	return target + " " + clause, nil
+}
+
+// SetRoleParameter sets a per-role default for a configuration parameter
+// (ALTER ROLE ... SET), or with a non-empty database a per-role default in
+// that database (ALTER ROLE ... IN DATABASE ... SET).
+func (c *Client) SetRoleParameter(ctx context.Context, role, database, parameter, value string) error {
+	query, err := buildAlterRoleSetQuery(role, database, parameter, value)
+	if err != nil {
+		return err
+	}
+	if _, err := c.db.ExecContext(ctx, query); err != nil {
+		return fmt.Errorf("failed to set %s for role %q%s: %w", parameter, role, inDatabase(database), err)
+	}
+	return nil
+}
+
+// ResetRoleParameter removes a per-role default (ALTER ROLE ... [IN DATABASE
+// ...] RESET).
+func (c *Client) ResetRoleParameter(ctx context.Context, role, database, parameter string) error {
+	query, err := buildAlterRoleResetQuery(role, database, parameter)
+	if err != nil {
+		return err
+	}
+	if _, err := c.db.ExecContext(ctx, query); err != nil {
+		return fmt.Errorf("failed to reset %s for role %q%s: %w", parameter, role, inDatabase(database), err)
+	}
+	return nil
+}
+
+func inDatabase(database string) string {
+	if database == "" {
+		return ""
+	}
+	return fmt.Sprintf(" in database %q", database)
 }
 
 // SetDatabaseParameter sets a per-database default for a configuration

@@ -288,10 +288,10 @@ var _ = Describe("Privilege grants", func() {
 				Settings: map[string]string{testWorkMem: grantTestValue, "MyApp.Tenant": grantTestTenant},
 			}}
 			db.Status.ManagedSettings = []string{"statement_timeout", testWorkMem}
-			Expect(reconcileDatabaseSettings(ctx, f, db, "app_db")).To(Succeed())
+			Expect(reconcileDatabaseSettings(ctx, f, db, "app_db", testSettingPolicy)).To(Succeed())
 			Expect(f.calls).To(Equal([]string{
 				"set myapp.tenant on app_db to acme",
-				"set work_mem on app_db to 64MB",
+				setWorkMemAppDB,
 				"reset statement_timeout on app_db",
 			}))
 			Expect(db.Status.ManagedSettings).To(Equal([]string{grantTestParam, testWorkMem}))
@@ -301,7 +301,7 @@ var _ = Describe("Privilege grants", func() {
 			f := &fakeGrantClient{failOn: "reset"}
 			db := &postgresv1alpha1.Database{}
 			db.Status.ManagedSettings = []string{testWorkMem}
-			Expect(reconcileDatabaseSettings(ctx, f, db, "app_db")).NotTo(Succeed())
+			Expect(reconcileDatabaseSettings(ctx, f, db, "app_db", testSettingPolicy)).NotTo(Succeed())
 			Expect(db.Status.ManagedSettings).To(Equal([]string{testWorkMem}))
 		})
 
@@ -310,9 +310,9 @@ var _ = Describe("Privilege grants", func() {
 			db := &postgresv1alpha1.Database{Spec: postgresv1alpha1.DatabaseSpec{
 				Settings: map[string]string{"work_mem; DROP DATABASE x": "1"},
 			}}
-			Expect(reconcileDatabaseSettings(ctx, f, db, "app_db")).To(MatchError(ContainSubstring("invalid parameter name")))
+			Expect(reconcileDatabaseSettings(ctx, f, db, "app_db", testSettingPolicy)).To(MatchError(ContainSubstring("invalid parameter name")))
 			db.Spec.Settings = map[string]string{grantTestMixedCase: "1", testWorkMem: "2"}
-			Expect(reconcileDatabaseSettings(ctx, f, db, "app_db")).To(MatchError(ContainSubstring("more than once")))
+			Expect(reconcileDatabaseSettings(ctx, f, db, "app_db", testSettingPolicy)).To(MatchError(ContainSubstring("more than once")))
 			Expect(f.calls).To(BeEmpty())
 		})
 
@@ -327,7 +327,7 @@ var _ = Describe("Privilege grants", func() {
 			}}}
 			// A setting applied before it became disallowed is reset.
 			db.Status.ManagedSettings = []string{grantTestReplicationRole}
-			err := reconcileDatabaseSettings(ctx, f, db, "app_db")
+			err := reconcileDatabaseSettings(ctx, f, db, "app_db", testSettingPolicy)
 			ce, ok := errors.AsType[*conditionError](err)
 			Expect(ok).To(BeTrue(), "expected a conditionError, got %v", err)
 			Expect(ce.reason).To(Equal(ReasonSettingNotAllowed))
@@ -336,7 +336,7 @@ var _ = Describe("Privilege grants", func() {
 			}
 			Expect(f.calls).To(Equal([]string{
 				"set myapp.tenant on app_db to acme",
-				"set work_mem on app_db to 64MB",
+				setWorkMemAppDB,
 				"reset session_replication_role on app_db",
 			}))
 			Expect(db.Status.ManagedSettings).To(Equal([]string{grantTestParam, testWorkMem}))

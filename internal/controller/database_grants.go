@@ -20,8 +20,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"maps"
-	"slices"
 	"strings"
 
 	postgresv1alpha1 "github.com/ruckc/pgop/api/v1alpha1"
@@ -123,52 +121,15 @@ func reconcileDatabaseGrants(ctx context.Context, pg databaseGrantClient, databa
 	return errors.Join(err, pausedErr)
 }
 
-// desiredDatabaseSettings returns spec.settings keyed by normalized
-// (lowercase) parameter name.
-func desiredDatabaseSettings(settings map[string]string) (map[string]string, error) {
-	out := make(map[string]string, len(settings))
-	for _, k := range slices.Sorted(maps.Keys(settings)) {
-		name, err := postgres.NormalizeParameterName(k)
-		if err != nil {
-			return nil, fmt.Errorf("settings: %w", err)
-		}
-		if _, dup := out[name]; dup {
-			return nil, fmt.Errorf("settings: parameter %q is listed more than once (names are case-insensitive)", name)
-		}
-		out[name] = settings[k]
-	}
-	return out, nil
-}
-
-// settingAllowed reports why pgop refuses to set parameter name per database,
-// or "" when it may. Parameters on the static denylist are refused, and so is
-// every parameter the server knows with a context other than "user" (only
-// superusers may set superuser-context parameters, and postmaster, sighup,
-// internal and backend parameters cannot be set per database at all): pgop
-// runs ALTER DATABASE as a superuser, so without this check a Database author
-// could set superuser-only parameters for every session. Unknown parameters
-// are custom placeholders (or typos, which PostgreSQL then rejects).
-func settingAllowed(ctx context.Context, pg databaseGrantClient, name string) (string, error) {
-	if postgres.DeniedParameter(name) {
-		return "is on pgop's denylist", nil
-	}
-	pgContext, found, err := pg.ParameterContext(ctx, name)
-	if err != nil {
-		return "", err
-	}
-	if found && pgContext != pgContextUser {
-		return fmt.Sprintf("has context %q (only %q parameters may be set per database)", pgContext, pgContextUser), nil
-	}
-	return "", nil
-}
-
 // reconcileDatabaseSettings applies spec.settings with ALTER DATABASE ... SET,
 // resets the settings pgop applied that were removed from the spec (or are no
 // longer allowed), and records the settings pgop manages in
-// database.Status.ManagedSettings. Settings that are not allowed are skipped
-// and reported with reason SettingNotAllowed after the others are applied.
-func reconcileDatabaseSettings(ctx context.Context, pg databaseGrantClient, database *postgresv1alpha1.Database, pgName string) error {
-	desired, err := desiredDatabaseSettings(database.Spec.Settings)
+// database.Status.ManagedSettings. Settings that are not allowed (see
+// settingAllowed) are skipped and reported with reason SettingNotAllowed
+// after the others are applied.
+func reconcileDatabaseSettings(ctx context.Context, pg databaseGrantClient, database *postgresv1alpha1.Database, pgName string,
+	policy *postgresv1alpha1.RolePolicySpec) error {
+	desired, err := normalizeSettings("settings", database.Spec.Settings)
 	if err != nil {
 		return err
 	}
@@ -176,44 +137,18 @@ func reconcileDatabaseSettings(ctx context.Context, pg databaseGrantClient, data
 	if len(desired) == 0 && len(managed) == 0 {
 		return nil
 	}
-
-	var refused []string
-	for _, name := range slices.Sorted(maps.Keys(desired)) {
-		reason, err := settingAllowed(ctx, pg, name)
-		if err != nil {
-			return err
-		}
-		if reason != "" {
-			refused = append(refused, name+" "+reason)
-			delete(desired, name)
-		}
+	after, refused, err := applySettings(ctx, pg, policy, desired, managed, settingOps{
+		set: func(ctx context.Context, name, value string) error {
+			return pg.SetDatabaseParameter(ctx, pgName, name, value)
+		},
+		reset: func(ctx context.Context, name string) error {
+			return pg.ResetDatabaseParameter(ctx, pgName, name)
+		},
+	})
+	database.Status.ManagedSettings = after
+	if err != nil {
+		return err
 	}
-
-	tracked := make(map[string]bool, len(managed)+len(desired))
-	for _, m := range managed {
-		tracked[m] = true
-	}
-	record := func() { database.Status.ManagedSettings = sortedKeys(tracked) }
-
-	// Settings are re-applied every time, which also repairs drift.
-	for _, name := range slices.Sorted(maps.Keys(desired)) {
-		if err := pg.SetDatabaseParameter(ctx, pgName, name, desired[name]); err != nil {
-			record()
-			return err
-		}
-		tracked[name] = true
-	}
-	for _, name := range managed {
-		if _, ok := desired[name]; ok {
-			continue
-		}
-		if err := pg.ResetDatabaseParameter(ctx, pgName, name); err != nil {
-			record()
-			return err
-		}
-		delete(tracked, name)
-	}
-	record()
 	if len(refused) > 0 {
 		return &conditionError{reason: ReasonSettingNotAllowed,
 			err: fmt.Errorf("settings not allowed: %s", strings.Join(refused, "; "))}

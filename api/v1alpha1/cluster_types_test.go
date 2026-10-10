@@ -98,6 +98,48 @@ func TestGrantablePredefinedRolesMatchCRD(t *testing.T) {
 	}
 }
 
+// TestDeniedSettingPrefixesMatchCRD checks that the CEL rule on
+// spec.rolePolicy.allowedSettingPrefixes lists exactly DeniedSettingPrefixes.
+func TestDeniedSettingPrefixesMatchCRD(t *testing.T) {
+	raw, err := os.ReadFile("../../config/crd/bases/pgop.ruck.io_clusters.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	crd := &apiextensionsv1.CustomResourceDefinition{}
+	if err := yaml.Unmarshal(raw, crd); err != nil {
+		t.Fatal(err)
+	}
+	field := crd.Spec.Versions[0].Schema.OpenAPIV3Schema.Properties["spec"].Properties["rolePolicy"].Properties["allowedSettingPrefixes"]
+	if len(field.XValidations) != 1 {
+		t.Fatalf("allowedSettingPrefixes: want one CEL rule, got %d", len(field.XValidations))
+	}
+	rule := field.XValidations[0].Rule
+	start, end := strings.Index(rule, "["), strings.Index(rule, "]")
+	if start < 0 || end < start {
+		t.Fatalf("no list in rule %q", rule)
+	}
+	var inRule []string
+	for item := range strings.SplitSeq(rule[start+1:end], ",") {
+		inRule = append(inRule, strings.Trim(strings.TrimSpace(item), "'"))
+	}
+	slices.Sort(inRule)
+	want := slices.Sorted(slices.Values(DeniedSettingPrefixes))
+	if !slices.Equal(inRule, want) {
+		t.Errorf("CEL rule lists %v, DeniedSettingPrefixes is %v", inRule, want)
+	}
+}
+
+func TestAllowsSettingPrefix(t *testing.T) {
+	var none *RolePolicySpec
+	if none.AllowsSettingPrefix("myapp") {
+		t.Error("a nil policy must allow nothing")
+	}
+	p := &RolePolicySpec{AllowedSettingPrefixes: []string{"myapp", "plperl"}}
+	if !p.AllowsSettingPrefix("myapp") || p.AllowsSettingPrefix("other") || p.AllowsSettingPrefix("plperl") {
+		t.Error("allowedSettingPrefixes not honored, or a denied prefix allowed")
+	}
+}
+
 func TestRolePolicyAllows(t *testing.T) {
 	var none *RolePolicySpec
 	if none.AllowsAttribute(RoleAttributeCreateRole) || none.AllowsPredefinedRole("pg_monitor") || none.AllowsExtension("x") {

@@ -30,3 +30,5 @@ spec:
   #   allowedAttributes: [bypassRLS]
   #   allowedPredefinedRoles: [pg_monitor]
   #   allowedExtensions: [postgis]
+  #   # Custom setting namespaces Database/Role settings may set (myapp.*).
+  #   allowedSettingPrefixes: [myapp]
