@@ -591,28 +591,6 @@ var _ = Describe("Privilege grants", func() {
 				To(Equal([]pg{{Target: parameterTarget(testWorkMem, grantTestRole), Privileges: set, GrantOptions: set}}))
 		})
 
-		It("merges ledgers entry by entry, never dropping one", func() {
-			ours := postgresv1alpha1.DatabaseStatus{
-				ManagedGrants:           []postgresv1alpha1.ManagedDatabaseGrant{{Role: grantTestRole, Privileges: connect}},
-				RevokedPublicPrivileges: []postgresv1alpha1.PublicPrivilege{postgresv1alpha1.PublicPrivilegeTemporary},
-			}
-			theirs := postgresv1alpha1.DatabaseStatus{
-				ManagedGrants: []postgresv1alpha1.ManagedDatabaseGrant{
-					{Role: grantTestRole, Privileges: []string{postgres.PrivilegeCreate}, WithGrantOption: true},
-					{Role: grantTestOther, Privileges: connect},
-				},
-				ManagedSchemaGrants:     []postgresv1alpha1.ManagedSchemaGrant{{Schema: grantTestRole, Role: grantTestRole, Privileges: usage}},
-				RevokedPublicPrivileges: []postgresv1alpha1.PublicPrivilege{postgresv1alpha1.PublicPrivilegeConnect},
-			}
-			mergeDatabaseLedgers(&ours, &theirs)
-			Expect(ours.ManagedGrants).To(Equal([]postgresv1alpha1.ManagedDatabaseGrant{
-				{Role: grantTestRole, Privileges: []string{postgres.PrivilegeConnect, postgres.PrivilegeCreate}, GrantOptions: []string{postgres.PrivilegeCreate}},
-				{Role: grantTestOther, Privileges: connect},
-			}))
-			Expect(ours.ManagedSchemaGrants).To(HaveLen(1))
-			Expect(ours.RevokedPublicPrivileges).To(Equal([]postgresv1alpha1.PublicPrivilege{
-				postgresv1alpha1.PublicPrivilegeConnect, postgresv1alpha1.PublicPrivilegeTemporary}))
-		})
 	})
 
 	Describe("grantee policy", func() {
@@ -1376,7 +1354,7 @@ var _ = Describe("Grant and settings CRD validation", func() {
 		Entry("pgaudit", grantTestAuditParam),
 	)
 
-	It("merges the grant ledgers when a status write conflicts", func() {
+	It("refuses a status write from a stale copy instead of overwriting the newer status", func() {
 		db := newDatabase(postgresv1alpha1.DatabaseSpec{})
 		Expect(k8sClient.Create(ctx, db)).To(Succeed())
 		defer func() { _ = k8sClient.Delete(ctx, db) }()
@@ -1386,17 +1364,13 @@ var _ = Describe("Grant and settings CRD validation", func() {
 		db.Status.ManagedGrants = []postgresv1alpha1.ManagedDatabaseGrant{{Role: grantTestRole, Privileges: []string{postgres.PrivilegeConnect}}}
 		Expect(k8sClient.Status().Update(ctx, db)).To(Succeed())
 
-		By("writing another ledger entry through a stale copy")
-		stale.Status.ManagedSchemaGrants = []postgresv1alpha1.ManagedSchemaGrant{
-			{Schema: grantTestRole, Role: grantTestOther, Privileges: []string{postgres.PrivilegeUsage}},
-		}
+		By("writing through a stale copy")
 		r := &DatabaseReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
-		Expect(r.saveStatus(ctx, stale)).To(Succeed())
+		Expect(apierrors.IsConflict(r.saveStatus(ctx, stale))).To(BeTrue())
 
 		got := &postgresv1alpha1.Database{}
 		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(db), got)).To(Succeed())
-		Expect(got.Status.ManagedGrants).To(HaveLen(1), "the entry recorded through the other copy is kept")
-		Expect(got.Status.ManagedSchemaGrants).To(HaveLen(1))
+		Expect(got.Status.ManagedGrants).To(HaveLen(1), "the newer ledger is kept")
 	})
 
 	It("accepts PUBLIC grantees and publicPrivileges", func() {

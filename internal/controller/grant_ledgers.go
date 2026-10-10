@@ -18,18 +18,12 @@ package controller
 
 import (
 	"context"
-	"maps"
-	"slices"
-
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/client-go/util/retry"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	postgresv1alpha1 "github.com/ruckc/pgop/api/v1alpha1"
 )
 
 // This file converts the grant ledgers between their status form and the
-// engine's, and writes statuses without ever dropping a ledger entry.
+// engine's, and writes the statuses that hold them.
 
 // statusSaver durably writes the resource's current status, ledgers
 // included. The grant reconcilers call it with the intended additions before
@@ -107,96 +101,18 @@ func parameterLedgerStatus(ledger []privilegeGrant) []postgresv1alpha1.ManagedPa
 	return out
 }
 
-// mergeLedgers returns the union of two ledgers, entry by entry.
-func mergeLedgers(a, b []privilegeGrant) []privilegeGrant {
-	m := make(map[string]privilegeGrant, len(a)+len(b))
-	for _, g := range append(a, b...) {
-		m[g.key()] = mergeGrant(m[g.key()], g)
-	}
-	return sortedGrants(m)
-}
-
-// mergeDatabaseLedgers adds the ledger entries of theirs (a newer copy of the
-// status) to ours, so a status write never drops what another write recorded.
-// The settings ledger is merged too (a RESET of a setting that is not set
-// changes nothing).
-func mergeDatabaseLedgers(ours, theirs *postgresv1alpha1.DatabaseStatus) {
-	ours.ManagedGrants = databaseLedgerStatus(mergeLedgers(databaseLedger("", ours.ManagedGrants), databaseLedger("", theirs.ManagedGrants)))
-	ours.ManagedSchemaGrants = schemaLedgerStatus(mergeLedgers(schemaLedger(ours.ManagedSchemaGrants), schemaLedger(theirs.ManagedSchemaGrants)))
-	ours.ManagedSettings = unionStrings(ours.ManagedSettings, theirs.ManagedSettings)
-	revoked := map[postgresv1alpha1.PublicPrivilege]bool{}
-	for _, p := range append(ours.RevokedPublicPrivileges, theirs.RevokedPublicPrivileges...) {
-		revoked[p] = true
-	}
-	ours.RevokedPublicPrivileges = nil
-	for _, it := range publicPrivilegeItems {
-		if revoked[it.field] {
-			ours.RevokedPublicPrivileges = append(ours.RevokedPublicPrivileges, it.field)
-		}
-	}
-}
-
-// mergeRoleLedgers is mergeDatabaseLedgers for a Role (parameter grants,
-// memberships and settings).
-func mergeRoleLedgers(ours, theirs *postgresv1alpha1.RoleStatus) {
-	ours.ManagedParameterGrants = parameterLedgerStatus(mergeLedgers(parameterLedger("", ours.ManagedParameterGrants),
-		parameterLedger("", theirs.ManagedParameterGrants)))
-	ours.ManagedMemberships = unionStrings(ours.ManagedMemberships, theirs.ManagedMemberships)
-	ours.ManagedSettings = unionStrings(ours.ManagedSettings, theirs.ManagedSettings)
-	perDB := map[string][]string{}
-	for _, d := range append(slices.Clone(ours.ManagedDatabaseSettings), theirs.ManagedDatabaseSettings...) {
-		perDB[d.Database] = unionStrings(perDB[d.Database], d.Settings)
-	}
-	ours.ManagedDatabaseSettings = nil
-	for _, db := range slices.Sorted(maps.Keys(perDB)) {
-		ours.ManagedDatabaseSettings = append(ours.ManagedDatabaseSettings,
-			postgresv1alpha1.ManagedRoleDatabaseSettings{Database: db, Settings: perDB[db]})
-	}
-}
-
-// unionStrings returns the sorted union of two string sets, nil when empty.
-func unionStrings(a, b []string) []string {
-	set := map[string]bool{}
-	for _, s := range append(slices.Clone(a), b...) {
-		set[s] = true
-	}
-	return sortedKeys(set)
-}
-
-// updateStatusKeepingLedgers writes obj's status. On a conflict (the cached
-// object was stale, or the object changed meanwhile) it re-reads the object,
-// merges the newer copy's grant ledgers into obj's (merge) and retries, so an
-// entry pgop recorded is never lost to a status write.
-func updateStatusKeepingLedgers[T client.Object](ctx context.Context, c client.Client, reader client.Reader, obj T,
-	fresh func() T, merge func(ours, theirs T)) error {
-	if reader == nil {
-		reader = c
-	}
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		err := c.Status().Update(ctx, obj)
-		if !apierrors.IsConflict(err) {
-			return err
-		}
-		latest := fresh()
-		if getErr := reader.Get(ctx, client.ObjectKeyFromObject(obj), latest); getErr != nil {
-			return getErr
-		}
-		merge(obj, latest)
-		obj.SetResourceVersion(latest.GetResourceVersion())
-		return err
-	})
-}
-
-// saveStatus writes the Database's status without dropping ledger entries.
+// saveStatus writes the Database's status. A conflict (a stale cached copy,
+// or a concurrent change) is returned, not retried: the status computed from
+// a stale copy must not overwrite a newer one (it could drop the record of
+// what the Database created). The grant ledgers do not depend on a retry:
+// what pgop is about to add is recorded before it is granted (see
+// applyPrivilegeGrants), so a failed write only means nothing is granted
+// until the next reconcile.
 func (r *DatabaseReconciler) saveStatus(ctx context.Context, database *postgresv1alpha1.Database) error {
-	return updateStatusKeepingLedgers(ctx, r.Client, r.APIReader, database,
-		func() *postgresv1alpha1.Database { return &postgresv1alpha1.Database{} },
-		func(ours, theirs *postgresv1alpha1.Database) { mergeDatabaseLedgers(&ours.Status, &theirs.Status) })
+	return r.Status().Update(ctx, database)
 }
 
-// saveStatus writes the Role's status without dropping ledger entries.
+// saveStatus writes the Role's status (see DatabaseReconciler.saveStatus).
 func (r *RoleReconciler) saveStatus(ctx context.Context, role *postgresv1alpha1.Role) error {
-	return updateStatusKeepingLedgers(ctx, r.Client, r.APIReader, role,
-		func() *postgresv1alpha1.Role { return &postgresv1alpha1.Role{} },
-		func(ours, theirs *postgresv1alpha1.Role) { mergeRoleLedgers(&ours.Status, &theirs.Status) })
+	return r.Status().Update(ctx, role)
 }

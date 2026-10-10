@@ -52,10 +52,6 @@ const (
 type DatabaseReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
-	// APIReader re-reads a Database uncached when a status write conflicts,
-	// so its grant ledgers can be merged. Optional: when nil the cached
-	// client is used.
-	APIReader client.Reader
 }
 
 // statusSaver returns the saver the grant reconcilers record their intended

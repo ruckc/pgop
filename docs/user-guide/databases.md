@@ -324,10 +324,12 @@ The same rules hold for `grants`, `schemas[].grants` and Role
   revokes. When one privilege of a `REVOKE` has such dependents, the others
   are revoked one at a time, so only that privilege is skipped.
 - The ledger is an intent log: pgop writes what it is about to add to the
-  status **before** it runs the `GRANT`, and writes the status merging, never
-  dropping, ledger entries when the write conflicts. So a status update that
-  is lost after the `GRANT` (a conflict, an operator restart) cannot leave a
-  privilege pgop granted untracked. If recording fails, nothing is granted.
+  status **before** it runs the `GRANT`. So a status update that is lost
+  after the `GRANT` (a conflict, an operator restart) cannot leave a
+  privilege pgop granted untracked. If recording fails (for example because
+  the cached copy of the resource was stale), nothing is granted and the
+  next reconcile, from the current copy, tries again; a stale copy never
+  overwrites a newer status.
   An entry recorded for a `GRANT` that then failed is harmless: the privilege
   is granted again while declared, and revoking a privilege the grantee does
   not hold changes nothing.
