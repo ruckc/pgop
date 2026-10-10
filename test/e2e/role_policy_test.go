@@ -259,7 +259,9 @@ spec:
 
 			By("withdrawing pg_monitor: the tracked membership is revoked")
 			setPolicy(`{"allowedPredefinedRoles":[]}`)
-			expectReason(roleRes+"pol-mem", "MembershipNotAllowed", "pg_monitor", "revoked")
+			// The message names the revoked membership only on the reconcile that
+			// revokes it; afterwards it still reports the refused membership.
+			expectReason(roleRes+"pol-mem", "MembershipNotAllowed", "pg_monitor is a predefined role")
 			Eventually(func(g Gomega) {
 				g.Expect(membership(g, "pg_monitor")).To(Equal("0"))
 				g.Expect(jsonpath(g, roleRes+"pol-mem", "{.status.managedMemberships}")).To(BeEmpty())
