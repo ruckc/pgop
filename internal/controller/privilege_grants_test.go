@@ -40,6 +40,7 @@ const (
 	grantTestParam           = "myapp.tenant"
 	grantTestMixedCase       = "Work_Mem"
 	grantTestAdmin           = "admin"
+	grantTestSighupParam     = "archive_command"
 	grantTestSearchPath      = "search_path"
 	grantTestValue           = "64MB"
 	grantTestSuperuserParam  = "log_statement"
@@ -407,6 +408,34 @@ var _ = Describe("Privilege grants", func() {
 			}))
 			Expect(role.Status.ManagedParameterGrants).To(Equal([]postgresv1alpha1.ManagedParameterGrant{
 				{Parameter: testWorkMem, Privileges: []string{postgres.PrivilegeSet}},
+			}))
+		})
+
+		It("only grants user and superuser parameters and custom placeholders", func() {
+			f := &fakeGrantClient{version: 180001, contexts: map[string]string{
+				grantTestSuperuserParam: pgContextSuperuser, testWorkMem: pgContextUser, grantTestSighupParam: "sighup",
+				"log_connections": "superuser-backend", "shared_buffers": "postmaster",
+			}}
+			role := newRole([]postgresv1alpha1.ParameterGrantSpec{
+				{Parameter: "log_statement"}, {Parameter: testWorkMem}, {Parameter: grantTestSighupParam},
+				{Parameter: "log_connections"}, {Parameter: "shared_buffers"}, {Parameter: grantTestParam},
+				{Parameter: "lo_compat_privileges"},
+			}, postgresv1alpha1.ManagedParameterGrant{Parameter: grantTestSighupParam, Privileges: []string{postgres.PrivilegeSet}})
+			err := reconcileParameterGrants(ctx, f, role, grantTestRole)
+			ce, ok := errors.AsType[*conditionError](err)
+			Expect(ok).To(BeTrue(), "expected a conditionError, got %v", err)
+			Expect(ce.reason).To(Equal(ReasonParameterNotAllowed))
+			Expect(err.Error()).To(SatisfyAll(
+				ContainSubstring(grantTestSighupParam+` (context "sighup")`),
+				ContainSubstring(`log_connections (context "superuser-backend")`),
+				ContainSubstring(`shared_buffers (context "postmaster")`),
+				ContainSubstring("lo_compat_privileges"),
+			))
+			Expect(f.calls).To(Equal([]string{
+				"grant SET on parameter log_statement to app wgo=false",
+				"grant SET on parameter work_mem to app wgo=false",
+				"grant SET on parameter myapp.tenant to app wgo=false",
+				"revoke SET on parameter " + grantTestSighupParam + " from app optionOnly=false cascade=false",
 			}))
 		})
 

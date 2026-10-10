@@ -292,7 +292,7 @@ restricts what a Database author can set:
   the operator's included), `session_preload_libraries`,
   `local_preload_libraries`, `shared_preload_libraries`,
   `dynamic_library_path`, `jit_provider` (code loading),
-  `session_replication_role` (disables triggers and foreign keys), and the
+  `session_replication_role` (disables triggers and foreign keys), `lo_compat_privileges` (disables large-object permission checks), and the
   `pgaudit.*`, `set_user.*`, `anon.*` and `sepgsql.*` namespaces (security
   extensions, which may not be loaded yet when the setting is checked). The
   API server rejects these names directly.
@@ -302,19 +302,26 @@ restricts what a Database author can set:
   reset.
 
 !!! warning "Remaining risk"
-    User-context parameters still affect every session in the database,
-    including the operator's own connection used for extensions and schemas
-    (for example `default_transaction_read_only=on` makes `CREATE EXTENSION`
-    fail). Custom placeholder parameters are accepted without a context check;
+    User-context parameters still affect every other session in the
+    database (the operator's own sessions are pinned, see below). Custom
+    placeholder parameters are accepted without a context check;
     if an extension that defines them is loaded later, their value applies
     with that extension's rules. Restrict who may create or edit Database
     resources accordingly.
 
-The operator's own sessions always use `search_path = pg_catalog, pg_temp`
-(sent as a connection parameter, which takes precedence over
-`ALTER DATABASE ... SET search_path`), so a `search_path` setting cannot make
-the operator's superuser queries resolve functions or operators from a
-schema the Database writer controls.
+The operator's own sessions pin their settings, so neither `spec.settings`
+nor an `ALTER DATABASE ... SET` / `ALTER ROLE ... IN DATABASE ... SET` run by
+the database owner can subvert them. Sent as connection parameters (which take
+precedence over those per-database and per-role defaults):
+`search_path = pg_catalog, pg_temp` (otherwise unqualified functions and
+operators in the operator's superuser queries could resolve to objects in a
+schema the owner controls), `role = none` (the owner can otherwise make every
+new session in their database start as their own role), `statement_timeout`,
+`lock_timeout`, `idle_in_transaction_session_timeout` (all `0`),
+`default_transaction_read_only = off`, `check_function_bodies = on`,
+`row_security = on`, `default_tablespace` and `temp_tablespaces` (empty). On
+connecting, `idle_session_timeout` (PostgreSQL 14+) and `transaction_timeout`
+(17+) are reset to `0` as well.
 
 ## Ordering & Dependencies
 
@@ -413,10 +420,25 @@ The policy for untrusted extensions lives on the Cluster, so allowing them
 needs RBAC to edit the Cluster, separately from RBAC to create Databases. See
 [Roles: security model](roles.md#security-model) for the overall picture.
 
-Known gaps: a Database whose name matches a database that already exists on
-the Cluster (created outside pgop) takes it over and changes its owner, and
-`schemas[].owner` / `grants[].role` accept any PostgreSQL role name on the
-Cluster.
+Known gap: `schemas[].owner` and `grants[].role` accept any PostgreSQL role
+name on the Cluster (giving ownership or privileges away is not an
+escalation for the writer).
+
+### Ownership of the PostgreSQL database
+
+As for [roles](roles.md#ownership-of-the-postgresql-role), pgop marks a
+database it creates with `COMMENT ON DATABASE <db> IS 'pgop:v1:Database/<Database name>'`
+and only changes the owner, settings, grants, extensions and schemas of, or
+drops, a database carrying this Database's marker:
+
+- an existing database without it (created by a DBA, a restore tool, another
+  Database) is left alone: reason `DatabaseNotManaged`, nothing is altered and
+  deleting the Database never drops it. A superuser can hand it over with the
+  `COMMENT ON DATABASE` statement the condition message shows;
+- of two Databases of a Cluster with the same PostgreSQL name only the older
+  one is reconciled; the other reports `DuplicateDatabaseName`;
+- a database an earlier pgop created (recorded in `status.databaseName`,
+  no comment) is marked on the next reconcile.
 
 ### Upgrade / breaking changes
 
@@ -428,6 +450,10 @@ Cluster.
 - System schema names (`pg_*`, `information_schema`) are rejected in
   `schemas`, and a Database named `postgres`, `template0` or `template1` must
   set `databaseName`.
+- Existing databases without the Database's ownership marker are no longer
+  taken over (`DatabaseNotManaged`); databases an earlier pgop created are
+  marked automatically.
+- `lo_compat_privileges` is refused in `settings`.
 
 ## Schema with Grants
 

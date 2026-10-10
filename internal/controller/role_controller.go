@@ -22,6 +22,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -106,12 +107,12 @@ func (r *RoleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		return ctrl.Result{}, nil
 	}
 
-	// A reserved name (postgres, pgop_*, pg_*) is never touched. The CRD
-	// rejects it in spec.roleName and for metadata.name; this also covers
-	// objects created before those rules existed.
+	// A reserved name (postgres, pgop_*, pg_*) is never touched, and of two
+	// Roles of a Cluster that resolve to the same PostgreSQL name only the
+	// older one is reconciled.
 	pgName := role.PostgresName()
-	if reason := reservedRoleName(pgName); reason != "" {
-		return r.updateStatus(ctx, role, false, "", &conditionError{reason: ReasonReservedName, err: errors.New(reason)})
+	if err := r.checkRoleName(ctx, role, pgName); err != nil {
+		return r.updateStatus(ctx, role, false, "", err)
 	}
 
 	// Get the referenced cluster
@@ -145,11 +146,11 @@ func (r *RoleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		}
 	}
 
-	// Taking over a role that already exists in PostgreSQL (one this Role
-	// has not created) hands its password to the Role writer: refuse a
-	// superuser, or a role that already belongs to roles the policy does not
-	// allow.
-	if err := checkAdoption(ctx, pgClient, role, pgName, policy); err != nil {
+	// Only a role this Role created (it carries its ownership marker) is
+	// altered: taking over an existing role would hand its password to the
+	// Role writer.
+	marker, err := r.checkRoleOwnership(ctx, pgClient, role, pgName, policy)
+	if err != nil {
 		log.Info("Not reconciling the role", "reason", err.Error())
 		return r.updateStatus(ctx, role, false, "", err)
 	}
@@ -179,6 +180,7 @@ func (r *RoleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	opts, policyErr := desiredRoleOptions(&role.Spec, policy)
 	opts.Password = dp.value
 	opts.KeepExistingPassword = dp.applied && !dp.force
+	opts.Comment = marker
 
 	if err := pgClient.CreateRole(ctx, pgName, opts); err != nil {
 		log.Error(err, "Failed to create/update role")
@@ -213,7 +215,7 @@ func (r *RoleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// Handle role memberships and parameter privileges. They are reconciled
 	// even when the role's attributes violate the policy, so forbidden
 	// memberships pgop granted earlier are revoked.
-	if err := errors.Join(policyErr, reconcileRoleGrants(ctx, pgClient, role, pgName, policy)); err != nil {
+	if err := errors.Join(policyErr, r.reconcileRoleGrants(ctx, pgClient, role, pgName, policy)); err != nil {
 		log.Error(err, "Failed to reconcile role")
 		return r.updateStatus(ctx, role, false, secretName, err)
 	}
@@ -257,9 +259,19 @@ func (r *RoleReconciler) dropPostgresRole(ctx context.Context, cluster *postgres
 		log.Info("Not dropping a reserved PostgreSQL role", "role", pgName)
 		return ctrl.Result{}, nil
 	}
-	exists, err := pgClient.RoleExists(ctx, pgName)
+	if err := r.checkRoleName(ctx, role, pgName); err != nil {
+		log.Info("Not dropping a role another Role manages", "reason", err.Error())
+		return ctrl.Result{}, nil
+	}
+	exists, comment, err := pgClient.RoleComment(ctx, pgName)
 	if err != nil || !exists {
 		return ctrl.Result{}, err
+	}
+	// Drop only a role carrying this Role's marker, or an unmarked one an
+	// earlier pgop recorded in status (created before markers existed).
+	if comment != "" && comment != ownerMarker(markerKindRole, role.Name) {
+		log.Info("Not dropping a role this Role does not own", "role", pgName, "comment", comment)
+		return ctrl.Result{}, nil
 	}
 
 	// REVOKE is idempotent, so a retry after a partial failure is safe.
@@ -314,32 +326,138 @@ func revokeSchemaPrivilegesIn(ctx context.Context, c client.Client, cluster *pos
 	return dbClient.RevokeAllSchemaPrivileges(ctx, role)
 }
 
-// checkAdoption returns a RolePolicyViolation error when pgName exists in
-// PostgreSQL, was not created by this Role (status.roleName differs), and
-// must not be taken over (see adoptionProblem).
-func checkAdoption(ctx context.Context, pg membershipClient, role *postgresv1alpha1.Role, pgName string,
-	policy *postgresv1alpha1.RolePolicySpec) error {
-	if role.Status.RoleName == pgName {
-		return nil
+// roleOwnershipClient is the subset of *postgres.Client used to decide
+// whether a Role owns its PostgreSQL role.
+type roleOwnershipClient interface {
+	RoleComment(ctx context.Context, name string) (exists bool, comment string, err error)
+	MembershipClosure(ctx context.Context, name string) ([]postgres.ReachableRole, error)
+}
+
+// checkRoleOwnership decides whether role may create or alter the
+// PostgreSQL role pgName. It returns the ownership marker to store with the
+// role ("" when it is already marked), or an error with reason RoleNotManaged
+// when the role exists without this Role's marker (created outside pgop, by
+// another Role, or by a DBA), or RolePolicyViolation when a role a superuser
+// deliberately marked for this Role is not acceptable (see
+// adoptionProblem). A role an earlier pgop recorded in status.roleName that
+// has no comment yet is marked.
+func (r *RoleReconciler) checkRoleOwnership(ctx context.Context, pg roleOwnershipClient, role *postgresv1alpha1.Role,
+	pgName string, policy *postgresv1alpha1.RolePolicySpec) (string, error) {
+	marker := ownerMarker(markerKindRole, role.Name)
+	exists, comment, err := pg.RoleComment(ctx, pgName)
+	if err != nil {
+		return "", err
 	}
-	closure, err := pg.MembershipClosure(ctx, pgName)
+	switch decideOwnership(exists, comment, marker, role.Status.RoleName == pgName) {
+	case ownedAbsent, ownedLegacy:
+		return marker, nil
+	case owned:
+		if role.Status.RoleName == pgName {
+			return "", nil
+		}
+		// Handed over by a superuser: still refuse a superuser or a role
+		// that belongs to roles the policy does not allow.
+		closure, err := pg.MembershipClosure(ctx, pgName)
+		if err != nil {
+			return "", err
+		}
+		managed, err := r.managedRoles(ctx, role)
+		if err != nil {
+			return "", err
+		}
+		if p := adoptionProblem(pgName, closure, policy, managed); p != "" {
+			return "", &conditionError{reason: ReasonRolePolicyViolation, err: errors.New(p)}
+		}
+		return "", nil
+	}
+	return "", &conditionError{reason: ReasonRoleNotManaged, err: errors.New(notManagedMessage("role", pgName, comment, marker))}
+}
+
+// clusterRoles returns the Roles of role's Cluster (in its namespace), oldest
+// first.
+func (r *RoleReconciler) clusterRoles(ctx context.Context, role *postgresv1alpha1.Role) ([]*postgresv1alpha1.Role, error) {
+	roles := &postgresv1alpha1.RoleList{}
+	if err := r.List(ctx, roles, client.InNamespace(role.Namespace)); err != nil {
+		return nil, fmt.Errorf("failed to list Roles: %w", err)
+	}
+	out := make([]*postgresv1alpha1.Role, 0, len(roles.Items))
+	for i := range roles.Items {
+		if roles.Items[i].Spec.ClusterRef.Name == role.Spec.ClusterRef.Name {
+			out = append(out, &roles.Items[i])
+		}
+	}
+	slices.SortFunc(out, func(a, b *postgresv1alpha1.Role) int {
+		if createdBefore(a, b) {
+			return -1
+		}
+		if createdBefore(b, a) {
+			return 1
+		}
+		return 0
+	})
+	return out, nil
+}
+
+// managedRoles returns the PostgreSQL roles the Roles of role's Cluster
+// manage, with the marker each must carry (the oldest Role wins a name).
+func (r *RoleReconciler) managedRoles(ctx context.Context, role *postgresv1alpha1.Role) (managedRoles, error) {
+	roles, err := r.clusterRoles(ctx, role)
+	if err != nil {
+		return nil, err
+	}
+	out := make(managedRoles, len(roles))
+	for _, other := range roles {
+		if _, taken := out[other.PostgresName()]; !taken {
+			out[other.PostgresName()] = ownerMarker(markerKindRole, other.Name)
+		}
+	}
+	return out, nil
+}
+
+// checkRoleName returns a ReservedName error for a reserved PostgreSQL name
+// and a DuplicateRoleName error when an older Role of the same Cluster
+// resolves to the same PostgreSQL name.
+func (r *RoleReconciler) checkRoleName(ctx context.Context, role *postgresv1alpha1.Role, pgName string) error {
+	if reason := reservedRoleName(pgName); reason != "" {
+		return &conditionError{reason: ReasonReservedName, err: errors.New(reason)}
+	}
+	roles, err := r.clusterRoles(ctx, role)
 	if err != nil {
 		return err
 	}
-	if p := adoptionProblem(pgName, closure, policy); p != "" {
-		return &conditionError{reason: ReasonRolePolicyViolation, err: errors.New(p)}
+	for _, other := range roles {
+		if other.UID != role.UID && other.PostgresName() == pgName && createdBefore(other, role) {
+			return &conditionError{reason: ReasonDuplicateRoleName, err: fmt.Errorf(
+				"the Role %q already manages the PostgreSQL role %s on Cluster %q; pick another roleName",
+				other.Name, pgName, role.Spec.ClusterRef.Name)}
+		}
 	}
 	return nil
+}
+
+// createdBefore reports whether a was created before b (by creation time,
+// then name), deciding which of two resources with the same PostgreSQL name
+// wins.
+func createdBefore(a, b metav1.Object) bool {
+	ta, tb := a.GetCreationTimestamp(), b.GetCreationTimestamp()
+	if !ta.Equal(&tb) {
+		return ta.Before(&tb)
+	}
+	return a.GetName() < b.GetName()
 }
 
 // reconcileRoleGrants brings the role's memberships (grant, update options,
 // revoke removed and forbidden ones) and its privileges on configuration
 // parameters (PostgreSQL 15+) to the declared state. A problem with one does
 // not hold up the other.
-func reconcileRoleGrants(ctx context.Context, pgClient *postgres.Client, role *postgresv1alpha1.Role, pgName string,
+func (r *RoleReconciler) reconcileRoleGrants(ctx context.Context, pgClient *postgres.Client, role *postgresv1alpha1.Role, pgName string,
 	policy *postgresv1alpha1.RolePolicySpec) error {
+	managed, err := r.managedRoles(ctx, role)
+	if err != nil {
+		return err
+	}
 	return errors.Join(
-		reconcileMemberships(ctx, pgClient, role, pgName, policy),
+		reconcileMemberships(ctx, pgClient, role, pgName, policy, managed),
 		reconcileParameterGrants(ctx, pgClient, role, pgName),
 	)
 }

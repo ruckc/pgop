@@ -199,6 +199,21 @@ type RolePolicySpec struct {
 	// +kubebuilder:validation:items:Enum=pg_checkpoint;pg_create_subscription;pg_maintain;pg_monitor;pg_read_all_data;pg_read_all_settings;pg_read_all_stats;pg_signal_autovacuum_worker;pg_signal_backend;pg_stat_scan_tables;pg_use_reserved_connections;pg_write_all_data
 	AllowedPredefinedRoles []string `json:"allowedPredefinedRoles,omitempty"`
 
+	// allowedExistingRoles lists PostgreSQL roles that are not managed by a
+	// Role of this Cluster (created by a DBA, a bootstrap Job, ...) that Roles
+	// may nevertheless be members of. Membership in any other role that no
+	// Role of this Cluster manages is refused (reason MembershipNotAllowed).
+	// The other membership rules (superuser, predefined roles, privileged
+	// attributes) still apply to the listed roles.
+	// +optional
+	// +listType=set
+	// +kubebuilder:validation:MaxItems=256
+	// +kubebuilder:validation:items:MinLength=1
+	// +kubebuilder:validation:items:MaxLength=63
+	// +kubebuilder:validation:items:Pattern=`^[a-z_][a-z0-9_]*$`
+	// +kubebuilder:validation:XValidation:rule="self.all(r, r != 'postgres' && !r.startsWith('pg_') && !r.startsWith('pgop_'))",message="allowedExistingRoles must not list postgres, pg_* or pgop_* roles"
+	AllowedExistingRoles []string `json:"allowedExistingRoles,omitempty"`
+
 	// allowedExtensions lists extensions that Databases may install although
 	// the server does not mark them as trusted
 	// (pg_available_extension_versions.trusted). Trusted extensions are
@@ -253,6 +268,13 @@ func (p *RolePolicySpec) AllowsAttribute(attr RoleAttribute) bool {
 // predefined role name. A nil policy allows none.
 func (p *RolePolicySpec) AllowsPredefinedRole(name string) bool {
 	return p != nil && slices.Contains(p.AllowedPredefinedRoles, name) && slices.Contains(GrantablePredefinedRoles, name)
+}
+
+// AllowsExistingRole reports whether the policy allows membership in the
+// role name although no Role of the Cluster manages it. A nil policy allows
+// none.
+func (p *RolePolicySpec) AllowsExistingRole(name string) bool {
+	return p != nil && slices.Contains(p.AllowedExistingRoles, name)
 }
 
 // AllowsExtension reports whether the policy explicitly allows the untrusted

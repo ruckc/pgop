@@ -82,20 +82,7 @@ func (r *DatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 				return ctrl.Result{}, err
 			}
 			if err == nil {
-				adminClient, err := newOperatorClient(ctx, r.Client, cluster, defaultDatabaseName)
-				if err != nil {
-					log.Error(err, "Failed to create PostgreSQL admin client during deletion")
-					return ctrl.Result{}, err
-				}
-				defer func() { _ = adminClient.Close() }()
-				// Prefer the name recorded in status so we drop what was actually created.
-				pgName := database.Status.DatabaseName
-				if pgName == "" {
-					pgName = database.PostgresName()
-				}
-				if reservedDatabaseName(pgName) != "" {
-					log.Info("Not dropping a reserved PostgreSQL database", "database", pgName)
-				} else if err := adminClient.DropDatabase(ctx, pgName); err != nil {
+				if err := r.dropPostgresDatabase(ctx, cluster, database); err != nil {
 					log.Error(err, "Failed to drop database")
 					return ctrl.Result{}, err
 				}
@@ -112,11 +99,13 @@ func (r *DatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{}, nil
 	}
 
-	// The maintenance and template databases are never managed: owning
-	// template1 would let the owner plant objects in every future database.
-	// The CRD rejects these names; this also covers older objects.
-	if reason := reservedDatabaseName(database.PostgresName()); reason != "" {
-		return r.updateStatus(ctx, database, false, nil, nil, &conditionError{reason: ReasonReservedName, err: errors.New(reason)})
+	// The maintenance and template databases are never managed (owning
+	// template1 would let the owner plant objects in every future database),
+	// and of two Databases of a Cluster that resolve to the same PostgreSQL
+	// name only the older one is reconciled.
+	pgName := database.PostgresName()
+	if err := r.checkDatabaseName(ctx, database, pgName); err != nil {
+		return r.updateStatus(ctx, database, false, nil, nil, err)
 	}
 
 	// Get the referenced cluster
@@ -161,14 +150,11 @@ func (r *DatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		}
 	}
 
-	// Create the database
-	pgName := database.PostgresName()
-	if err := adminClient.CreateDatabase(ctx, pgName, ownerPGName); err != nil {
+	// Create the database, or update the owner of one this Database owns.
+	if err := ensureDatabase(ctx, adminClient, database, pgName, ownerPGName); err != nil {
 		log.Error(err, "Failed to create database")
 		return r.updateStatus(ctx, database, false, nil, nil, err)
 	}
-	// Record the PostgreSQL name that now exists so deletion drops exactly it.
-	database.Status.DatabaseName = pgName
 
 	// Settings and database grants. A problem with them (a grantee that does
 	// not exist yet, a setting that is not allowed) does not hold up the
@@ -272,6 +258,97 @@ func reconcileSchemas(ctx context.Context, pg *postgres.Client, database *postgr
 			"system schemas cannot be managed: %s", strings.Join(refused, ", "))}
 	}
 	return created, refusedErr, nil
+}
+
+// databaseOwnershipClient is the subset of *postgres.Client used to create a
+// database and keep track of who owns it.
+type databaseOwnershipClient interface {
+	DatabaseComment(ctx context.Context, name string) (exists bool, comment string, err error)
+	CommentOnDatabase(ctx context.Context, name, comment string) error
+	CreateDatabase(ctx context.Context, name, owner string) error
+}
+
+// ensureDatabase creates the PostgreSQL database pgName with the Database's
+// ownership marker (COMMENT ON DATABASE), or, when it already carries the
+// marker, updates its owner. A database without the marker (created outside
+// pgop or by another Database) is left alone (reason DatabaseNotManaged);
+// an unmarked one an earlier pgop recorded in status.databaseName is marked.
+// It records pgName in status.databaseName once the database exists.
+func ensureDatabase(ctx context.Context, pg databaseOwnershipClient, database *postgresv1alpha1.Database,
+	pgName, owner string) error {
+	marker := ownerMarker(markerKindDatabase, database.Name)
+	exists, comment, err := pg.DatabaseComment(ctx, pgName)
+	if err != nil {
+		return err
+	}
+	if decideOwnership(exists, comment, marker, database.Status.DatabaseName == pgName) == notOwned {
+		return &conditionError{reason: ReasonDatabaseNotManaged, err: errors.New(notManagedMessage("database", pgName, comment, marker))}
+	}
+	if err := pg.CreateDatabase(ctx, pgName, owner); err != nil {
+		return err
+	}
+	// Record the name now, so a failed COMMENT is retried as a legacy
+	// database (and deletion still finds it).
+	database.Status.DatabaseName = pgName
+	if comment != marker {
+		return pg.CommentOnDatabase(ctx, pgName, marker)
+	}
+	return nil
+}
+
+// checkDatabaseName returns a ReservedName error for a reserved PostgreSQL
+// database name and a DuplicateDatabaseName error when an older Database of
+// the same Cluster resolves to the same PostgreSQL name.
+func (r *DatabaseReconciler) checkDatabaseName(ctx context.Context, database *postgresv1alpha1.Database, pgName string) error {
+	if reason := reservedDatabaseName(pgName); reason != "" {
+		return &conditionError{reason: ReasonReservedName, err: errors.New(reason)}
+	}
+	databases := &postgresv1alpha1.DatabaseList{}
+	if err := r.List(ctx, databases, client.InNamespace(database.Namespace)); err != nil {
+		return fmt.Errorf("failed to list Databases: %w", err)
+	}
+	for i := range databases.Items {
+		other := &databases.Items[i]
+		if other.UID != database.UID && other.Spec.ClusterRef.Name == database.Spec.ClusterRef.Name &&
+			other.PostgresName() == pgName && createdBefore(other, database) {
+			return &conditionError{reason: ReasonDuplicateDatabaseName, err: fmt.Errorf(
+				"the Database %q already manages the PostgreSQL database %s on Cluster %q; pick another databaseName",
+				other.Name, pgName, database.Spec.ClusterRef.Name)}
+		}
+	}
+	return nil
+}
+
+// dropPostgresDatabase drops the Database's PostgreSQL database during
+// deletion: exactly the one recorded in status.databaseName, and only when it
+// carries this Database's ownership marker (or no comment, for a database an
+// earlier pgop created). Nothing is dropped for a reserved name, for a
+// Database that lost a name collision, or for a database someone else owns.
+func (r *DatabaseReconciler) dropPostgresDatabase(ctx context.Context, cluster *postgresv1alpha1.Cluster, database *postgresv1alpha1.Database) error {
+	log := logf.FromContext(ctx)
+	pgName := database.Status.DatabaseName
+	if pgName == "" {
+		log.Info("No PostgreSQL database recorded for this Database, nothing to drop")
+		return nil
+	}
+	if err := r.checkDatabaseName(ctx, database, pgName); err != nil {
+		log.Info("Not dropping the database", "reason", err.Error())
+		return nil
+	}
+	adminClient, err := newOperatorClient(ctx, r.Client, cluster, defaultDatabaseName)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = adminClient.Close() }()
+	exists, comment, err := adminClient.DatabaseComment(ctx, pgName)
+	if err != nil || !exists {
+		return err
+	}
+	if comment != "" && comment != ownerMarker(markerKindDatabase, database.Name) {
+		log.Info("Not dropping a database this Database does not own", "database", pgName, "comment", comment)
+		return nil
+	}
+	return adminClient.DropDatabase(ctx, pgName)
 }
 
 // extensionClient is the subset of *postgres.Client used to check the

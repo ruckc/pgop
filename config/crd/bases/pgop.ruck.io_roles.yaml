@@ -201,15 +201,15 @@ spec:
                       type: string
                       x-kubernetes-validations:
                       - message: privileges on role, session_authorization, *_preload_libraries,
-                          dynamic_library_path, jit_provider, session_replication_role
-                          and pgaudit.*, set_user.*, anon.*, sepgsql.* parameters
-                          cannot be granted
+                          dynamic_library_path, jit_provider, session_replication_role,
+                          lo_compat_privileges and pgaudit.*, set_user.*, anon.*,
+                          sepgsql.* parameters cannot be granted
                         rule: '!(self.lowerAscii() in [''role'', ''session_authorization'',
                           ''session_preload_libraries'', ''local_preload_libraries'',
                           ''shared_preload_libraries'', ''dynamic_library_path'',
-                          ''jit_provider'', ''session_replication_role''] || self.lowerAscii().startsWith(''pgaudit.'')
-                          || self.lowerAscii().startsWith(''set_user.'') || self.lowerAscii().startsWith(''anon.'')
-                          || self.lowerAscii().startsWith(''sepgsql.''))'
+                          ''jit_provider'', ''session_replication_role'', ''lo_compat_privileges'']
+                          || self.lowerAscii().startsWith(''pgaudit.'') || self.lowerAscii().startsWith(''set_user.'')
+                          || self.lowerAscii().startsWith(''anon.'') || self.lowerAscii().startsWith(''sepgsql.''))'
                     privileges:
                       default:
                       - SET

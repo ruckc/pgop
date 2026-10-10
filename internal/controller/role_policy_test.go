@@ -46,6 +46,9 @@ const (
 	polTrgm         = "pg_trgm"
 	polUUID         = "uuid-ossp"
 	polGrantA       = "grant a to app"
+	polAnalytics    = "analytics_ro"
+	polOtherCluster = "other_cluster"
+	polWrapsDBA     = "wraps_dba"
 )
 
 var _ = Describe("Role policy", func() {
@@ -129,56 +132,108 @@ var _ = Describe("Role policy", func() {
 			NotTo(BeEmpty())
 	})
 
+	// managed returns a role managed by a Role of the test Cluster.
+	managed := func(name string) rr { return rr{Name: name, Comment: ownerMarker(markerKindRole, name)} }
+
 	Describe("membershipProblem", func() {
-		It("allows a plain role", func() {
-			Expect(membershipProblem("app_ro", []rr{{Name: "app_ro"}}, nil)).To(BeEmpty())
+		It("allows a role managed by a Role of the Cluster", func() {
+			Expect(membershipProblem("app_ro", []rr{managed("app_ro")}, nil, testManaged)).To(BeEmpty())
+		})
+		It("refuses a role no Role of the Cluster manages unless listed", func() {
+			for _, closure := range [][]rr{
+				{{Name: polAnalytics}},
+				{{Name: polAnalytics, Comment: "a DBA comment"}},
+				{{Name: polAnalytics, Comment: ownerMarker(markerKindRole, "other-cluster-role")}},
+				{{Name: polAnalytics, Comment: ownerMarker(markerKindRole, polAnalytics) + "x"}},
+			} {
+				Expect(membershipProblem(polAnalytics, closure, nil, testManaged)).
+					To(ContainSubstring("not managed by a Role of this Cluster"), "%v", closure)
+				Expect(membershipProblem(polAnalytics, closure,
+					&postgresv1alpha1.RolePolicySpec{AllowedExistingRoles: []string{polAnalytics}}, testManaged)).To(BeEmpty())
+			}
+			By("also when reached through a managed role")
+			Expect(membershipProblem("app_ro", []rr{managed("app_ro"), {Name: polAnalytics, Via: polAnalytics}}, nil, testManaged)).
+				To(ContainSubstring("app_ro is a member of analytics_ro, which is not managed"))
+			By("a listed existing role is still checked for superuser")
+			Expect(membershipProblem(polAnalytics, []rr{{Name: polAnalytics, Superuser: true}},
+				&postgresv1alpha1.RolePolicySpec{AllowedExistingRoles: []string{polAnalytics}}, testManaged)).To(Equal("analytics_ro is a superuser"))
 		})
 		It("allows a role that does not exist yet (GRANT then fails)", func() {
-			Expect(membershipProblem("later", nil, nil)).To(BeEmpty())
+			Expect(membershipProblem("later", nil, nil, testManaged)).To(BeEmpty())
 		})
 		It("refuses a superuser", func() {
-			Expect(membershipProblem(polDBA, []rr{{Name: polDBA, Superuser: true}}, allowAll)).To(Equal("dba is a superuser"))
+			Expect(membershipProblem(polDBA, []rr{{Name: polDBA, Superuser: true}}, allowAll, testManaged)).To(Equal("dba is a superuser"))
 		})
 		It("refuses a role with an attribute the policy does not allow", func() {
-			closure := []rr{{Name: "repl", Replication: true, BypassRLS: true}}
-			Expect(membershipProblem("repl", closure, nil)).To(ContainSubstring("has REPLICATION, BYPASSRLS"))
-			Expect(membershipProblem("repl", closure, allowAll)).To(BeEmpty())
+			repl := managed("repl")
+			repl.Replication, repl.BypassRLS = true, true
+			Expect(membershipProblem("repl", []rr{repl}, nil, testManaged)).To(ContainSubstring("has REPLICATION, BYPASSRLS"))
+			Expect(membershipProblem("repl", []rr{repl}, allowAll, testManaged)).To(BeEmpty())
 		})
 		It("allows the predefined roles an allowed predefined role contains", func() {
 			monitor := &postgresv1alpha1.RolePolicySpec{AllowedPredefinedRoles: []string{polMonitor}}
 			closure := []rr{{Name: polMonitor}, {Name: polReadSettings, Via: polReadSettings}}
-			Expect(membershipProblem(polMonitor, closure, monitor)).To(BeEmpty())
+			Expect(membershipProblem(polMonitor, closure, monitor, testManaged)).To(BeEmpty())
 			Expect(adoptionProblem("app_mon", []rr{{Name: "app_mon"}, {Name: polMonitor, Via: polMonitor},
-				{Name: polReadSettings, Via: polMonitor}}, monitor)).To(BeEmpty())
+				{Name: polReadSettings, Via: polMonitor}}, monitor, testManaged)).To(BeEmpty())
 			By("but not a server-file role, even inside an allowed predefined role")
 			withExec := []rr{{Name: polMonitor}, {Name: polReadSettings, Via: polReadSettings}, {Name: polExecProgram, Via: polExecProgram}}
-			Expect(membershipProblem(polMonitor, withExec, monitor)).To(ContainSubstring(polExecProgram))
+			Expect(membershipProblem(polMonitor, withExec, monitor, testManaged)).To(ContainSubstring(polExecProgram))
 			By("and not the contained roles when the outer role is not allowed")
-			Expect(membershipProblem("ops", []rr{{Name: "ops"}, {Name: polMonitor, Via: polMonitor},
-				{Name: polReadSettings, Via: polMonitor}}, nil)).To(ContainSubstring(polMonitor))
+			Expect(membershipProblem(polOps, []rr{managed(polOps), {Name: polMonitor, Via: polMonitor},
+				{Name: polReadSettings, Via: polMonitor}}, nil, testManaged)).To(ContainSubstring(polMonitor))
 		})
 
 		It("refuses a role that reaches a superuser or a forbidden role indirectly", func() {
-			Expect(membershipProblem(polOps, []rr{{Name: polOps}, {Name: bootstrapRoleName, Via: "admins", Superuser: true}}, allowAll)).
+			Expect(membershipProblem(polOps, []rr{managed(polOps), {Name: bootstrapRoleName, Via: "admins", Superuser: true}}, allowAll, testManaged)).
 				To(Equal("ops is a member of postgres, which is reserved (bootstrap superuser)"))
-			Expect(membershipProblem(polOps, []rr{{Name: polOps}, {Name: polExecProgram, Via: polExecProgram}}, allowAll)).
+			Expect(membershipProblem(polOps, []rr{managed(polOps), {Name: polExecProgram, Via: polExecProgram}}, allowAll, testManaged)).
 				To(ContainSubstring("ops is a member of pg_execute_server_program"))
-			Expect(membershipProblem(polOps, []rr{{Name: polOps}, {Name: polReadAllData, Via: polReadAllData}}, nil)).
+			Expect(membershipProblem(polOps, []rr{managed(polOps), {Name: polReadAllData, Via: polReadAllData}}, nil, testManaged)).
 				To(ContainSubstring("allowedPredefinedRoles"))
 		})
 	})
 
 	Describe("adoptionProblem", func() {
 		It("allows a new or plain role", func() {
-			Expect(adoptionProblem(grantTestRole, nil, nil)).To(BeEmpty())
-			Expect(adoptionProblem(grantTestRole, []rr{{Name: grantTestRole, CreateRole: true}}, nil)).To(BeEmpty())
+			Expect(adoptionProblem(grantTestRole, nil, nil, testManaged)).To(BeEmpty())
+			Expect(adoptionProblem(grantTestRole, []rr{{Name: grantTestRole, CreateRole: true}}, nil, testManaged)).To(BeEmpty())
 		})
 		It("refuses an existing superuser", func() {
-			Expect(adoptionProblem(polDBA, []rr{{Name: polDBA, Superuser: true}}, allowAll)).To(ContainSubstring("it is a superuser"))
+			Expect(adoptionProblem(polDBA, []rr{{Name: polDBA, Superuser: true}}, allowAll, testManaged)).To(ContainSubstring("it is a superuser"))
 		})
 		It("refuses a role that is already a member of a forbidden role", func() {
-			Expect(adoptionProblem(polOps, []rr{{Name: polOps}, {Name: grantTestAdmin, Via: grantTestAdmin, Superuser: true}}, allowAll)).
+			Expect(adoptionProblem(polOps, []rr{{Name: polOps}, {Name: grantTestAdmin, Via: grantTestAdmin, Superuser: true}}, allowAll, testManaged)).
 				To(ContainSubstring("it is a member of admin, which is a superuser"))
+		})
+	})
+
+	Describe("ownership markers", func() {
+		It("builds markers that identify the resource", func() {
+			Expect(ownerMarker(markerKindRole, "app-user")).To(Equal("pgop:v1:Role/app-user"))
+			Expect(ownerMarker(markerKindDatabase, "app-db")).To(Equal("pgop:v1:Database/app-db"))
+			Expect(isOwnerMarker("pgop:v1:Role/app-user")).To(BeTrue())
+			Expect(isOwnerMarker("owned by the DBA team")).To(BeFalse())
+		})
+
+		DescribeTable("decideOwnership",
+			func(exists bool, comment string, recorded bool, want ownership) {
+				Expect(decideOwnership(exists, comment, "pgop:v1:ns/c/me", recorded)).To(Equal(want))
+			},
+			Entry("absent", false, "", false, ownedAbsent),
+			Entry("own marker", true, "pgop:v1:ns/c/me", false, owned),
+			Entry("own marker, recorded", true, "pgop:v1:ns/c/me", true, owned),
+			Entry("legacy: no comment, recorded in status", true, "", true, ownedLegacy),
+			Entry("pre-existing DBA role", true, "", false, notOwned),
+			Entry("DBA comment, even if recorded", true, "app team", true, notOwned),
+			Entry("another resource's marker", true, "pgop:v1:ns/c/other", true, notOwned),
+		)
+
+		It("tells how to hand an object over", func() {
+			Expect(notManagedMessage("role", "analytics", "", "pgop:v1:ns/c/me")).
+				To(ContainSubstring("COMMENT ON ROLE analytics IS 'pgop:v1:ns/c/me'"))
+			Expect(notManagedMessage("database", "app", "pgop:v1:ns/c/other", "pgop:v1:ns/c/me")).
+				To(ContainSubstring("managed by another pgop resource"))
 		})
 	})
 

@@ -61,6 +61,7 @@ spec:
 | `parameters` | map[string]string | - | PostgreSQL configuration parameters. See [Parameters](#parameters) |
 | `rolePolicy.allowedAttributes` | []string | `[]` | Privileged attributes Roles may request: `createRole`, `replication`, `bypassRLS`. See [Role policy](#role-policy) |
 | `rolePolicy.allowedPredefinedRoles` | []string | `[]` | Predefined `pg_*` roles Roles may be members of. See [Role policy](#role-policy) |
+| `rolePolicy.allowedExistingRoles` | []string | `[]` | Roles not managed by a Role of this Cluster that Roles may be members of. See [Role policy](#role-policy) |
 | `rolePolicy.allowedExtensions` | []string | `[]` | Untrusted extensions Databases may install (trusted ones are always allowed). See [Role policy](#role-policy) |
 
 ## Status
@@ -203,6 +204,7 @@ spec:
   rolePolicy:
     allowedAttributes: [bypassRLS]          # createRole, replication, bypassRLS
     allowedPredefinedRoles: [pg_monitor]    # see the list below
+    allowedExistingRoles: [analytics_ro]    # roles created outside pgop
     allowedExtensions: [postgis, file_fdw]  # untrusted extensions
 ```
 
@@ -216,6 +218,10 @@ Without `rolePolicy` (the default):
   or of a role with an attribute the policy does not allow (reason
   `MembershipNotAllowed`; memberships pgop granted earlier are revoked). See
   [Roles: membership policy](roles.md#membership-policy).
+- Roles cannot be members of roles that no Role of this Cluster manages (a
+  DBA's or a bootstrap Job's roles), unless `allowedExistingRoles` lists them.
+  Roles managed by Roles of the same Cluster can always be joined: the
+  Cluster's namespace is one trust domain.
 - Databases can only install extensions the server marks as trusted (reason
   `ExtensionNotAllowed` otherwise). See
   [Databases: extension policy](databases.md#extension-policy).

@@ -222,7 +222,7 @@ type ParameterGrantSpec struct {
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=127
 	// +kubebuilder:validation:Pattern=`^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$`
-	// +kubebuilder:validation:XValidation:rule="!(self.lowerAscii() in ['role', 'session_authorization', 'session_preload_libraries', 'local_preload_libraries', 'shared_preload_libraries', 'dynamic_library_path', 'jit_provider', 'session_replication_role'] || self.lowerAscii().startsWith('pgaudit.') || self.lowerAscii().startsWith('set_user.') || self.lowerAscii().startsWith('anon.') || self.lowerAscii().startsWith('sepgsql.'))",message="privileges on role, session_authorization, *_preload_libraries, dynamic_library_path, jit_provider, session_replication_role and pgaudit.*, set_user.*, anon.*, sepgsql.* parameters cannot be granted"
+	// +kubebuilder:validation:XValidation:rule="!(self.lowerAscii() in ['role', 'session_authorization', 'session_preload_libraries', 'local_preload_libraries', 'shared_preload_libraries', 'dynamic_library_path', 'jit_provider', 'session_replication_role', 'lo_compat_privileges'] || self.lowerAscii().startsWith('pgaudit.') || self.lowerAscii().startsWith('set_user.') || self.lowerAscii().startsWith('anon.') || self.lowerAscii().startsWith('sepgsql.'))",message="privileges on role, session_authorization, *_preload_libraries, dynamic_library_path, jit_provider, session_replication_role, lo_compat_privileges and pgaudit.*, set_user.*, anon.*, sepgsql.* parameters cannot be granted"
 	Parameter string `json:"parameter"`
 
 	// privileges lists the privileges to grant. Only SET is supported (the

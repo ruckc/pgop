@@ -156,8 +156,8 @@ func settingAllowed(ctx context.Context, pg databaseGrantClient, name string) (s
 	if err != nil {
 		return "", err
 	}
-	if found && pgContext != "user" {
-		return fmt.Sprintf("has context %q (only %q parameters may be set per database)", pgContext, "user"), nil
+	if found && pgContext != pgContextUser {
+		return fmt.Sprintf("has context %q (only %q parameters may be set per database)", pgContext, pgContextUser), nil
 	}
 	return "", nil
 }

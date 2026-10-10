@@ -74,6 +74,11 @@ spec:
     # pg_write_server_files can never be allowed.)
     allowedPredefinedRoles:
       - string
+    # Roles not managed by a Role of this Cluster (created by a DBA or a
+    # bootstrap Job) that Roles may be members of (max 256; not postgres,
+    # pg_* or pgop_*).
+    allowedExistingRoles:
+      - string
     # Untrusted extensions Databases may install (max 128; trusted
     # extensions are always allowed).
     allowedExtensions:
@@ -150,8 +155,9 @@ spec:
   # pg_read_server_files, pg_write_server_files. Refused by the operator
   # (reason MembershipNotAllowed; revoked if pgop granted them): superuser
   # roles, pg_* roles not in the Cluster's rolePolicy.allowedPredefinedRoles,
-  # roles with attributes the policy does not allow, and roles that are
-  # members of any of these. Applies to memberOf as well.
+  # roles with attributes the policy does not allow, roles no Role of this
+  # Cluster manages (unless in rolePolicy.allowedExistingRoles), and roles
+  # that are members of any of these. Applies to memberOf as well.
   memberships:             # max 256, each role at most once
     - role: string         # Role to be a member of (required)
       inherit: boolean     # INHERIT option (optional; PostgreSQL 16+)
@@ -188,7 +194,7 @@ spec:
     - parameter: string    # Parameter name, e.g. log_statement or myapp.tenant_id.
                            # Not allowed: role, session_authorization,
                            # *_preload_libraries, dynamic_library_path,
-                           # jit_provider, session_replication_role,
+                           # jit_provider, session_replication_role, lo_compat_privileges,
                            # pgaudit.*, set_user.*, anon.*, sepgsql.*
       privileges:          # Only SET (the default); ALTER SYSTEM is not offered
         - SET
@@ -233,7 +239,10 @@ denylisted parameter, `RolePolicyViolation` when the Role requests a
 privileged attribute the Cluster's `rolePolicy` does not allow (the role then
 has none of `createRole`, `replication`, `bypassRLS`), names an existing role
 pgop must not take over, or names a pgop-managed Secret in `passwordSecretRef`,
-`MembershipNotAllowed` when a membership is refused (the others are applied;
+`RoleNotManaged` when the PostgreSQL role exists without this Role's
+ownership marker (`COMMENT ON ROLE ... IS 'pgop:v1:Role/<name>'`),
+`DuplicateRoleName` when an older Role of the Cluster has the same
+PostgreSQL name, `MembershipNotAllowed` when a membership is refused (the others are applied;
 refused ones pgop granted before are revoked), `ReservedName` when the
 PostgreSQL name is reserved, `RoleDropBlocked` while a deleted Role cannot be dropped
 because objects or privileges pgop does not manage depend on it (the message
@@ -315,7 +324,7 @@ spec:
   # Values: max 4096 chars. pgop-set keys removed from the spec are RESET.
   # Only "user"-context and custom parameters are applied; superuser-only
   # parameters and role, session_authorization, *_preload_libraries,
-  # dynamic_library_path, jit_provider, session_replication_role, pgaudit.*,
+  # dynamic_library_path, jit_provider, session_replication_role, lo_compat_privileges, pgaudit.*,
   # set_user.*, anon.*, sepgsql.* are refused (reason SettingNotAllowed).
   # search_path/temp_tablespaces take a postgresql.conf list ("$user", app);
   # an empty list is rejected.
@@ -327,7 +336,10 @@ The `Available` condition is `False` with reason `SettingNotAllowed` when a
 setting is refused, `ExtensionNotAllowed` when an extension is refused,
 `SchemaNotAllowed` for a system schema (the other settings, grants,
 extensions and schemas are still reconciled), `ReservedName` for a reserved
-database name, and `ReconcileError` for other failures, such as a grantee
+database name, `DatabaseNotManaged` when the database exists without this
+Database's ownership marker (`COMMENT ON DATABASE ... IS
+'pgop:v1:Database/<name>'`), `DuplicateDatabaseName` when an older Database of
+the Cluster has the same PostgreSQL name, and `ReconcileError` for other failures, such as a grantee
 role that does not exist yet.
 
 ### DatabaseStatus

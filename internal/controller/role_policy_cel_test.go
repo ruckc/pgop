@@ -96,7 +96,7 @@ var _ = Describe("Role policy CRD validation", func() {
 		})
 
 		It("no longer has a superuser field", func() {
-			const field = "superuser"
+			const field = pgContextSuperuser // the removed spec.superuser field
 			u := &unstructured.Unstructured{}
 			u.SetGroupVersionKind(postgresv1alpha1.GroupVersion.WithKind("Role"))
 			u.SetName("su-" + suffix)
@@ -142,6 +142,13 @@ var _ = Describe("Role policy CRD validation", func() {
 
 		It("rejects an invalid extension name", func() {
 			expectInvalid(create(newCluster(&postgresv1alpha1.RolePolicySpec{AllowedExtensions: []string{`x"; DROP`}})))
+		})
+
+		It("validates allowedExistingRoles like role names", func() {
+			for _, name := range []string{bootstrapRoleName, "pg_monitor_x", DefaultOperatorUsername, "Analytics", `a"b`} {
+				expectInvalid(create(newCluster(&postgresv1alpha1.RolePolicySpec{AllowedExistingRoles: []string{name}})))
+			}
+			Expect(create(newCluster(&postgresv1alpha1.RolePolicySpec{AllowedExistingRoles: []string{"analytics_ro"}}))).To(Succeed())
 		})
 	})
 

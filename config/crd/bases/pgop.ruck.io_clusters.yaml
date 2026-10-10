@@ -254,6 +254,27 @@ spec:
                     maxItems: 3
                     type: array
                     x-kubernetes-list-type: set
+                  allowedExistingRoles:
+                    description: |-
+                      allowedExistingRoles lists PostgreSQL roles that are not managed by a
+                      Role of this Cluster (created by a DBA, a bootstrap Job, ...) that Roles
+                      may nevertheless be members of. Membership in any other role that no
+                      Role of this Cluster manages is refused (reason MembershipNotAllowed).
+                      The other membership rules (superuser, predefined roles, privileged
+                      attributes) still apply to the listed roles.
+                    items:
+                      maxLength: 63
+                      minLength: 1
+                      pattern: ^[a-z_][a-z0-9_]*$
+                      type: string
+                    maxItems: 256
+                    type: array
+                    x-kubernetes-list-type: set
+                    x-kubernetes-validations:
+                    - message: allowedExistingRoles must not list postgres, pg_* or
+                        pgop_* roles
+                      rule: self.all(r, r != 'postgres' && !r.startsWith('pg_') &&
+                        !r.startsWith('pgop_'))
                   allowedExtensions:
                     description: |-
                       allowedExtensions lists extensions that Databases may install although

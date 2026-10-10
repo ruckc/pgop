@@ -104,7 +104,9 @@ func diffMemberships(desired []postgresv1alpha1.RoleMembership, managed []string
 type membershipChecker struct {
 	pg     membershipClient
 	policy *postgresv1alpha1.RolePolicySpec
-	cache  map[string]string
+	// managed lists the roles the Cluster's Roles manage.
+	managed managedRoles
+	cache   map[string]string
 }
 
 // problem explains why membership in target is not allowed, or returns ""
@@ -121,7 +123,7 @@ func (c *membershipChecker) problem(ctx context.Context, target string) (string,
 		if err != nil {
 			return "", err
 		}
-		p = membershipProblem(target, closure, c.policy)
+		p = membershipProblem(target, closure, c.policy, c.managed)
 	}
 	if c.cache == nil {
 		c.cache = map[string]string{}
@@ -140,14 +142,14 @@ func (c *membershipChecker) problem(ctx context.Context, target string) (string,
 // status.managedMemberships) is revoked, whatever revokeRemovedMemberships
 // says.
 func reconcileMemberships(ctx context.Context, pg membershipClient, role *postgresv1alpha1.Role, member string,
-	policy *postgresv1alpha1.RolePolicySpec) error {
+	policy *postgresv1alpha1.RolePolicySpec, clusterRoles managedRoles) error {
 	requested := role.Spec.DesiredMemberships()
 	managed := role.Status.ManagedMemberships
 	if len(requested) == 0 && len(managed) == 0 {
 		return nil
 	}
 
-	checker := &membershipChecker{pg: pg, policy: policy}
+	checker := &membershipChecker{pg: pg, policy: policy, managed: clusterRoles}
 	desired := make([]postgresv1alpha1.RoleMembership, 0, len(requested))
 	var refused []string
 	for _, d := range requested {

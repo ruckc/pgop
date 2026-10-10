@@ -255,13 +255,15 @@ spec:
                 - message: settings values must be at most 4096 characters
                   rule: self.all(k, size(self[k]) <= 4096)
                 - message: settings must not include role, session_authorization,
-                    *_preload_libraries, dynamic_library_path, jit_provider, session_replication_role
-                    or pgaudit.*, set_user.*, anon.*, sepgsql.* parameters
+                    *_preload_libraries, dynamic_library_path, jit_provider, session_replication_role,
+                    lo_compat_privileges or pgaudit.*, set_user.*, anon.*, sepgsql.*
+                    parameters
                   rule: '!self.exists(k, k.lowerAscii() in [''role'', ''session_authorization'',
                     ''session_preload_libraries'', ''local_preload_libraries'', ''shared_preload_libraries'',
-                    ''dynamic_library_path'', ''jit_provider'', ''session_replication_role'']
-                    || k.lowerAscii().startsWith(''pgaudit.'') || k.lowerAscii().startsWith(''set_user.'')
-                    || k.lowerAscii().startsWith(''anon.'') || k.lowerAscii().startsWith(''sepgsql.''))'
+                    ''dynamic_library_path'', ''jit_provider'', ''session_replication_role'',
+                    ''lo_compat_privileges''] || k.lowerAscii().startsWith(''pgaudit.'')
+                    || k.lowerAscii().startsWith(''set_user.'') || k.lowerAscii().startsWith(''anon.'')
+                    || k.lowerAscii().startsWith(''sepgsql.''))'
             required:
             - clusterRef
             type: object

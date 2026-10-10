@@ -1101,6 +1101,11 @@ func (in *RolePolicySpec) DeepCopyInto(out *RolePolicySpec) {
 		*out = make([]string, len(*in))
 		copy(*out, *in)
 	}
+	if in.AllowedExistingRoles != nil {
+		in, out := &in.AllowedExistingRoles, &out.AllowedExistingRoles
+		*out = make([]string, len(*in))
+		copy(*out, *in)
+	}
 	if in.AllowedExtensions != nil {
 		in, out := &in.AllowedExtensions, &out.AllowedExtensions
 		*out = make([]string, len(*in))

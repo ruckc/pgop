@@ -137,6 +137,18 @@ const (
 	ReasonExtensionNotAllowed = "ExtensionNotAllowed"
 	// ReasonSchemaNotAllowed: Database.spec.schemas names a system schema.
 	ReasonSchemaNotAllowed = "SchemaNotAllowed"
+	// ReasonRoleNotManaged: the PostgreSQL role exists but does not carry this
+	// Role's ownership marker (COMMENT ON ROLE); pgop leaves it alone.
+	ReasonRoleNotManaged = "RoleNotManaged"
+	// ReasonDuplicateRoleName: an older Role of the same Cluster resolves to
+	// the same PostgreSQL role name; this Role is not reconciled.
+	ReasonDuplicateRoleName = "DuplicateRoleName"
+	// ReasonDatabaseNotManaged: the PostgreSQL database exists but does not
+	// carry this Database's ownership marker; pgop leaves it alone.
+	ReasonDatabaseNotManaged = "DatabaseNotManaged"
+	// ReasonDuplicateDatabaseName: an older Database of the same Cluster
+	// resolves to the same PostgreSQL database name.
+	ReasonDuplicateDatabaseName = "DuplicateDatabaseName"
 
 	DefaultPostgresImage    = "postgres:18"
 	DefaultOperatorUsername = "pgop_operator"

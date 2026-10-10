@@ -40,6 +40,89 @@ const reservedRolePrefix = "pgop_"
 // pgop's clusters use their own operator role, but the name stays reserved.
 const bootstrapRoleName = "postgres"
 
+// markerVersion starts every ownership marker pgop stores in COMMENT ON ROLE
+// and COMMENT ON DATABASE.
+const markerVersion = "pgop:v1:"
+
+// Kinds used in ownership markers.
+const (
+	markerKindRole     = "Role"
+	markerKindDatabase = "Database"
+)
+
+// ownerMarker is the ownership marker pgop stores on the PostgreSQL role or
+// database that the resource kind/name manages: "pgop:v1:Role/<name>" or
+// "pgop:v1:Database/<name>". Only a superuser (or, for a role, a role with
+// CREATEROLE and ADMIN on it; for a database, its owner) can set a comment,
+// so the marker records that pgop created the object, or that a privileged
+// user deliberately handed it over.
+//
+// The marker names the resource, not its UID, namespace or Cluster: every
+// resource that can reach a Cluster lives in the Cluster's namespace (and
+// resource names are unique there), and a name survives what a UID does not:
+// re-creating the resources from Git, or restoring a physical backup into a
+// Cluster with another name. Two resources with the same PostgreSQL name have
+// different markers, and only the older one is reconciled.
+func ownerMarker(kind, name string) string {
+	return markerVersion + kind + "/" + name
+}
+
+// managedRoles maps the PostgreSQL role names of a Cluster's Roles to the
+// ownership marker each must carry to count as managed by that Role.
+type managedRoles map[string]string
+
+// manages reports whether r is a role a Role of the Cluster manages: its name
+// belongs to such a Role and it carries that Role's marker.
+func (m managedRoles) manages(r postgres.ReachableRole) bool {
+	marker, ok := m[r.Name]
+	return ok && r.Comment == marker
+}
+
+// isOwnerMarker reports whether comment is a pgop ownership marker.
+func isOwnerMarker(comment string) bool {
+	return strings.HasPrefix(comment, markerVersion)
+}
+
+// ownership is how a resource relates to an existing PostgreSQL object of
+// its name.
+type ownership int
+
+const (
+	// ownedAbsent: the object does not exist; create it with the marker.
+	ownedAbsent ownership = iota
+	// owned: the object carries this resource's marker.
+	owned
+	// ownedLegacy: the object has no comment and the resource's status
+	// records that an earlier pgop created or took it over; mark it.
+	ownedLegacy
+	// notOwned: the object belongs to someone else; leave it alone.
+	notOwned
+)
+
+// decideOwnership classifies an existing object by its comment.
+func decideOwnership(exists bool, comment, marker string, recordedInStatus bool) ownership {
+	switch {
+	case !exists:
+		return ownedAbsent
+	case comment == marker:
+		return owned
+	case comment == "" && recordedInStatus:
+		return ownedLegacy
+	}
+	return notOwned
+}
+
+// notManagedMessage explains why pgop leaves an existing object alone and
+// how to hand it over deliberately.
+func notManagedMessage(kind, name, comment, marker string) string {
+	if isOwnerMarker(comment) {
+		return fmt.Sprintf("the PostgreSQL %s %s is managed by another pgop resource (%s); pgop does not touch it", kind, name, comment)
+	}
+	return fmt.Sprintf("the PostgreSQL %s %s already exists and was not created by this resource; pgop does not take it over "+
+		"(it would reset its owner, settings or password and could drop it). To hand it over deliberately, a superuser "+
+		"can run: COMMENT ON %s %s IS '%s'", kind, name, strings.ToUpper(kind), name, marker)
+}
+
 // reservedRoleName explains why name cannot be managed by a Role resource,
 // or returns "" when it can. The CRD rejects the same names in
 // spec.roleName; this also covers a Role whose metadata.name is used as the
@@ -114,15 +197,25 @@ func attributeProblem(r postgres.ReachableRole, policy *postgresv1alpha1.RolePol
 }
 
 // reachableRoleProblem explains why being able to act as r is not allowed,
-// or returns "" when it is.
-func reachableRoleProblem(r postgres.ReachableRole, policy *postgresv1alpha1.RolePolicySpec) string {
+// or returns "" when it is. managed lists the roles the Cluster's Roles
+// manage: any other role (a DBA's, a bootstrap Job's, one restored from
+// another Cluster) is only allowed when the policy lists it in
+// allowedExistingRoles. Predefined pg_* roles are governed by
+// allowedPredefinedRoles instead.
+func reachableRoleProblem(r postgres.ReachableRole, policy *postgresv1alpha1.RolePolicySpec, managed managedRoles) string {
 	if p := membershipNameProblem(r.Name, policy); p != "" {
 		return p
 	}
 	if r.Superuser {
 		return "is a superuser"
 	}
-	return attributeProblem(r, policy)
+	if p := attributeProblem(r, policy); p != "" {
+		return p
+	}
+	if !strings.HasPrefix(r.Name, "pg_") && !managed.manages(r) && !policy.AllowsExistingRole(r.Name) {
+		return "is not managed by a Role of this Cluster and the Cluster's spec.rolePolicy.allowedExistingRoles does not list it"
+	}
+	return ""
 }
 
 // builtinContainedRoles are the predefined roles PostgreSQL itself makes
@@ -151,7 +244,7 @@ func containedPredefinedRole(reached string, closure []postgres.ReachableRole, p
 // not exist). Grant options are ignored on purpose: a member that cannot SET
 // ROLE today can be given that option later, and memberships of target can
 // change after this check.
-func membershipProblem(target string, closure []postgres.ReachableRole, policy *postgresv1alpha1.RolePolicySpec) string {
+func membershipProblem(target string, closure []postgres.ReachableRole, policy *postgresv1alpha1.RolePolicySpec, managed managedRoles) string {
 	if p := membershipNameProblem(target, policy); p != "" {
 		return fmt.Sprintf("%s %s", target, p)
 	}
@@ -159,7 +252,7 @@ func membershipProblem(target string, closure []postgres.ReachableRole, policy *
 		if r.Name != target && containedPredefinedRole(r.Name, closure, policy) {
 			continue
 		}
-		p := reachableRoleProblem(r, policy)
+		p := reachableRoleProblem(r, policy, managed)
 		switch {
 		case p == "":
 		case r.Name == target:
@@ -178,7 +271,7 @@ func membershipProblem(target string, closure []postgres.ReachableRole, policy *
 // pgop) of a role the policy does not allow, is refused. The role's own
 // privileged attributes are not a reason to refuse: they are altered down to
 // what the policy allows.
-func adoptionProblem(name string, closure []postgres.ReachableRole, policy *postgresv1alpha1.RolePolicySpec) string {
+func adoptionProblem(name string, closure []postgres.ReachableRole, policy *postgresv1alpha1.RolePolicySpec, managed managedRoles) string {
 	for _, r := range closure {
 		if r.Via == "" {
 			if r.Superuser {
@@ -189,7 +282,7 @@ func adoptionProblem(name string, closure []postgres.ReachableRole, policy *post
 		if containedPredefinedRole(r.Name, closure, policy) {
 			continue
 		}
-		if p := reachableRoleProblem(r, policy); p != "" {
+		if p := reachableRoleProblem(r, policy, managed); p != "" {
 			return fmt.Sprintf("pgop does not take over the existing PostgreSQL role %s: it is a member of %s, which %s",
 				name, r.Name, p)
 		}

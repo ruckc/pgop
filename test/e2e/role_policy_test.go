@@ -62,7 +62,8 @@ func RegisterRolePolicyTests() {
 		// psqlDB runs a query as the superuser over the local socket.
 		psqlDB := func(db, query string) (string, error) {
 			out, err := utils.Run(exec.Command("kubectl", "exec", "-n", namespace, clusterName+"-0", "-c", "postgresql", "--",
-				"sh", "-c", `psql -U "$POSTGRES_USER" -d "$1" -v ON_ERROR_STOP=1 -tAc "$0"`, query, db))
+				"sh", "-c", `PGOPTIONS='-c statement_timeout=0 -c lock_timeout=0 -c default_transaction_read_only=off -c search_path=public' `+
+					`psql -U "$POSTGRES_USER" -d "$1" -v ON_ERROR_STOP=1 -tAc "$0"`, query, db))
 			return strings.TrimSpace(out), err
 		}
 		psql := func(query string) (string, error) { return psqlDB("postgres", query) }
@@ -98,13 +99,16 @@ func RegisterRolePolicyTests() {
 		}
 
 		AfterAll(func() {
-			for _, res := range []string{dbRes + "pol-db", roleRes + "pol-steal", roleRes + "pol-old", roleRes + "pol-priv",
-				roleRes + "pol-mem", roleRes + "pol-adopt"} {
+			for _, res := range []string{dbRes + "pol-db", dbRes + "pol-db-dup", dbRes + "pol-dbaowned", roleRes + "pol-steal",
+				roleRes + "pol-mem2", roleRes + "pol-old", roleRes + "pol-priv", roleRes + "pol-mem", roleRes + "pol-adopt",
+				roleRes + "pol-adopt-su", roleRes + "pol-dup"} {
 				_, _ = utils.Run(exec.Command("kubectl", "delete", "-n", namespace, "--ignore-not-found",
 					"--wait=true", "--timeout=2m", res))
 			}
-			_, _ = psql(`DROP ROLE IF EXISTS pol_dba`)
-			_, _ = psql(`DROP ROLE IF EXISTS pol_adopt`)
+			_, _ = psql(`DROP DATABASE IF EXISTS pol_dbaowned`)
+			for _, role := range []string{"pol_dba", "pol_adopt_su", "pol_dba_app", "pol_analytics"} {
+				_, _ = psql(`DROP ROLE IF EXISTS ` + role)
+			}
 			_, _ = utils.Run(exec.Command("kubectl", "patch", clusterRes, "-n", namespace,
 				"--type=json", "-p", `[{"op":"remove","path":"/spec/rolePolicy"}]`))
 		})
@@ -268,9 +272,51 @@ spec:
 			}).Should(Succeed())
 		})
 
-		It("does not take over an existing role that is a member of a superuser", func() {
-			_, err := psql(`CREATE ROLE pol_adopt NOLOGIN IN ROLE pol_dba`)
+		It("refuses memberships in roles no Role of the Cluster manages unless the Cluster lists them", func() {
+			_, err := psql(`CREATE ROLE pol_analytics NOLOGIN`)
 			Expect(err).NotTo(HaveOccurred())
+			Expect(apply(`
+apiVersion: pgop.ruck.io/v1alpha1
+kind: Role
+metadata:
+  name: pol-mem2
+spec:
+  clusterRef:
+    name: example-cluster
+  roleName: pol_mem2
+  login: false
+  memberships:
+    - role: pol_analytics
+    - role: pol_old
+`)).To(Succeed())
+			expectReason(roleRes+"pol-mem2", "MembershipNotAllowed", "pol_analytics is not managed by a Role of this Cluster")
+			member := func(g Gomega, role string) string {
+				return query(g, `SELECT count(*) FROM pg_auth_members WHERE roleid = '`+role+`'::regrole AND member = 'pol_mem2'::regrole`)
+			}
+			Eventually(func(g Gomega) {
+				g.Expect(member(g, "pol_old")).To(Equal("1"), "a role managed by a Role of the Cluster is allowed")
+				g.Expect(member(g, "pol_analytics")).To(Equal("0"))
+			}).Should(Succeed())
+
+			By("allowing the DBA's role on the Cluster")
+			setPolicy(`{"allowedExistingRoles":["pol_analytics"]}`)
+			waitReady(roleRes + "pol-mem2")
+			Eventually(func(g Gomega) { g.Expect(member(g, "pol_analytics")).To(Equal("1")) }).Should(Succeed())
+		})
+
+		It("only manages PostgreSQL roles and databases it created", func() {
+			passwordOf := func(g Gomega, role string) string {
+				return query(g, `SELECT coalesce(rolpassword, '') FROM pg_authid WHERE rolname = '`+role+`'`)
+			}
+			roleComment := func(g Gomega, role string) string {
+				return query(g, `SELECT coalesce(shobj_description(oid, 'pg_authid'), '') FROM pg_roles WHERE rolname = '`+role+`'`)
+			}
+
+			By("leaving a DBA's existing role alone")
+			_, err := psql(`CREATE ROLE pol_dba_app LOGIN PASSWORD 'dba-secret'`)
+			Expect(err).NotTo(HaveOccurred())
+			var dbaPassword string
+			Eventually(func(g Gomega) { dbaPassword = passwordOf(g, "pol_dba_app") }).Should(Succeed())
 			Expect(apply(`
 apiVersion: pgop.ruck.io/v1alpha1
 kind: Role
@@ -279,19 +325,96 @@ metadata:
 spec:
   clusterRef:
     name: example-cluster
-  roleName: pol_adopt
+  roleName: pol_dba_app
 `)).To(Succeed())
-			expectReason(roleRes+"pol-adopt", "RolePolicyViolation", "does not take over", "pol_dba")
+			expectReason(roleRes+"pol-adopt", "RoleNotManaged", "COMMENT ON ROLE pol_dba_app IS 'pgop:v1:Role/pol-adopt'")
+			Consistently(func(g Gomega) { g.Expect(passwordOf(g, "pol_dba_app")).To(Equal(dbaPassword)) }, 20*time.Second, 2*time.Second).
+				Should(Succeed())
+			_, err = utils.Run(exec.Command("kubectl", "get", "secret", "example-cluster-pol-adopt-credentials", "-n", namespace))
+			Expect(err).To(HaveOccurred(), "the DBA's password must not be replaced and handed out")
+
+			By("refusing a superuser-member role even when it is handed over")
+			_, err = psql(`CREATE ROLE pol_adopt_su NOLOGIN IN ROLE pol_dba`)
+			Expect(err).NotTo(HaveOccurred())
+			_, err = psql(`COMMENT ON ROLE pol_adopt_su IS 'pgop:v1:Role/pol-adopt-su'`)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(apply(`
+apiVersion: pgop.ruck.io/v1alpha1
+kind: Role
+metadata:
+  name: pol-adopt-su
+spec:
+  clusterRef:
+    name: example-cluster
+  roleName: pol_adopt_su
+  login: false
+`)).To(Succeed())
+			expectReason(roleRes+"pol-adopt-su", "RolePolicyViolation", "does not take over", "pol_dba")
+
+			By("taking a role over once a superuser hands it over")
+			_, err = psql(`COMMENT ON ROLE pol_dba_app IS 'pgop:v1:Role/pol-adopt'`)
+			Expect(err).NotTo(HaveOccurred())
+			_, err = utils.Run(exec.Command("kubectl", "annotate", roleRes+"pol-adopt", "-n", namespace, "--overwrite", "pgop.ruck.io/nudge=1"))
+			Expect(err).NotTo(HaveOccurred())
+			waitReady(roleRes + "pol-adopt")
+			Eventually(func(g Gomega) { g.Expect(passwordOf(g, "pol_dba_app")).NotTo(Equal(dbaPassword)) }).Should(Succeed())
+
+			By("refusing a second Role with the same PostgreSQL name")
+			Expect(apply(`
+apiVersion: pgop.ruck.io/v1alpha1
+kind: Role
+metadata:
+  name: pol-dup
+spec:
+  clusterRef:
+    name: example-cluster
+  roleName: pol_dba_app
+`)).To(Succeed())
+			expectReason(roleRes+"pol-dup", "DuplicateRoleName", "pol-adopt")
+			_, err = utils.Run(exec.Command("kubectl", "delete", "-n", namespace, "--wait=true", "--timeout=2m", roleRes+"pol-dup"))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(psql(`SELECT count(*) FROM pg_roles WHERE rolname = 'pol_dba_app'`)).To(Equal("1"), "deleting the duplicate must not drop the role")
+
+			By("dropping the handed-over role with its Role, but not roles it never owned")
+			for _, res := range []string{roleRes + "pol-adopt", roleRes + "pol-adopt-su"} {
+				_, err = utils.Run(exec.Command("kubectl", "delete", "-n", namespace, "--wait=true", "--timeout=2m", res))
+				Expect(err).NotTo(HaveOccurred())
+			}
+			Expect(psql(`SELECT count(*) FROM pg_roles WHERE rolname IN ('pol_dba_app', 'pol_adopt_su')`)).To(Equal("1"))
+			Expect(psql(`SELECT count(*) FROM pg_roles WHERE rolname = 'pol_adopt_su'`)).To(Equal("1"))
+
+			By("marking a role an earlier pgop created without a marker (legacy)")
+			_, err = psql(`COMMENT ON ROLE pol_old IS NULL`)
+			Expect(err).NotTo(HaveOccurred())
+			_, err = utils.Run(exec.Command("kubectl", "patch", roleRes+"pol-old", "-n", namespace,
+				"--type=merge", "-p", `{"spec":{"connectionLimit":6}}`))
+			Expect(err).NotTo(HaveOccurred())
 			Eventually(func(g Gomega) {
-				// Not altered: still NOLOGIN, no password.
-				g.Expect(query(g, `SELECT rolcanlogin::text || ',' || (rolpassword IS NULL) FROM pg_authid WHERE rolname = 'pol_adopt'`)).
-					To(Equal("false,true"))
+				g.Expect(roleComment(g, "pol_old")).To(Equal("pgop:v1:Role/pol-old"))
+				g.Expect(query(g, `SELECT rolconnlimit FROM pg_roles WHERE rolname = 'pol_old'`)).To(Equal("6"))
 			}).Should(Succeed())
 
-			By("deleting the Role leaves the role it did not take over in place")
-			_, err = utils.Run(exec.Command("kubectl", "delete", "-n", namespace, "--wait=true", "--timeout=2m", roleRes+"pol-adopt"))
+			By("leaving a DBA's existing database alone")
+			_, err = psql(`CREATE DATABASE pol_dbaowned`)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(psql(`SELECT count(*) FROM pg_roles WHERE rolname = 'pol_adopt'`)).To(Equal("1"))
+			Expect(apply(`
+apiVersion: pgop.ruck.io/v1alpha1
+kind: Database
+metadata:
+  name: pol-dbaowned
+spec:
+  clusterRef:
+    name: example-cluster
+  databaseName: pol_dbaowned
+  owner: pol-old
+`)).To(Succeed())
+			expectReason(dbRes+"pol-dbaowned", "DatabaseNotManaged", "COMMENT ON DATABASE pol_dbaowned IS 'pgop:v1:Database/pol-dbaowned'")
+			Consistently(func(g Gomega) {
+				g.Expect(query(g, `SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname = 'pol_dbaowned'`)).NotTo(Equal("pol_old"))
+			}, 15*time.Second, 3*time.Second).Should(Succeed())
+			_, err = utils.Run(exec.Command("kubectl", "delete", "-n", namespace, "--wait=true", "--timeout=2m", dbRes+"pol-dbaowned"))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(psql(`SELECT count(*) FROM pg_database WHERE datname = 'pol_dbaowned'`)).To(Equal("1"), "a database pgop does not own is never dropped")
 		})
 
 		It("installs trusted extensions and untrusted ones only when the Cluster allows them", func() {
@@ -320,6 +443,29 @@ spec:
 				// although operator sessions pin search_path to pg_catalog.
 				g.Expect(extensions(g)).To(Equal("pg_trgm@public"))
 			}).Should(Succeed())
+
+			By("refusing a second Database with the same PostgreSQL name")
+			Expect(apply(`
+apiVersion: pgop.ruck.io/v1alpha1
+kind: Database
+metadata:
+  name: pol-db-dup
+spec:
+  clusterRef:
+    name: example-cluster
+  databaseName: pol_db
+`)).To(Succeed())
+			expectReason(dbRes+"pol-db-dup", "DuplicateDatabaseName", "pol-db")
+			_, err := utils.Run(exec.Command("kubectl", "delete", "-n", namespace, "--wait=true", "--timeout=2m", dbRes+"pol-db-dup"))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(psql(`SELECT count(*) FROM pg_database WHERE datname = 'pol_db'`)).To(Equal("1"), "deleting the duplicate must not drop the database")
+
+			By("hostile database defaults do not affect the operator's sessions")
+			for _, set := range []string{"default_transaction_read_only = on", "statement_timeout = 1",
+				"lock_timeout = 1", "idle_in_transaction_session_timeout = 1", "search_path = evil, public", "check_function_bodies = off"} {
+				_, err = psql(`ALTER DATABASE pol_db SET ` + set)
+				Expect(err).NotTo(HaveOccurred())
+			}
 
 			By("allowing file_fdw on the Cluster")
 			setPolicy(`{"allowedExtensions":["file_fdw"]}`)
