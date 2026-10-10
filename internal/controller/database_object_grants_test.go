@@ -536,6 +536,18 @@ var _ = Describe("Object grant helpers", func() {
 		}
 	})
 
+	It("picks skipped examples with distinct reasons first", func() {
+		st := &objectStats{examples: map[string]string{}}
+		for i := range 8 {
+			st.examples[fmt.Sprintf("a.ext%d()", i)] = "belongs to the extension x"
+		}
+		st.examples["z.definer()"] = "is a SECURITY DEFINER routine owned by the superuser s"
+		got := st.pickExamples()
+		Expect(got).To(HaveLen(maxSkippedExamples))
+		Expect(got[:2]).To(Equal([]string{"a.ext0() belongs to the extension x",
+			"z.definer() is a SECURITY DEFINER routine owned by the superuser s"}))
+	})
+
 	It("normalizes privileges per kind", func() {
 		Expect(normalizeObjectPrivileges(postgres.SchemaSequence, []string{"All"})).To(Equal(
 			[]string{postgres.PrivilegeSelect, postgres.PrivilegeUpdate, postgres.PrivilegeUsage}))

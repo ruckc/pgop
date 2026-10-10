@@ -232,6 +232,31 @@ func (s *objectStats) skip(identity, why string) {
 	}
 }
 
+// pickExamples returns up to maxSkippedExamples skipped objects with the
+// reason, one per distinct reason first (an extension's many members must
+// not hide a superuser's SECURITY DEFINER function), then the rest, each in
+// object order.
+func (s *objectStats) pickExamples() []string {
+	ids := slices.Sorted(maps.Keys(s.examples))
+	var out []string
+	picked := map[string]bool{}
+	reasons := map[string]bool{}
+	for _, pass := range []bool{true, false} {
+		for _, id := range ids {
+			if len(out) == maxSkippedExamples {
+				return out
+			}
+			why := s.examples[id]
+			if picked[id] || (pass && reasons[why]) {
+				continue
+			}
+			picked[id], reasons[why] = true, true
+			out = append(out, id+" "+why)
+		}
+	}
+	return out
+}
+
 // objectPlanner works out the desired object grants of one reconcile.
 type objectPlanner struct {
 	pg            objectGrantClient
@@ -519,12 +544,7 @@ func (p *objectPlanner) status() []postgresv1alpha1.ObjectGrantStatus {
 		st := p.stats[k]
 		s := postgresv1alpha1.ObjectGrantStatus{Schema: g.schema, Kind: g.kind.api,
 			Granted: int32(len(st.granted)), Skipped: int32(len(st.skipped))}
-		for _, id := range slices.Sorted(maps.Keys(st.examples)) {
-			if len(s.SkippedExamples) == maxSkippedExamples {
-				break
-			}
-			s.SkippedExamples = append(s.SkippedExamples, id+" "+st.examples[id])
-		}
+		s.SkippedExamples = st.pickExamples()
 		out = append(out, s)
 	}
 	slices.SortFunc(out, func(a, b postgresv1alpha1.ObjectGrantStatus) int {
