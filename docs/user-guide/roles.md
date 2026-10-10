@@ -365,11 +365,13 @@ spec:
   `postgresql.auto.conf`, which overrides the Cluster's `spec.parameters`.
 - On a server older than PostgreSQL 15 the Role reports `Available=False` with
   reason `UnsupportedServerVersion`; nothing is granted.
-- pgop records what it granted in `status.managedParameterGrants`. Removing a
-  parameter (or turning `withGrantOption` off) revokes what pgop granted;
-  privileges granted outside pgop are never revoked. A revoke of privileges
-  granted with `withGrantOption` uses `CASCADE`, so grants the role passed on
-  are revoked too.
+- pgop grants only what the role does not hold yet and records only that (and
+  the grant options it added) in `status.managedParameterGrants`. Removing a
+  parameter (or turning `withGrantOption` off) revokes exactly that;
+  privileges the role already held, for example granted by hand, are never
+  revoked. Revoking a grant option pgop added uses `CASCADE`, so grants the
+  role passed on are revoked too (see
+  [Databases: what pgop tracks](databases.md#what-pgop-tracks)).
 - Only parameters whose `pg_settings.context` is `superuser` (the point of
   the feature) or `user`, and custom placeholders the server does not know,
   are granted. Other contexts are refused with `ParameterNotAllowed` (and a
@@ -520,7 +522,7 @@ all with `CASCADE` (privileges the role passed on go with it, as with
 `ALTER DATABASE ... WITH ALLOW_CONNECTIONS false`, which also locks out
 superusers) or cannot be reached is skipped instead of holding the deletion
 up; if privileges there still block `DROP ROLE`, the `RoleDropBlocked`
-condition names the database. Databases whose `grants` list the role stop granting to it while
+condition names the database. Databases whose `grants` or `schemas[].grants` list the role stop granting to it while
 it is being deleted, so they do not undo this.
 
 Anything else that depends on the role, such as objects it owns or privileges
@@ -587,7 +589,7 @@ all of them form one trust domain for the Cluster.
 |-----|-----|--------|
 | **Cluster editors** | Everything pgop offers, including widening `spec.rolePolicy`: privileged attributes, predefined roles, memberships in existing roles, untrusted extensions, custom setting namespaces, and **taking over existing roles and databases** (`adoptableRoles`, `adoptableDatabases`). Cluster editors are trusted with the whole server. | — |
 | **Role writers** | Create non-superuser roles with `login`, `createDB`, `inherit`, `connectionLimit`, passwords, parameter grants (with a denylist), role settings (user-context parameters, and placeholders in namespaces the Cluster allows), and memberships in roles that pass the [membership policy](#membership-policy). Read the other Secrets of the namespace via `passwordSecretRef`. | Create superusers (the field no longer exists; roles are always `NOSUPERUSER`). Read pgop's own Secrets (the Cluster's superuser credentials, TLS keys) through `passwordSecretRef`. Get `createRole`, `replication` or `bypassRLS`, or membership in predefined `pg_*` roles, unless the Cluster allows it. Become a member of a superuser, `postgres`, `pgop_*` or the server-file roles, or of any role that leads to them. Take over, reset the password of, or drop an existing role pgop did not create for them, whatever its comment says, unless a Cluster editor allowlists it (`RoleNotManaged`); reuse another Role's PostgreSQL name (`DuplicateRoleName`). Join roles that no Role of the Cluster manages unless the Cluster lists them. Grant `SET` on parameters that are not `user`/`superuser` context or on the denylist. Set role defaults (`settings`, `databaseSettings`) other than `user`-context parameters or placeholders in namespaces the Cluster lists, or on any role but their own. Use the `pgop_` prefix, `pg_` prefix or `postgres` as role names. |
-| **Database writers** | Everything inside *their* database: owner, schemas, grants, settings (user-context parameters, and placeholders in namespaces the Cluster allows), trusted extensions (see [Databases: security model](databases.md#security-model)). | Take over or drop a database pgop did not create for them (`DatabaseNotManaged`, `DuplicateDatabaseName`). Install untrusted extensions unless the Cluster lists them. Manage the `postgres`, `template0` or `template1` databases or system schemas (`pg_*`, `information_schema`). Change the operator's session settings (`search_path`, `role`, timeouts, read-only) with `ALTER DATABASE ... SET`. |
+| **Database writers** | Everything inside *their* database: owner, schemas, grants (to `PUBLIC` and to roles the Cluster's Roles manage), revoking `PUBLIC`'s defaults, settings (user-context parameters, and placeholders in namespaces the Cluster allows), trusted extensions (see [Databases: security model](databases.md#security-model)). | Take over or drop a database pgop did not create for them (`DatabaseNotManaged`, `DuplicateDatabaseName`). Grant on objects of other databases or Clusters, or grant to superusers, `postgres`, `pgop_*`, `pg_*` or roles no Role of the Cluster manages unless the Cluster lists them (`GranteeNotAllowed`). Take over or grant on existing schemas they neither created nor own (`SchemaNotManaged`). Install untrusted extensions unless the Cluster lists them. Manage the `postgres`, `template0` or `template1` databases or system schemas (`pg_*`, `information_schema`). Change the operator's session settings (`search_path`, `role`, timeouts, read-only) with `ALTER DATABASE ... SET`. |
 
 Because the policy lives on the **Cluster**, granting someone RBAC to create
 Roles (or Databases) no longer makes them superuser-equivalent: widening what

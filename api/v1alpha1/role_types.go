@@ -315,12 +315,23 @@ type ManagedParameterGrant struct {
 	// parameter is the parameter name, normalized to lowercase.
 	Parameter string `json:"parameter"`
 
-	// privileges are the granted privileges.
+	// privileges are the privileges pgop added: those the role did not hold
+	// before pgop granted them. Only these are revoked once they leave the
+	// spec.
+	// +optional
 	// +listType=set
-	Privileges []string `json:"privileges"`
+	Privileges []string `json:"privileges,omitempty"`
 
-	// withGrantOption records whether pgop granted the privileges with the
-	// grant option.
+	// grantOptions are the privileges whose grant option pgop added (the
+	// grantee could not grant them on before). Revoking them cascades to
+	// what the grantee passed on.
+	// +optional
+	// +listType=set
+	GrantOptions []string `json:"grantOptions,omitempty"`
+
+	// withGrantOption is deprecated and no longer written: pgop v0.15 recorded
+	// with it that all privileges were granted with the grant option. A
+	// ledger that still has it is read as grantOptions = privileges.
 	// +optional
 	WithGrantOption bool `json:"withGrantOption,omitempty"`
 }
@@ -371,6 +382,7 @@ type RoleStatus struct {
 	// the spec.
 	// +optional
 	// +listType=set
+	// +kubebuilder:validation:MaxItems=1024
 	ManagedMemberships []string `json:"managedMemberships,omitempty"`
 
 	// managedParameterGrants lists the parameter privileges pgop has granted
@@ -379,6 +391,7 @@ type RoleStatus struct {
 	// +optional
 	// +listType=map
 	// +listMapKey=parameter
+	// +kubebuilder:validation:MaxItems=512
 	ManagedParameterGrants []ManagedParameterGrant `json:"managedParameterGrants,omitempty"`
 
 	// managedSettings lists the parameter names pgop has set with ALTER ROLE

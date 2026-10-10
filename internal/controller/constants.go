@@ -152,6 +152,34 @@ const (
 	// ReasonDuplicateDatabaseName: an older Database of the same Cluster
 	// resolves to the same PostgreSQL database name.
 	ReasonDuplicateDatabaseName = "DuplicateDatabaseName"
+	// ReasonGranteeNotAllowed: Database.spec.grants or schemas[].grants names
+	// a grantee the policy does not allow (not managed by a Role of the
+	// Cluster nor listed in rolePolicy.allowedExistingRoles, a superuser, or
+	// a reserved role). Grants to it are not applied; managed ones are
+	// revoked. The other grants are still applied.
+	ReasonGranteeNotAllowed = "GranteeNotAllowed"
+	// ReasonPublicPrivilegeConflict: Database.spec.publicPrivileges revokes a
+	// privilege from PUBLIC that spec.grants or schemas[public].grants grant
+	// to PUBLIC. That PUBLIC privilege is left as it is.
+	ReasonPublicPrivilegeConflict = "PublicPrivilegeConflict"
+	// ReasonPublicPrivilegeStillHeld: Database.spec.publicPrivileges revokes
+	// a privilege that PUBLIC still holds from a grantor other than the
+	// object's owner (a role with the grant option), which pgop's REVOKE,
+	// issued as the owner, does not remove.
+	ReasonPublicPrivilegeStillHeld = "PublicPrivilegeStillHeld"
+	// ReasonTooManyGrants: the grants declared, together with those pgop
+	// still tracks, exceed what the status ledger can hold. Nothing of that
+	// kind is granted or revoked until grants are removed from the spec.
+	ReasonTooManyGrants = "TooManyGrants"
+	// ReasonRevokeSkipped: a privilege pgop granted could not be revoked
+	// without CASCADE because the grantee passed it on with a grant option
+	// pgop did not give. pgop does not cascade into that; it stops tracking
+	// the privilege and reports it once.
+	ReasonRevokeSkipped = "RevokeSkipped"
+	// ReasonSchemaNotManaged: Database.spec.schemas names an existing schema
+	// the Database neither created nor owns (for example one an extension or
+	// another role created). pgop does not change its owner or its grants.
+	ReasonSchemaNotManaged = "SchemaNotManaged"
 
 	DefaultPostgresImage    = "postgres:18"
 	DefaultOperatorUsername = "pgop_operator"

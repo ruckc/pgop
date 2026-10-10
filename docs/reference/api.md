@@ -75,7 +75,8 @@ spec:
     allowedPredefinedRoles:
       - string
     # Roles not managed by a Role of this Cluster (created by a DBA or a
-    # bootstrap Job) that Roles may be members of (max 256; not postgres,
+    # bootstrap Job) that Roles may be members of and Databases may grant
+    # privileges to (max 256; not postgres,
     # pg_* or pgop_*).
     allowedExistingRoles:
       - string
@@ -340,24 +341,42 @@ spec:
       schema: string       # Optional schema (default: control file schema, else public)
       version: string      # Optional version (default: the default version)
 
-  # Schemas to create
+  # Schemas to create (max 64, each name at most once)
   schemas:
     - name: string         # Schema name (not pg_* or information_schema)
       owner: string        # Schema owner
+      # Schema privileges (GRANT ... ON SCHEMA), max 16, each role at most
+      # once. Tracked in status.managedSchemaGrants: pgop-granted privileges
+      # removed from the spec (or whose schema entry is removed) are revoked,
+      # with CASCADE when they were granted WITH GRANT OPTION.
       grants:
-        - role: string     # PostgreSQL role to grant to
+        - role: string     # Grantee (same rules as grants[].role below)
           privileges:
             - string       # USAGE, CREATE, ALL or ALL PRIVILEGES (any case; max 8)
-          withGrantOption: boolean
+          withGrantOption: boolean   # not allowed for PUBLIC
 
   # Database-level privileges (GRANT ... ON DATABASE). pgop-granted
   # privileges removed from the spec are revoked (with CASCADE when they were
   # granted WITH GRANT OPTION).
   grants:                  # max 256, each role at most once
-    - role: string         # PostgreSQL role name (must exist)
+    - role: string         # Grantee: PUBLIC (upper case), a role managed by a
+                           # Role of this Cluster, or one listed in the
+                           # Cluster's rolePolicy.allowedExistingRoles (must
+                           # exist). Never postgres, none, pgop_*, pg_* or a
+                           # superuser (reason GranteeNotAllowed). Max 63 chars.
       privileges:
         - string           # CONNECT, CREATE, TEMPORARY, TEMP or ALL
-      withGrantOption: boolean
+      withGrantOption: boolean   # not allowed for PUBLIC
+
+  # Revoke PostgreSQL's default PUBLIC privileges. false revokes; unset or
+  # true leaves (or restores) the default. What pgop revoked is recorded in
+  # status.revokedPublicPrivileges and granted back once no longer requested.
+  # Must not contradict a PUBLIC entry in grants or schemas[public].grants.
+  publicPrivileges:
+    connect: boolean             # CONNECT on the database
+    temporary: boolean           # TEMPORARY on the database
+    publicSchemaUsage: boolean   # USAGE on the schema public
+    publicSchemaCreate: boolean  # CREATE on the schema public (PostgreSQL < 15 default)
 
   # Per-database parameter defaults (ALTER DATABASE ... SET name TO 'value').
   # Keys: parameter names (identifiers, optionally dotted, max 127 chars).
@@ -376,8 +395,16 @@ spec:
 
 The `Available` condition is `False` with reason `SettingNotAllowed` when a
 setting is refused, `ExtensionNotAllowed` when an extension is refused,
-`SchemaNotAllowed` for a system schema (the other settings, grants,
-extensions and schemas are still reconciled), `ReservedName` for a reserved
+`SchemaNotAllowed` for a system schema, `GranteeNotAllowed` when a grantee
+in `grants` or `schemas[].grants` is not allowed (grants to it are not
+applied, and revoked if pgop granted them), `PublicPrivilegeConflict` when
+`publicPrivileges` revokes what a `PUBLIC` grant grants, `TooManyGrants` when
+the declared grants plus those pgop still tracks exceed the status ledger,
+`RevokeSkipped` (reported once) when a revoke was blocked by dependent
+privileges pgop did not enable, `PublicPrivilegeStillHeld` when PUBLIC keeps a
+revoked privilege from another grantor, `SchemaNotManaged` for an existing schema the
+Database neither created nor owns (in all these cases the other
+settings, grants, extensions and schemas are still reconciled), `ReservedName` for a reserved
 database name, `DatabaseNotManaged` when the database exists but the Database neither
 created it (`status.databaseName`) nor may adopt it (the Cluster's
 `rolePolicy.adoptableDatabases`), `DatabaseNotConnectable` when
@@ -395,11 +422,21 @@ status:
   installedExtensions:
     - string               # List of installed extension names
   createdSchemas:
-    - string               # List of created schema names
-  managedGrants:           # Database privileges pgop granted (revoked when removed)
-    - role: string
+    - string               # Schemas the Database manages (created, or owned by the declared/database owner)
+  # Ledgers record only what pgop added (privileges the grantee did not hold,
+  # grant options it did not have); only these are revoked when removed.
+  managedGrants:           # max 512
+    - role: string         # Role name or PUBLIC
       privileges: [string] # Normalized: CONNECT, CREATE, TEMPORARY
-      withGrantOption: boolean
+      grantOptions: [string]   # Privileges whose grant option pgop added
+      withGrantOption: boolean # Deprecated (v0.15 ledgers), read as grantOptions = privileges; no longer written
+  managedSchemaGrants:     # max 2048
+    - schema: string
+      role: string         # Role name or PUBLIC
+      privileges: [string] # Normalized: CREATE, USAGE
+      grantOptions: [string]
+  revokedPublicPrivileges: # Default PUBLIC privileges pgop revoked (granted back when no longer requested)
+    - string               # connect, temporary, publicSchemaUsage, publicSchemaCreate
   managedSettings:         # Lowercased parameter names pgop set (reset when removed)
     - string
   conditions:

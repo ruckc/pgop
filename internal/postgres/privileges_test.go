@@ -39,6 +39,111 @@ var injectionPrivileges = []string{
 	"USAGE,CREATE",
 }
 
+// testPublic is the lower-case spelling of PUBLIC (and the schema public).
+const testPublic = "public"
+
+func schemaGrantQuery(schema, role string, privs []string, wgo bool) (string, error) {
+	return buildGrantPrivilegesQuery(PrivilegeObject{Kind: ObjectSchema, Name: schema}, role, privs, wgo)
+}
+
+func databaseGrantQuery(db, role string, privs []string, wgo bool) (string, error) {
+	return buildGrantPrivilegesQuery(PrivilegeObject{Kind: ObjectDatabase, Name: db}, role, privs, wgo)
+}
+
+func databaseRevokeQuery(db, role string, privs []string, mode RevokeMode) (string, error) {
+	return buildRevokePrivilegesQuery(PrivilegeObject{Kind: ObjectDatabase, Name: db}, role, privs, mode)
+}
+
+func parameterGrantQuery(param, role string, privs []string, wgo bool) (string, error) {
+	return buildGrantPrivilegesQuery(PrivilegeObject{Kind: ObjectParameter, Name: param}, role, privs, wgo)
+}
+
+func parameterRevokeQuery(param, role string, privs []string, mode RevokeMode) (string, error) {
+	return buildRevokePrivilegesQuery(PrivilegeObject{Kind: ObjectParameter, Name: param}, role, privs, mode)
+}
+
+func TestPublicGrantee(t *testing.T) {
+	// Every spelling of public is the PUBLIC keyword, never a quoted
+	// identifier: "PUBLIC" (quoted) would name an ordinary role.
+	for _, g := range []string{"PUBLIC", testPublic, "Public", "pUbLiC"} {
+		got, err := databaseGrantQuery("app_db", g, []string{PrivilegeConnect}, false)
+		if err != nil {
+			t.Fatalf("%s: %v", g, err)
+		}
+		if want := `GRANT CONNECT ON DATABASE "app_db" TO PUBLIC`; got != want {
+			t.Errorf("%s: got %q, want %q", g, got, want)
+		}
+		got, err = buildRevokePrivilegesQuery(PrivilegeObject{Kind: ObjectSchema, Name: testPublic}, g,
+			[]string{PrivilegeCreate, PrivilegeUsage}, RevokeMode{})
+		if err != nil {
+			t.Fatalf("%s: %v", g, err)
+		}
+		if want := `REVOKE CREATE, USAGE ON SCHEMA "public" FROM PUBLIC`; got != want {
+			t.Errorf("%s: got %q, want %q", g, got, want)
+		}
+		if CanonicalGrantee(g) != PublicGrantee {
+			t.Errorf("CanonicalGrantee(%q) = %q", g, CanonicalGrantee(g))
+		}
+	}
+	// Names that merely contain public are ordinary, quoted roles.
+	for _, g := range []string{"public_reader", " public", "public ", `"public"`, "publicx"} {
+		got, err := databaseGrantQuery("d", g, []string{PrivilegeConnect}, false)
+		if err != nil {
+			t.Fatalf("%q: %v", g, err)
+		}
+		if want := `GRANT CONNECT ON DATABASE "d" TO ` + quoteIdent(g); got != want {
+			t.Errorf("%q: got %q, want %q", g, got, want)
+		}
+		if IsPublic(g) {
+			t.Errorf("IsPublic(%q) = true", g)
+		}
+	}
+	if _, err := databaseGrantQuery("d", testPublic, []string{PrivilegeConnect}, true); err == nil {
+		t.Error("granted the grant option to PUBLIC")
+	}
+	for _, g := range []string{"", "none", "NONE"} {
+		if _, err := databaseGrantQuery("d", g, []string{PrivilegeConnect}, false); err == nil {
+			t.Errorf("accepted grantee %q", g)
+		}
+	}
+}
+
+func TestGranteeAndObjectInjection(t *testing.T) {
+	hostile := []string{`x" TO PUBLIC; DROP DATABASE postgres; --`, `PUBLIC; DROP ROLE x`, `public"`, "a\x00b"}
+	for _, h := range hostile {
+		got, err := databaseGrantQuery(h, h, []string{PrivilegeConnect}, false)
+		if err != nil {
+			t.Fatalf("%q: %v", h, err)
+		}
+		want := `GRANT CONNECT ON DATABASE ` + quoteIdent(h) + ` TO ` + quoteIdent(h)
+		if got != want {
+			t.Errorf("%q: got %q, want %q", h, got, want)
+		}
+	}
+	if _, err := buildGrantPrivilegesQuery(PrivilegeObject{Kind: "TABLE", Name: "t"}, "r", []string{"SELECT"}, false); err == nil {
+		t.Error("accepted an unsupported object kind")
+	}
+	if _, err := schemaGrantQuery("", "r", []string{PrivilegeUsage}, false); err == nil {
+		t.Error("accepted an empty schema name")
+	}
+}
+
+func TestNormalizeSchemaPrivileges(t *testing.T) {
+	got, err := NormalizeSchemaPrivileges([]string{" Usage", privilegeAllPrivileges, "Create"})
+	if err != nil || !slices.Equal(got, []string{PrivilegeCreate, PrivilegeUsage}) {
+		t.Errorf("got %v, %v", got, err)
+	}
+	got, err = NormalizeSchemaPrivileges([]string{"USAGE "})
+	if err != nil || !slices.Equal(got, []string{PrivilegeUsage}) {
+		t.Errorf("got %v, %v", got, err)
+	}
+	for _, p := range injectionPrivileges {
+		if _, err := NormalizeSchemaPrivileges([]string{p}); err == nil {
+			t.Errorf("accepted %q", p)
+		}
+	}
+}
+
 func TestBuildGrantSchemaPrivilegesQuery(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -58,7 +163,7 @@ func TestBuildGrantSchemaPrivilegesQuery(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := buildGrantSchemaPrivilegesQuery(tt.schema, tt.role, tt.privs, tt.wgo)
+			got, err := schemaGrantQuery(tt.schema, tt.role, tt.privs, tt.wgo)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -72,61 +177,61 @@ func TestBuildGrantSchemaPrivilegesQuery(t *testing.T) {
 func TestPrivilegeBuildersRejectInjection(t *testing.T) {
 	for _, p := range injectionPrivileges {
 		privs := []string{p}
-		if _, err := buildGrantSchemaPrivilegesQuery("s", "r", privs, false); err == nil {
+		if _, err := schemaGrantQuery("s", "r", privs, false); err == nil {
 			t.Errorf("schema grant accepted privilege %q", p)
 		}
-		if _, err := buildGrantDatabasePrivilegesQuery("d", "r", privs, false); err == nil {
+		if _, err := databaseGrantQuery("d", "r", privs, false); err == nil {
 			t.Errorf("database grant accepted privilege %q", p)
 		}
-		if _, err := buildRevokeDatabasePrivilegesQuery("d", "r", privs, RevokeMode{}); err == nil {
+		if _, err := databaseRevokeQuery("d", "r", privs, RevokeMode{}); err == nil {
 			t.Errorf("database revoke accepted privilege %q", p)
 		}
-		if _, err := buildGrantParameterQuery("work_mem", "r", privs, false); err == nil {
+		if _, err := parameterGrantQuery("work_mem", "r", privs, false); err == nil {
 			t.Errorf("parameter grant accepted privilege %q", p)
 		}
-		if _, err := buildRevokeParameterQuery("work_mem", "r", privs, RevokeMode{}); err == nil {
+		if _, err := parameterRevokeQuery("work_mem", "r", privs, RevokeMode{}); err == nil {
 			t.Errorf("parameter revoke accepted privilege %q", p)
 		}
 		// A valid privilege next to a hostile one must not slip through.
-		if _, err := buildGrantSchemaPrivilegesQuery("s", "r", []string{PrivilegeUsage, p}, false); err == nil {
+		if _, err := schemaGrantQuery("s", "r", []string{PrivilegeUsage, p}, false); err == nil {
 			t.Errorf("schema grant accepted privilege list with %q", p)
 		}
 	}
-	if _, err := buildGrantSchemaPrivilegesQuery("s", "r", nil, false); err == nil {
+	if _, err := schemaGrantQuery("s", "r", nil, false); err == nil {
 		t.Error("schema grant accepted empty privileges")
 	}
 	// Privileges valid for one object type are not valid for another.
-	if _, err := buildGrantSchemaPrivilegesQuery("s", "r", []string{PrivilegeConnect}, false); err == nil {
+	if _, err := schemaGrantQuery("s", "r", []string{PrivilegeConnect}, false); err == nil {
 		t.Error("schema grant accepted CONNECT")
 	}
-	if _, err := buildGrantDatabasePrivilegesQuery("d", "r", []string{PrivilegeUsage}, false); err == nil {
+	if _, err := databaseGrantQuery("d", "r", []string{PrivilegeUsage}, false); err == nil {
 		t.Error("database grant accepted USAGE")
 	}
 }
 
 func TestBuildDatabasePrivilegeQueries(t *testing.T) {
-	got, err := buildGrantDatabasePrivilegesQuery("app_db", testMember, []string{PrivilegeConnect, "temp"}, false)
+	got, err := databaseGrantQuery("app_db", testMember, []string{PrivilegeConnect, "temp"}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if want := `GRANT CONNECT, TEMP ON DATABASE "app_db" TO "app"`; got != want {
 		t.Errorf("grant: got %q, want %q", got, want)
 	}
-	got, err = buildGrantDatabasePrivilegesQuery(`d"b`, `r"x`, []string{PrivilegeAll}, true)
+	got, err = databaseGrantQuery(`d"b`, `r"x`, []string{PrivilegeAll}, true)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if want := `GRANT ALL ON DATABASE "d""b" TO "r""x" WITH GRANT OPTION`; got != want {
 		t.Errorf("grant: got %q, want %q", got, want)
 	}
-	got, err = buildRevokeDatabasePrivilegesQuery("app_db", testMember, []string{PrivilegeCreate, PrivilegeTemporary}, RevokeMode{Cascade: true})
+	got, err = databaseRevokeQuery("app_db", testMember, []string{PrivilegeCreate, PrivilegeTemporary}, RevokeMode{Cascade: true})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if want := `REVOKE CREATE, TEMPORARY ON DATABASE "app_db" FROM "app" CASCADE`; got != want {
 		t.Errorf("revoke: got %q, want %q", got, want)
 	}
-	got, err = buildRevokeDatabasePrivilegesQuery("app_db", testMember, []string{PrivilegeConnect}, RevokeMode{GrantOptionOnly: true, Cascade: true})
+	got, err = databaseRevokeQuery("app_db", testMember, []string{PrivilegeConnect}, RevokeMode{GrantOptionOnly: true, Cascade: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -217,35 +322,35 @@ func TestParameterNames(t *testing.T) {
 		if _, err := buildAlterRoleResetQuery("r", "d", in); err == nil {
 			t.Errorf("role reset %q: expected error", in)
 		}
-		if _, err := buildGrantParameterQuery(in, "r", []string{PrivilegeSet}, false); err == nil {
+		if _, err := parameterGrantQuery(in, "r", []string{PrivilegeSet}, false); err == nil {
 			t.Errorf("grant on %q: expected error", in)
 		}
 	}
 }
 
 func TestBuildParameterQueries(t *testing.T) {
-	got, err := buildGrantParameterQuery("log_statement", "auditor", []string{PrivilegeSet}, false)
+	got, err := parameterGrantQuery("log_statement", "auditor", []string{PrivilegeSet}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if want := `GRANT SET ON PARAMETER "log_statement" TO "auditor"`; got != want {
 		t.Errorf("got %q, want %q", got, want)
 	}
-	got, err = buildGrantParameterQuery("MyApp.Tenant", `a"b`, []string{"set"}, true)
+	got, err = parameterGrantQuery("MyApp.Tenant", `a"b`, []string{"set"}, true)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if want := `GRANT SET ON PARAMETER "myapp"."tenant" TO "a""b" WITH GRANT OPTION`; got != want {
 		t.Errorf("got %q, want %q", got, want)
 	}
-	got, err = buildRevokeParameterQuery("log_statement", "auditor", []string{PrivilegeSet}, RevokeMode{GrantOptionOnly: true})
+	got, err = parameterRevokeQuery("log_statement", "auditor", []string{PrivilegeSet}, RevokeMode{GrantOptionOnly: true})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if want := `REVOKE GRANT OPTION FOR SET ON PARAMETER "log_statement" FROM "auditor"`; got != want {
 		t.Errorf("got %q, want %q", got, want)
 	}
-	got, err = buildRevokeParameterQuery("log_statement", "auditor", []string{PrivilegeSet}, RevokeMode{})
+	got, err = parameterRevokeQuery("log_statement", "auditor", []string{PrivilegeSet}, RevokeMode{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -362,7 +467,7 @@ func TestBuildAlterRoleQueries(t *testing.T) {
 }
 
 func TestAllPrivilegesAndCase(t *testing.T) {
-	got, err := buildGrantSchemaPrivilegesQuery("s", "r", []string{"all  privileges", "usage"}, false)
+	got, err := schemaGrantQuery("s", "r", []string{"all  privileges", "usage"}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -373,7 +478,7 @@ func TestAllPrivilegesAndCase(t *testing.T) {
 	if err != nil || !slices.Equal(privs, []string{PrivilegeConnect, PrivilegeCreate, PrivilegeTemporary}) {
 		t.Errorf("got %v, %v", privs, err)
 	}
-	if _, err := NormalizeParameterPrivileges([]string{"ALL PRIVILEGES"}); err == nil {
+	if _, err := NormalizeParameterPrivileges([]string{privilegeAllPrivileges}); err == nil {
 		t.Error("parameter grant accepted ALL PRIVILEGES")
 	}
 }

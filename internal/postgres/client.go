@@ -277,9 +277,10 @@ type RoleOptions struct {
 var ErrObjectExists = errors.New("the object already exists")
 
 // duplicateObjectError wraps err in ErrObjectExists when it is PostgreSQL's
-// duplicate_object (42710, roles) or duplicate_database (42P04) error.
+// duplicate_object (42710, roles), duplicate_database (42P04) or
+// duplicate_schema (42P06) error.
 func duplicateObjectError(what string, err error) error {
-	if pqErr, ok := errors.AsType[*pq.Error](err); ok && (pqErr.Code == "42710" || pqErr.Code == "42P04") {
+	if pqErr, ok := errors.AsType[*pq.Error](err); ok && (pqErr.Code == "42710" || pqErr.Code == "42P04" || pqErr.Code == "42P06") {
 		return fmt.Errorf("%s: %w", what, ErrObjectExists)
 	}
 	return nil
@@ -539,6 +540,22 @@ type ReachableRole struct {
 	CreateRole  bool
 	Replication bool
 	BypassRLS   bool
+}
+
+// LookupRole returns the role name with its comment and privileged
+// attributes (Via is ""), or nil when the role does not exist.
+func (c *Client) LookupRole(ctx context.Context, name string) (*ReachableRole, error) {
+	const query = `SELECT r.rolname, COALESCE(pg_catalog.shobj_description(r.oid, 'pg_authid'), ''), r.rolsuper, r.rolcreaterole, r.rolreplication, r.rolbypassrls
+FROM pg_catalog.pg_roles r WHERE r.rolname = $1`
+	var r ReachableRole
+	err := c.db.QueryRowContext(ctx, query, name).Scan(&r.Name, &r.Comment, &r.Superuser, &r.CreateRole, &r.Replication, &r.BypassRLS)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to look up role %q: %w", name, err)
+	}
+	return &r, nil
 }
 
 // MembershipClosure returns the role name itself (Via "") followed by every
@@ -830,50 +847,65 @@ func (c *Client) CreateExtension(ctx context.Context, name, schema, version stri
 	return nil
 }
 
-// CreateSchema creates a schema in the current database
-func (c *Client) CreateSchema(ctx context.Context, name, owner string) error {
-	// Check if schema exists
-	var exists bool
-	err := c.db.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM information_schema.schemata WHERE schema_name = $1)", name).Scan(&exists)
+// SchemaInfo describes an existing schema.
+type SchemaInfo struct {
+	// Owner is the name of the schema's owner.
+	Owner string
+	// OwnerIsBootstrap reports whether the owner is the bootstrap superuser
+	// (OID 10), which owns the schema public of databases created before
+	// PostgreSQL 15.
+	OwnerIsBootstrap bool
+}
+
+// SchemaOwner returns the owner of a schema in the current database, and
+// whether the schema exists.
+func (c *Client) SchemaOwner(ctx context.Context, name string) (info SchemaInfo, exists bool, err error) {
+	err = c.db.QueryRowContext(ctx,
+		"SELECT pg_catalog.pg_get_userbyid(nspowner), nspowner = 10 FROM pg_catalog.pg_namespace WHERE nspname = $1",
+		name).Scan(&info.Owner, &info.OwnerIsBootstrap)
+	if errors.Is(err, sql.ErrNoRows) {
+		return SchemaInfo{}, false, nil
+	}
 	if err != nil {
-		return fmt.Errorf("failed to check schema existence: %w", err)
+		return SchemaInfo{}, false, fmt.Errorf("failed to look up schema %q: %w", name, err)
 	}
+	return info, true, nil
+}
 
-	if exists {
-		if owner != "" {
-			query := fmt.Sprintf("ALTER SCHEMA %s OWNER TO %s", quoteIdent(name), quoteIdent(owner))
-			_, err = c.db.ExecContext(ctx, query)
-			if err != nil {
-				return fmt.Errorf("failed to alter schema owner: %w", err)
-			}
-		}
-		return nil
+// CurrentDatabaseOwner returns the owner of the database the client is
+// connected to.
+func (c *Client) CurrentDatabaseOwner(ctx context.Context) (string, error) {
+	var owner string
+	err := c.db.QueryRowContext(ctx,
+		"SELECT pg_catalog.pg_get_userbyid(datdba) FROM pg_catalog.pg_database WHERE datname = pg_catalog.current_database()").Scan(&owner)
+	if err != nil {
+		return "", fmt.Errorf("failed to look up the database owner: %w", err)
 	}
+	return owner, nil
+}
 
+// CreateSchema creates a schema in the current database, owned by owner
+// (the session user when empty). It fails with ErrObjectExists when the
+// schema exists.
+func (c *Client) CreateSchema(ctx context.Context, name, owner string) error {
 	query := fmt.Sprintf("CREATE SCHEMA %s", quoteIdent(name))
 	if owner != "" {
 		query += fmt.Sprintf(" AUTHORIZATION %s", quoteIdent(owner))
 	}
-
-	_, err = c.db.ExecContext(ctx, query)
-	if err != nil {
+	if _, err := c.db.ExecContext(ctx, query); err != nil {
+		if dup := duplicateObjectError(fmt.Sprintf("schema %q", name), err); dup != nil {
+			return dup
+		}
 		return fmt.Errorf("failed to create schema: %w", err)
 	}
 	return nil
 }
 
-// GrantSchemaPrivileges grants privileges on a schema to a role. The
-// privileges are checked against the schema allow-list (USAGE, CREATE, ALL)
-// before any SQL is built, since they cannot be passed as bind parameters.
-func (c *Client) GrantSchemaPrivileges(ctx context.Context, schema, role string, privileges []string, withGrantOption bool) error {
-	query, err := buildGrantSchemaPrivilegesQuery(schema, role, privileges, withGrantOption)
-	if err != nil {
-		return err
-	}
-
-	_, err = c.db.ExecContext(ctx, query)
-	if err != nil {
-		return fmt.Errorf("failed to grant schema privileges: %w", err)
+// AlterSchemaOwner changes the owner of a schema in the current database.
+func (c *Client) AlterSchemaOwner(ctx context.Context, name, owner string) error {
+	query := fmt.Sprintf("ALTER SCHEMA %s OWNER TO %s", quoteIdent(name), quoteIdent(owner))
+	if _, err := c.db.ExecContext(ctx, query); err != nil {
+		return fmt.Errorf("failed to alter schema owner: %w", err)
 	}
 	return nil
 }

@@ -58,7 +58,7 @@ WHERE a.grantee = (SELECT oid FROM pg_roles WHERE rolname = $1)`, role)
 		return fmt.Errorf("failed to list database privileges of %q: %w", role, err)
 	}
 	for _, db := range dbs {
-		query := buildRevokeQuery([]string{PrivilegeAll}, "DATABASE "+quoteIdent(db), role, RevokeMode{Cascade: true})
+		query := buildRevokeQuery([]string{PrivilegeAll}, "DATABASE "+quoteIdent(db), quoteIdent(role), RevokeMode{Cascade: true})
 		if _, err := c.db.ExecContext(ctx, query); err != nil {
 			return fmt.Errorf("failed to revoke privileges on database %q from %q: %w", db, role, err)
 		}
@@ -111,7 +111,7 @@ WHERE a.grantee = (SELECT oid FROM pg_roles WHERE rolname = $1)`, role)
 		return fmt.Errorf("failed to list schema privileges of %q: %w", role, err)
 	}
 	for _, s := range schemas {
-		query := buildRevokeQuery([]string{PrivilegeAll}, "SCHEMA "+quoteIdent(s), role, RevokeMode{Cascade: true})
+		query := buildRevokeQuery([]string{PrivilegeAll}, "SCHEMA "+quoteIdent(s), quoteIdent(role), RevokeMode{Cascade: true})
 		if _, err := c.db.ExecContext(ctx, query); err != nil {
 			return fmt.Errorf("failed to revoke privileges on schema %q from %q: %w", s, role, err)
 		}

@@ -540,6 +540,7 @@ spec:
                   the spec.
                 items:
                   type: string
+                maxItems: 1024
                 type: array
                 x-kubernetes-list-type: set
               managedParameterGrants:
@@ -552,25 +553,38 @@ spec:
                     ManagedParameterGrant records privileges on a configuration parameter that
                     pgop granted to the role.
                   properties:
+                    grantOptions:
+                      description: |-
+                        grantOptions are the privileges whose grant option pgop added (the
+                        grantee could not grant them on before). Revoking them cascades to
+                        what the grantee passed on.
+                      items:
+                        type: string
+                      type: array
+                      x-kubernetes-list-type: set
                     parameter:
                       description: parameter is the parameter name, normalized to
                         lowercase.
                       type: string
                     privileges:
-                      description: privileges are the granted privileges.
+                      description: |-
+                        privileges are the privileges pgop added: those the role did not hold
+                        before pgop granted them. Only these are revoked once they leave the
+                        spec.
                       items:
                         type: string
                       type: array
                       x-kubernetes-list-type: set
                     withGrantOption:
                       description: |-
-                        withGrantOption records whether pgop granted the privileges with the
-                        grant option.
+                        withGrantOption is deprecated and no longer written: pgop v0.15 recorded
+                        with it that all privileges were granted with the grant option. A
+                        ledger that still has it is read as grantOptions = privileges.
                       type: boolean
                   required:
                   - parameter
-                  - privileges
                   type: object
+                maxItems: 512
                 type: array
                 x-kubernetes-list-map-keys:
                 - parameter
