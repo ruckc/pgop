@@ -50,13 +50,16 @@ type DatabaseSpec struct {
 	// +optional
 	Owner string `json:"owner,omitempty"`
 
-	// extensions lists PostgreSQL extensions to install in this database.
-	// The operator installs them as a superuser, so only extensions that the
-	// server marks as trusted (pg_available_extension_versions.trusted) or
-	// that the Cluster lists in spec.rolePolicy.allowedExtensions are
-	// installed; others are reported with reason ExtensionNotAllowed.
-	// Extensions are never dropped when removed from the list.
+	// extensions lists PostgreSQL extensions to install in this database,
+	// in order. The operator installs them as a superuser, so only extensions
+	// that the server marks as trusted (pg_available_extension_versions.trusted)
+	// for the requested version or that the Cluster lists in
+	// spec.rolePolicy.allowedExtensions are installed; others are reported
+	// with reason ExtensionNotAllowed. Extensions are not dropped when
+	// removed from the list unless dropOnRemoval is set.
 	// +optional
+	// +listType=map
+	// +listMapKey=name
 	// +kubebuilder:validation:MaxItems=64
 	Extensions []ExtensionSpec `json:"extensions,omitempty"`
 
@@ -215,16 +218,227 @@ type ExtensionSpec struct {
 
 	// schema is the schema to install the extension into. If not specified,
 	// the extension is installed into the schema named by its control file,
-	// or else into public.
+	// or else into public. A schema that does not exist and is not listed in
+	// spec.schemas is created by pgop, owned by the operator (a superuser),
+	// so the extension's install and update scripts run in a schema no other
+	// role can write to. The schema is checked before every CREATE EXTENSION
+	// and ALTER EXTENSION ... UPDATE (reason ExtensionSchemaNotAllowed): see
+	// the Database documentation. pgop never moves an installed extension to
+	// another schema. Schemas control files name are created by pgop too,
+	// before CREATE EXTENSION, so an extension never runs in a schema someone
+	// else created in the meantime.
 	// +optional
+	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:XValidation:rule="!self.startsWith('pg_') && self != 'information_schema'",message="schema must not be a system schema (pg_* or information_schema)"
 	Schema string `json:"schema,omitempty"`
 
-	// version is the version of the extension to install.
-	// If not specified, the default version is installed.
+	// version is the version of the extension to install. If not specified,
+	// the default version is installed, and an installed extension is left
+	// at its version. Changing it on an installed extension updates it
+	// (ALTER EXTENSION ... UPDATE TO); a version lower than the installed one
+	// is refused (reason ExtensionDowngradeNotAllowed), and so is a version
+	// the server has no update path to (ExtensionVersionNotAvailable).
 	// +optional
+	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=64
+	// +kubebuilder:validation:Pattern=`^[A-Za-z0-9][A-Za-z0-9._+~-]*$`
 	Version string `json:"version,omitempty"`
+
+	// cascade installs the extensions this extension requires that are not
+	// installed yet (CREATE EXTENSION ... CASCADE). Every one of them must
+	// pass the same policy as a listed extension (trusted, or listed in the
+	// Cluster's spec.rolePolicy.allowedExtensions); pgop resolves the whole
+	// dependency list first and installs nothing when one is refused (reason
+	// ExtensionNotAllowed). Without cascade, an extension whose dependencies
+	// are not installed is reported (ExtensionDependencyMissing): list the
+	// dependencies before it, or set cascade.
+	// +optional
+	Cascade bool `json:"cascade,omitempty"`
+
+	// dropOnRemoval drops the extension (DROP EXTENSION, without CASCADE)
+	// once its entry is removed from spec.extensions. It only applies to an
+	// extension pgop created for this Database (status.extensions[].created)
+	// and only once pgop has recorded the setting in
+	// status.extensions[].dropOnRemoval. Dependencies installed through
+	// cascade are never dropped. A drop PostgreSQL refuses because other
+	// objects depend on the extension is reported (ExtensionDropBlocked) and
+	// retried. Default false: removing an extension from the list leaves it
+	// installed, because dropping it deletes the data stored in its types.
+	// +optional
+	DropOnRemoval bool `json:"dropOnRemoval,omitempty"`
+
+	// grants grants privileges on the extension's own objects (those that
+	// belong to the extension, pg_depend deptype 'e') and on its schema to
+	// PostgreSQL roles, for example EXECUTE on pg_partman's functions. They
+	// are applied while the extension is installed and allowed, re-applied
+	// to objects an update adds, and revoked once they are removed from the
+	// spec (tracked in status.managedExtensionGrants). Grantees follow the
+	// same policy as spec.grants. EXECUTE is only granted on functions and
+	// procedures written in SQL or PL/pgSQL that are not SECURITY DEFINER,
+	// and table privileges only on plain and partitioned tables: the other
+	// objects run with the privileges of their owner (a superuser) or rely
+	// on not being executable by others, and are skipped
+	// (status.extensions[].skippedObjects). On an extension the server does
+	// not trust at its installed version (installed because the Cluster's
+	// allowedExtensions lists it), only read-only privileges are granted
+	// (schema USAGE, tables and sequences SELECT, functions EXECUTE): the
+	// others are refused with reason ExtensionGrantNotAllowed.
+	// +optional
+	// +listType=map
+	// +listMapKey=role
+	// +kubebuilder:validation:MaxItems=16
+	Grants []ExtensionGrantSpec `json:"grants,omitempty"`
+}
+
+// ExtensionGrantSpec grants privileges on an extension's objects to a role.
+// +kubebuilder:validation:XValidation:rule="has(self.schema) || has(self.tables) || has(self.sequences) || has(self.functions)",message="an extension grant must list schema, tables, sequences or functions privileges"
+type ExtensionGrantSpec struct {
+	// role is the grantee: the PostgreSQL name of a role (a raw PostgreSQL
+	// role name, not a Role resource name), or PUBLIC (upper case) for every
+	// role. It follows the same grantee policy as spec.grants (reason
+	// GranteeNotAllowed).
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:XValidation:rule="self == 'PUBLIC' || self.lowerAscii() != 'public'",message="write the PUBLIC pseudo-role in upper case"
+	// +kubebuilder:validation:XValidation:rule="self != 'postgres' && !self.startsWith('pgop_') && !self.startsWith('pg_') && self.lowerAscii() != 'none'",message="role must not be postgres, none, a pgop_* role or a predefined pg_* role"
+	Role string `json:"role"`
+
+	// schema lists privileges on the extension's schema: USAGE, CREATE or
+	// ALL. Only applied when the extension has a schema of its own: not
+	// public, not a system schema and not a schema listed in spec.schemas
+	// (grant on those in spec.schemas[].grants; reason
+	// ExtensionGrantNotAllowed). Granting CREATE lets the grantee write to
+	// the schema the extension's scripts run in, so later updates of the
+	// extension are refused (ExtensionSchemaNotAllowed).
+	// +optional
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=3
+	// +kubebuilder:validation:items:Enum=USAGE;CREATE;ALL
+	Schema []string `json:"schema,omitempty"`
+
+	// tables lists privileges on the extension's plain and partitioned
+	// tables: SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, MAINTAIN
+	// (PostgreSQL 17 and later) or ALL (all of these but MAINTAIN). TRIGGER
+	// is not offered: a trigger on a table the extension's superuser-run code
+	// writes to would run as that superuser.
+	// +optional
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=8
+	// +kubebuilder:validation:items:Enum=SELECT;INSERT;UPDATE;DELETE;TRUNCATE;REFERENCES;MAINTAIN;ALL
+	Tables []string `json:"tables,omitempty"`
+
+	// sequences lists privileges on the extension's sequences: USAGE,
+	// SELECT, UPDATE or ALL.
+	// +optional
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=4
+	// +kubebuilder:validation:items:Enum=USAGE;SELECT;UPDATE;ALL
+	Sequences []string `json:"sequences,omitempty"`
+
+	// functions lists privileges on the extension's functions and
+	// procedures: EXECUTE (or ALL, the same). See grants for the functions
+	// that are skipped.
+	// +optional
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=2
+	// +kubebuilder:validation:items:Enum=EXECUTE;ALL
+	Functions []string `json:"functions,omitempty"`
+}
+
+// ExtensionObjectKind is the kind of extension object an extension grant
+// is on.
+// +kubebuilder:validation:Enum=schema;tables;sequences;functions
+type ExtensionObjectKind string
+
+// Extension object kinds.
+const (
+	ExtensionObjectSchema    ExtensionObjectKind = "schema"
+	ExtensionObjectTables    ExtensionObjectKind = "tables"
+	ExtensionObjectSequences ExtensionObjectKind = "sequences"
+	ExtensionObjectFunctions ExtensionObjectKind = "functions"
+)
+
+// ManagedExtensionGrant records privileges pgop granted on an extension's
+// objects of one kind to a role.
+type ManagedExtensionGrant struct {
+	// extension is the extension whose objects the privileges are on.
+	Extension string `json:"extension"`
+
+	// role is the grantee: a PostgreSQL role, or PUBLIC.
+	Role string `json:"role"`
+
+	// kind is the kind of object: schema (the extension's schema), tables,
+	// sequences or functions (the extension's member objects of that kind).
+	Kind ExtensionObjectKind `json:"kind"`
+
+	// schema is the extension's schema, for kind schema.
+	// +optional
+	Schema string `json:"schema,omitempty"`
+
+	// privileges are the privileges pgop added on at least one object of the
+	// kind (normalized, ALL expanded). Once they leave the spec they are
+	// revoked from the grantee on every object of the kind that belongs to
+	// the extension.
+	// +optional
+	// +listType=set
+	Privileges []string `json:"privileges,omitempty"`
+}
+
+// ExtensionStatus reports one extension of the Database.
+type ExtensionStatus struct {
+	// name is the extension.
+	Name string `json:"name"`
+
+	// version is the installed version (pg_extension.extversion), empty when
+	// the extension is not installed.
+	// +optional
+	Version string `json:"version,omitempty"`
+
+	// schema is the schema the extension is installed in.
+	// +optional
+	Schema string `json:"schema,omitempty"`
+
+	// created reports that pgop created the extension for this Database
+	// (recorded before CREATE EXTENSION runs, and kept only once oid and
+	// owner confirm it). Only such an extension is dropped by dropOnRemoval.
+	// +optional
+	Created bool `json:"created,omitempty"`
+
+	// oid and owner identify the installation pgop created
+	// (pg_extension.oid and extowner). An extension dropped and created
+	// again by someone else has another oid, so pgop no longer treats it as
+	// created by it.
+	// +optional
+	OID int64 `json:"oid,omitempty"`
+
+	// owner is the extension's owner (pg_extension.extowner) when pgop
+	// created it.
+	// +optional
+	Owner string `json:"owner,omitempty"`
+
+	// dropOnRemoval is the extension's dropOnRemoval setting as last
+	// reconciled; it decides what happens once the entry leaves the spec.
+	// +optional
+	DropOnRemoval bool `json:"dropOnRemoval,omitempty"`
+
+	// reason is why the extension is not installed, not at the requested
+	// version or not dropped (a condition reason such as
+	// ExtensionNotAllowed), empty when it is as requested.
+	// +optional
+	Reason string `json:"reason,omitempty"`
+
+	// message explains reason.
+	// +optional
+	Message string `json:"message,omitempty"`
+
+	// skippedObjects counts the extension's objects that grants asked for
+	// but that pgop does not grant on (SECURITY DEFINER functions, functions
+	// in languages other than SQL and PL/pgSQL, views and other relations
+	// that are not plain or partitioned tables).
+	// +optional
+	SkippedObjects int32 `json:"skippedObjects,omitempty"`
 }
 
 // SchemaSpec defines a schema to create in the database
@@ -332,9 +546,30 @@ type DatabaseStatus struct {
 	// +optional
 	ClusterUID string `json:"clusterUID,omitempty"`
 
-	// installedExtensions lists extensions that have been successfully installed
+	// installedExtensions lists the extensions of spec.extensions that are
+	// installed.
 	// +optional
 	InstalledExtensions []string `json:"installedExtensions,omitempty"`
+
+	// extensions reports each extension of spec.extensions (installed
+	// version, schema, why it is not as requested), and removed extensions
+	// pgop still has to drop (dropOnRemoval).
+	// +optional
+	// +listType=map
+	// +listMapKey=name
+	// +kubebuilder:validation:MaxItems=128
+	Extensions []ExtensionStatus `json:"extensions,omitempty"`
+
+	// managedExtensionGrants lists the privileges pgop has granted on
+	// extensions' objects. Only these are revoked when they are removed from
+	// spec.extensions[].grants.
+	// +optional
+	// +listType=map
+	// +listMapKey=extension
+	// +listMapKey=role
+	// +listMapKey=kind
+	// +kubebuilder:validation:MaxItems=1024
+	ManagedExtensionGrants []ManagedExtensionGrant `json:"managedExtensionGrants,omitempty"`
 
 	// createdSchemas lists the schemas this Database manages: those it
 	// created, and existing ones owned by a non-superuser that is the

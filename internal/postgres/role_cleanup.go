@@ -26,7 +26,8 @@ import (
 
 // Privileges held by a role block DROP ROLE ("role cannot be dropped because
 // some objects depend on it"). The helpers below remove the privileges that
-// pgop itself manages on a role's behalf (database and schema ACL entries)
+// pgop itself manages on a role's behalf (database and schema ACL entries,
+// and privileges on extension objects, see extensions.go)
 // right before the role is dropped. They revoke with CASCADE: the role is
 // going away, so privileges it passed on to others go with it, as they would
 // with DROP OWNED.
@@ -73,14 +74,16 @@ type DatabaseRef struct {
 	AllowConns bool
 }
 
-// DatabasesWithSchemaPrivileges returns the databases in which role holds
-// privileges on schemas (recorded in pg_shdepend), with whether each one
-// accepts connections: a database owner can turn connections off
-// (ALTER DATABASE ... WITH ALLOW_CONNECTIONS false), for superusers too.
-func (c *Client) DatabasesWithSchemaPrivileges(ctx context.Context, role string) ([]DatabaseRef, error) {
+// DatabasesWithObjectPrivileges returns the databases in which role holds
+// privileges on schemas, relations or routines (recorded in pg_shdepend),
+// with whether each one accepts connections: a database owner can turn
+// connections off (ALTER DATABASE ... WITH ALLOW_CONNECTIONS false), for
+// superusers too.
+func (c *Client) DatabasesWithObjectPrivileges(ctx context.Context, role string) ([]DatabaseRef, error) {
 	rows, err := c.db.QueryContext(ctx, `SELECT DISTINCT d.datname, d.datallowconn FROM pg_catalog.pg_shdepend s
 JOIN pg_catalog.pg_database d ON d.oid = s.dbid
-WHERE s.deptype = 'a' AND s.classid = 'pg_catalog.pg_namespace'::pg_catalog.regclass
+WHERE s.deptype = 'a' AND s.classid IN ('pg_catalog.pg_namespace'::pg_catalog.regclass,
+    'pg_catalog.pg_class'::pg_catalog.regclass, 'pg_catalog.pg_proc'::pg_catalog.regclass)
   AND s.refclassid = 'pg_catalog.pg_authid'::pg_catalog.regclass
   AND s.refobjid = (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = $1)
 ORDER BY d.datname`, role)

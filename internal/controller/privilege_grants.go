@@ -55,7 +55,7 @@ import (
 //
 // Ledger keys are exclusive to one resource by construction: a key names the
 // object and the grantee, and every object a key can name belongs to exactly
-// one resource. Database and schema grants are on the Database's own
+// one resource. Database, schema and extension grants are on the Database's own
 // PostgreSQL database (two Databases never manage the same database: the
 // younger one reports DuplicateDatabaseName and touches nothing), parameter
 // grants name the Role's own role as grantee (DuplicateRoleName likewise).
@@ -71,10 +71,14 @@ import (
 // functions, default privileges) add the fields they need to it.
 type grantTarget struct {
 	Kind postgres.ObjectKind
-	// Name is the object: a database, schema or parameter name.
+	// Name is the object: a database, schema or parameter name, or for the
+	// extension kinds the extension whose objects the privileges are on.
 	Name string
 	// Grantee is a role name, or postgres.PublicGrantee.
 	Grantee string
+	// Schema is, for grants on an extension's schema, that schema. It is
+	// data, not part of the key: the key names the extension.
+	Schema string
 }
 
 // key returns the target's stable, unambiguous ledger key.

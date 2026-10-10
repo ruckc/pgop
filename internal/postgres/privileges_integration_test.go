@@ -43,7 +43,9 @@ func TestPrivilegesIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = admin.Close() }()
+	// Closed after the cleanup below (cleanups run last-in first-out, and
+	// after deferred calls, which is why this is not a defer).
+	t.Cleanup(func() { _ = admin.Close() })
 	exec := func(c *Client, q string) {
 		t.Helper()
 		if _, err := c.db.ExecContext(ctx, q); err != nil {
@@ -52,7 +54,8 @@ func TestPrivilegesIntegration(t *testing.T) {
 	}
 	const db = "pgop_priv_test"
 	cleanup := func() {
-		_, _ = admin.db.ExecContext(ctx, `DROP DATABASE IF EXISTS `+db)
+		_, _ = admin.db.ExecContext(ctx, `DROP DATABASE IF EXISTS `+db+` WITH (FORCE)`)
+		_, _ = admin.db.ExecContext(ctx, `DROP ROLE IF EXISTS pgop_priv_dep`)
 		_, _ = admin.db.ExecContext(ctx, `DROP ROLE IF EXISTS pgop_priv_reader`)
 		_, _ = admin.db.ExecContext(ctx, `DROP ROLE IF EXISTS "PUBLIC"`)
 	}
@@ -149,7 +152,6 @@ func checkHeldPrivilegesIntegration(ctx context.Context, t *testing.T, c *Client
 	// The grantee passes the privilege on: a plain REVOKE fails with
 	// "dependent privileges exist", which pgop recognizes.
 	exec(c, `CREATE ROLE pgop_priv_dep`)
-	t.Cleanup(func() { _, _ = c.db.ExecContext(ctx, `DROP OWNED BY pgop_priv_dep; DROP ROLE IF EXISTS pgop_priv_dep`) })
 	exec(c, `SET ROLE pgop_priv_reader; GRANT USAGE ON SCHEMA app TO pgop_priv_dep; RESET ROLE`)
 	err := c.RevokePrivileges(ctx, app, "pgop_priv_reader", []string{PrivilegeUsage}, RevokeMode{})
 	if !DependentPrivilegesExist(err) {

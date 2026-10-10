@@ -332,9 +332,10 @@ func backoffDelay(attempt int, jitter float64) time.Duration {
 
 // dropPostgresRole drops the Role's PostgreSQL role during deletion. Privileges
 // held by the role block DROP ROLE, so it first revokes the parameter grants
-// pgop made and every database and schema privilege the role holds on the
-// cluster (with CASCADE: the role is going away). Anything else that still
-// depends on the role (objects it owns, table privileges) is reported as an
+// pgop made and every database and schema privilege, and every privilege on
+// objects that belong to an extension, the role holds on the cluster (with
+// CASCADE: the role is going away). Anything else that still depends on the
+// role (objects it owns, privileges on other tables) is reported as an
 // Available=False condition with reason RoleDropBlocked and PostgreSQL's
 // list of dependents, and the drop is retried periodically. A non-zero
 // result or an error means the role has not been dropped yet.
@@ -394,7 +395,7 @@ func (r *RoleReconciler) dropPostgresRole(ctx context.Context, cluster *postgres
 		log.Error(err, "Failed to revoke database privileges")
 		return ctrl.Result{}, err
 	}
-	dbs, err := pgClient.DatabasesWithSchemaPrivileges(ctx, pgName)
+	dbs, err := pgClient.DatabasesWithObjectPrivileges(ctx, pgName)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -409,7 +410,7 @@ func (r *RoleReconciler) dropPostgresRole(ctx context.Context, cluster *postgres
 			continue
 		}
 		if err := revokeSchemaPrivilegesIn(ctx, r.Client, cluster, db.Name, pgName); err != nil {
-			log.Error(err, "Failed to revoke schema privileges; skipping the database", "database", db.Name)
+			log.Error(err, "Failed to revoke schema or extension object privileges; skipping the database", "database", db.Name)
 			skipped = append(skipped, db.Name+" ("+err.Error()+")")
 		}
 	}
@@ -418,7 +419,7 @@ func (r *RoleReconciler) dropPostgresRole(ctx context.Context, cluster *postgres
 	if depErr, ok := errors.AsType[*postgres.DependentObjectsError](err); ok {
 		msg := depErr.Error()
 		if len(skipped) > 0 {
-			msg += "; schema privileges could not be revoked in: " + strings.Join(skipped, ", ")
+			msg += "; schema or extension object privileges could not be revoked in: " + strings.Join(skipped, ", ")
 		}
 		log.Info("Role cannot be dropped yet", "reason", msg)
 		meta.SetStatusCondition(&role.Status.Conditions, metav1.Condition{
@@ -440,14 +441,18 @@ func (r *RoleReconciler) dropPostgresRole(ctx context.Context, cluster *postgres
 }
 
 // revokeSchemaPrivilegesIn revokes every schema privilege role holds in the
-// database db.
+// database db, and every privilege it holds on objects that belong to an
+// extension (Database spec.extensions[].grants).
 func revokeSchemaPrivilegesIn(ctx context.Context, c client.Client, cluster *postgresv1alpha1.Cluster, db, role string) error {
 	dbClient, err := newOperatorClient(ctx, c, cluster, db)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = dbClient.Close() }()
-	return dbClient.RevokeAllSchemaPrivileges(ctx, role)
+	if err := dbClient.RevokeAllSchemaPrivileges(ctx, role); err != nil {
+		return err
+	}
+	return dbClient.RevokeAllExtensionMemberPrivileges(ctx, role)
 }
 
 // createOrAlterRole runs CreateRole and reports a role someone else created

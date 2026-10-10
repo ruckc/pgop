@@ -333,13 +333,40 @@ spec:
   # by that Role's effective PostgreSQL name.
   owner: string
 
-  # Extensions to install (max 64). Only extensions the server marks as
-  # trusted, or listed in the Cluster's rolePolicy.allowedExtensions, are
-  # installed (reason ExtensionNotAllowed otherwise). Never dropped.
+  # Extensions to install, in order (max 64, each name at most once). Only
+  # extensions the server marks as trusted for the requested version, or
+  # listed in the Cluster's rolePolicy.allowedExtensions, are installed
+  # (reason ExtensionNotAllowed otherwise). Their install and update scripts
+  # run as a superuser, so the schemas they run in are checked
+  # (ExtensionSchemaNotAllowed): see Databases > Extensions.
   extensions:
     - name: string         # Extension name ([A-Za-z0-9_-], max 63 chars)
-      schema: string       # Optional schema (default: control file schema, else public)
-      version: string      # Optional version (default: the default version)
+      schema: string       # Optional schema (default: control file schema, else public);
+                           # not pg_* or information_schema. Created by pgop,
+                           # owned by the operator, when missing and not in schemas.
+      version: string      # Optional version ([A-Za-z0-9][A-Za-z0-9._+~-]*, max 64);
+                           # default: the default version. Changing it updates
+                           # (ALTER EXTENSION ... UPDATE TO); downgrades refused.
+      cascade: boolean     # CREATE EXTENSION ... CASCADE; every dependency
+                           # must pass the policy too
+      dropOnRemoval: boolean   # DROP EXTENSION (no CASCADE) once removed from
+                               # the list, only if pgop created it. Default false.
+      # Privileges on the extension's own objects (pg_depend deptype 'e'),
+      # max 16, each role at most once. Tracked in
+      # status.managedExtensionGrants and revoked when removed.
+      grants:
+        - role: string     # Grantee (same rules as grants[].role below)
+          schema: [string]     # USAGE, CREATE, ALL: on the extension's own schema
+                               # (not public, pg_*, or a schema in schemas)
+          tables: [string]     # SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES,
+                               # MAINTAIN (PostgreSQL 17+), ALL (all but MAINTAIN);
+                               # plain and partitioned tables only. No TRIGGER.
+          sequences: [string]  # USAGE, SELECT, UPDATE, ALL
+          functions: [string]  # EXECUTE (or ALL): only SQL / PL/pgSQL functions
+                               # and procedures that are not SECURITY DEFINER
+          # On an extension the server does not trust (allowed only by
+          # allowedExtensions), only USAGE (schema), SELECT (tables,
+          # sequences) and EXECUTE are granted (ExtensionGrantNotAllowed).
 
   # Schemas to create (max 64, each name at most once)
   schemas:
@@ -394,7 +421,13 @@ spec:
 ```
 
 The `Available` condition is `False` with reason `SettingNotAllowed` when a
-setting is refused, `ExtensionNotAllowed` when an extension is refused,
+setting is refused, `ExtensionNotAllowed` when an extension (or a dependency
+cascade would install) is refused, `ExtensionSchemaNotAllowed` when an
+extension's script would run in a schema other roles can write to,
+`ExtensionDependencyMissing`, `ExtensionVersionNotAvailable`,
+`ExtensionDowngradeNotAllowed`, `ExtensionSchemaMismatch`,
+`ExtensionNotManaged`, `ExtensionDropBlocked` and `ExtensionGrantNotAllowed`
+(see [Databases: Extensions](../user-guide/databases.md#extensions)),
 `SchemaNotAllowed` for a system schema, `GranteeNotAllowed` when a grantee
 in `grants` or `schemas[].grants` is not allowed (grants to it are not
 applied, and revoked if pgop granted them), `PublicPrivilegeConflict` when
@@ -420,7 +453,18 @@ status:
   databaseName: string     # Effective PostgreSQL database name
   clusterUID: string       # UID of the Cluster databaseName was created/adopted on
   installedExtensions:
-    - string               # List of installed extension names
+    - string               # Extensions of spec.extensions that are installed
+  extensions:              # max 128: spec.extensions, and removed ones pgop still has to drop
+    - name: string
+      version: string      # Installed version (empty: not installed)
+      schema: string       # Schema it is installed in
+      created: boolean     # pgop created it (recorded before CREATE EXTENSION)
+      oid: integer         # pg_extension.oid of the installation pgop created
+      owner: string        # its extowner; both must still match for a drop
+      dropOnRemoval: boolean   # dropOnRemoval as last reconciled
+      reason: string       # Why it is not as requested (a condition reason)
+      message: string
+      skippedObjects: integer  # Objects grants asked for that pgop does not grant on
   createdSchemas:
     - string               # Schemas the Database manages (created, or owned by the declared/database owner)
   # Ledgers record only what pgop added (privileges the grantee did not hold,
@@ -435,6 +479,12 @@ status:
       role: string         # Role name or PUBLIC
       privileges: [string] # Normalized: CREATE, USAGE
       grantOptions: [string]
+  managedExtensionGrants:  # max 1024
+    - extension: string
+      role: string         # Role name or PUBLIC
+      kind: string         # schema, tables, sequences or functions
+      schema: string       # The extension's schema (kind schema)
+      privileges: [string] # Added on at least one object; revoked from every object of the kind
   revokedPublicPrivileges: # Default PUBLIC privileges pgop revoked (granted back when no longer requested)
     - string               # connect, temporary, publicSchemaUsage, publicSchemaCreate
   managedSettings:         # Lowercased parameter names pgop set (reset when removed)

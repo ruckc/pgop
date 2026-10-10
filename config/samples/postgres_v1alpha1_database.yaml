@@ -32,11 +32,23 @@ spec:
   #   search_path: '"$user", app, public'
   #   statement_timeout: 30s
   # Extensions are installed by the operator as a superuser, so only those
-  # the server marks as trusted (uuid-ossp and pg_trgm are) or that the
-  # Cluster lists in spec.rolePolicy.allowedExtensions are installed.
+  # the server marks as trusted (uuid-ossp, pg_trgm and citext are) or that
+  # the Cluster lists in spec.rolePolicy.allowedExtensions are installed, and
+  # only into schemas no untrusted role can write to. Removing an entry
+  # leaves the extension installed unless dropOnRemoval was set.
   extensions:
     - name: uuid-ossp
     - name: pg_trgm
+    # - name: citext
+    #   version: "1.8"          # changing it runs ALTER EXTENSION ... UPDATE TO
+    #   # EXECUTE on the extension's SQL/PL/pgSQL (non-SECURITY DEFINER)
+    #   # functions; C and SECURITY DEFINER functions are skipped.
+    #   grants:
+    #     - role: app-user
+    #       functions: [EXECUTE]
+    # - name: earthdistance     # untrusted: needs rolePolicy.allowedExtensions
+    #   schema: geo             # created by pgop, owned by the operator
+    #   cascade: true           # also installs cube (must pass the policy too)
   schemas:
     - name: app
       owner: app-user
