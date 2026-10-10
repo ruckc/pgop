@@ -76,14 +76,22 @@ type grantTarget struct {
 	Name string
 	// Grantee is a role name, or postgres.PublicGrantee.
 	Grantee string
-	// Schema is, for grants on an extension's schema, that schema. It is
-	// data, not part of the key: the key names the extension.
+	// Schema is, for grants on an extension's schema, that schema, and for
+	// object grants the schema of the object (Name is the object's identity,
+	// which names the schema too). It is data, not part of the key.
 	Schema string
+	// ForRole is, for default privileges, the role whose future objects
+	// they apply to (Name is the schema). It is part of the key.
+	ForRole string
 }
 
 // key returns the target's stable, unambiguous ledger key.
 func (t grantTarget) key() string {
-	return string(t.Kind) + "|" + strconv.Quote(t.Name) + "|" + strconv.Quote(t.Grantee)
+	k := string(t.Kind) + "|" + strconv.Quote(t.Name) + "|" + strconv.Quote(t.Grantee)
+	if t.ForRole != "" {
+		k += "|" + strconv.Quote(t.ForRole)
+	}
+	return k
 }
 
 // object returns the PostgreSQL object the target's privileges are on.
@@ -92,6 +100,9 @@ func (t grantTarget) object() postgres.PrivilegeObject {
 }
 
 func (t grantTarget) String() string {
+	if t.ForRole != "" {
+		return fmt.Sprintf("%s in schema %q for role %q to %s", strings.ToLower(string(t.Kind)), t.Name, t.ForRole, t.Grantee)
+	}
 	return fmt.Sprintf("%s to %s", t.object(), t.Grantee)
 }
 

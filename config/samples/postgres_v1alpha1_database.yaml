@@ -59,3 +59,20 @@ spec:
           privileges:
             - USAGE
             - CREATE
+      # Optional privileges on objects of the schema. Only objects owned by
+      # the database owner or roles of this Cluster's Roles
+      # are granted on (see the Databases guide); "*" selects every object of
+      # the kind on each reconcile. pgop tracks what it granted per object
+      # and revokes it once no entry selects the object.
+      # objectGrants:
+      #   - role: app_reader
+      #     kind: table             # table, sequence, function, procedure, type
+      #     objects: ["*"]          # or names: [orders, "refresh(integer)"]
+      #     privileges: [SELECT]
+      # Optional default privileges for objects a role of this Cluster's
+      # Roles creates in the schema later (for example the migrator).
+      # defaultPrivileges:
+      #   - forRole: app-user       # PostgreSQL role name
+      #     role: app_reader
+      #     kind: table             # table, sequence, function, type
+      #     privileges: [SELECT]

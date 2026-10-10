@@ -698,6 +698,7 @@ spec:
 	RegisterRolePolicyTests()
 	RegisterRoleSettingsTests()
 	RegisterExtensionTests()
+	RegisterObjectGrantTests()
 	RegisterBackupTests()
 	RegisterRetentionTests()
 	RegisterTLSTests()

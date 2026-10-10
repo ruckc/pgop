@@ -215,12 +215,14 @@ func (r *DatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		log.Error(extErr, "Failed to reconcile extensions")
 	}
 	// Schema grants and PUBLIC's privileges on the schema public, once every
-	// schema exists, then the grants on the extensions' objects. Like the
+	// schema exists, then the grants on the extensions' objects, then the
+	// grants on the schemas' objects and the default privileges. Like the
 	// database grants, a problem here is reported after the credentials
 	// Secret is reconciled.
 	accessErr = errors.Join(extErr, accessErr,
 		reconcileSchemaAccess(ctx, dbClient, database, pgName, createdSchemas, checker, r.statusSaver(database)),
-		reconcileExtensionAccess(ctx, dbClient, database, extStates, checker, r.statusSaver(database)))
+		reconcileExtensionAccess(ctx, dbClient, database, extStates, checker, r.statusSaver(database)),
+		reconcileObjectAccess(ctx, dbClient, dbClient.ServerVersionNum, database, createdSchemas, checker, r.statusSaver(database)))
 
 	if err := r.reconcileCredentialsSecret(ctx, database, ownerRole, cluster); err != nil {
 		log.Error(err, "Failed to reconcile database credentials secret")
@@ -708,7 +710,8 @@ func (r *DatabaseReconciler) updateStatus(ctx context.Context, database *postgre
 }
 
 // databasesForOwnerRole maps a Role to the Databases in its namespace whose
-// spec.owner names it, or whose spec.grants or spec.schemas[].grants name its
+// spec.owner names it, or whose spec.grants, spec.extensions[].grants or
+// spec.schemas[] grants, object grants or default privileges name its
 // PostgreSQL role, so they reconcile when the owner becomes Ready, a grantee
 // is created (and recorded, which the grantee policy requires) or deleted.
 func (r *DatabaseReconciler) databasesForOwnerRole(ctx context.Context, obj client.Object) []reconcile.Request {
@@ -726,7 +729,7 @@ func (r *DatabaseReconciler) databasesForOwnerRole(ctx context.Context, obj clie
 			return false
 		}
 		if slices.ContainsFunc(db.Spec.Grants, func(g postgresv1alpha1.DatabaseGrantSpec) bool { return g.Role == pgName }) ||
-			extensionsGrantingTo(db, pgName) {
+			extensionsGrantingTo(db, pgName) || objectAccessNames(db, pgName) {
 			return true
 		}
 		return slices.ContainsFunc(db.Spec.Schemas, func(s postgresv1alpha1.SchemaSpec) bool {

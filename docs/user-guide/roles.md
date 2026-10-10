@@ -518,18 +518,31 @@ revokes:
 - every schema privilege the role holds, in every database, and
 - every privilege the role holds on objects that belong to an extension
   (granted by a Database's [`extensions[].grants`](databases.md#grants-on-extension-objects)),
-  in every database,
+  in every database, and
+- the [object grants and default privileges](databases.md#object-grants) the
+  Databases of the Cluster recorded for the role (`status.managedObjectGrants`
+  and `status.managedDefaultPrivileges`), in each such database: the
+  privileges pgop granted the role on tables, sequences, functions and types,
+  the default privileges pgop set for the role (as `forRole`) or to it (as
+  grantee), and the privileges those default privileges gave the role on the
+  objects their `forRole` created since,
 
 all with `CASCADE` (privileges the role passed on go with it, as with
-`DROP OWNED`). A database that does not accept connections (its owner can run
+`DROP OWNED`). Only database, schema and extension-object privileges are
+revoked wholesale; on tables, sequences, functions and types pgop revokes only
+what the Databases' ledgers record. pgop never runs `DROP OWNED`. A database that does not accept connections (its owner can run
 `ALTER DATABASE ... WITH ALLOW_CONNECTIONS false`, which also locks out
 superusers) or cannot be reached is skipped instead of holding the deletion
 up; if privileges there still block `DROP ROLE`, the `RoleDropBlocked`
-condition names the database. Databases whose `grants`, `schemas[].grants` or `extensions[].grants` list the role stop granting to it while
-it is being deleted, so they do not undo this.
+condition names the database. Databases whose `grants`, `schemas[].grants`,
+`schemas[].objectGrants`, `schemas[].defaultPrivileges` (as grantee or
+`forRole`) or `extensions[].grants` list the role stop granting to it while
+it is being deleted (and revoke what they recorded), so they do not undo
+this.
 
-Anything else that depends on the role, such as objects it owns or privileges
-on tables, is left alone. The drop then fails, and the Role reports
+Anything else that depends on the role, such as objects it owns, privileges
+on tables granted outside pgop (or by default privileges pgop no longer
+tracks), or default privileges set by hand, is left alone. The drop then fails, and the Role reports
 `Available=False` with reason `RoleDropBlocked` and PostgreSQL's list of
 dependents. pgop retries every 30 seconds until you resolve them (for
 example with `REASSIGN OWNED BY ... TO ...` and `DROP OWNED BY ...` in each
@@ -592,7 +605,7 @@ all of them form one trust domain for the Cluster.
 |-----|-----|--------|
 | **Cluster editors** | Everything pgop offers, including widening `spec.rolePolicy`: privileged attributes, predefined roles, memberships in existing roles, untrusted extensions, custom setting namespaces, and **taking over existing roles and databases** (`adoptableRoles`, `adoptableDatabases`). Cluster editors are trusted with the whole server. | — |
 | **Role writers** | Create non-superuser roles with `login`, `createDB`, `inherit`, `connectionLimit`, passwords, parameter grants (with a denylist), role settings (user-context parameters, and placeholders in namespaces the Cluster allows), and memberships in roles that pass the [membership policy](#membership-policy). Read the other Secrets of the namespace via `passwordSecretRef`. | Create superusers (the field no longer exists; roles are always `NOSUPERUSER`). Read pgop's own Secrets (the Cluster's superuser credentials, TLS keys) through `passwordSecretRef`. Get `createRole`, `replication` or `bypassRLS`, or membership in predefined `pg_*` roles, unless the Cluster allows it. Become a member of a superuser, `postgres`, `pgop_*` or the server-file roles, or of any role that leads to them. Take over, reset the password of, or drop an existing role pgop did not create for them, whatever its comment says, unless a Cluster editor allowlists it (`RoleNotManaged`); reuse another Role's PostgreSQL name (`DuplicateRoleName`). Join roles that no Role of the Cluster manages unless the Cluster lists them. Grant `SET` on parameters that are not `user`/`superuser` context or on the denylist. Set role defaults (`settings`, `databaseSettings`) other than `user`-context parameters or placeholders in namespaces the Cluster lists, or on any role but their own. Use the `pgop_` prefix, `pg_` prefix or `postgres` as role names. |
-| **Database writers** | Everything inside *their* database: owner, schemas, grants (to `PUBLIC` and to roles the Cluster's Roles manage), revoking `PUBLIC`'s defaults, settings (user-context parameters, and placeholders in namespaces the Cluster allows), trusted extensions and their updates, grants on extension objects that do not run as their (superuser) owner (see [Databases: security model](databases.md#security-model)). | Take over or drop a database pgop did not create for them (`DatabaseNotManaged`, `DuplicateDatabaseName`). Grant on objects of other databases or Clusters, or grant to superusers, `postgres`, `pgop_*`, `pg_*` or roles no Role of the Cluster manages unless the Cluster lists them (`GranteeNotAllowed`). Take over or grant on existing schemas they neither created nor own (`SchemaNotManaged`). Install untrusted extensions unless the Cluster lists them, also as `cascade` dependencies; run any extension script in a schema `PUBLIC` or another role can create in (or, for untrusted extensions, in a schema a non-superuser owns or can create in) (`ExtensionSchemaNotAllowed`); downgrade extensions; drop extensions pgop did not create, or drop with `CASCADE`; get `EXECUTE` on `SECURITY DEFINER` or C functions, privileges on views, or `TRIGGER` through extension grants. Manage the `postgres`, `template0` or `template1` databases or system schemas (`pg_*`, `information_schema`). Change the operator's session settings (`search_path`, `role`, timeouts, read-only) with `ALTER DATABASE ... SET`. |
+| **Database writers** | Everything inside *their* database: owner, schemas, grants (to `PUBLIC` and to roles the Cluster's Roles manage), revoking `PUBLIC`'s defaults, settings (user-context parameters, and placeholders in namespaces the Cluster allows), trusted extensions and their updates, grants on extension objects that do not run as their (superuser) owner, grants on the objects of their schemas whose owner is in the Cluster's trust domain, and default privileges for roles the Cluster's Roles manage (see [Databases: security model](databases.md#security-model)). | Take over or drop a database pgop did not create for them (`DatabaseNotManaged`, `DuplicateDatabaseName`). Grant on objects of other databases or Clusters, or grant to superusers, `postgres`, `pgop_*`, `pg_*` or roles no Role of the Cluster manages unless the Cluster lists them (`GranteeNotAllowed`). Take over or grant on existing schemas they neither created nor own (`SchemaNotManaged`). Install untrusted extensions unless the Cluster lists them, also as `cascade` dependencies; run any extension script in a schema `PUBLIC` or another role can create in (or, for untrusted extensions, in a schema a non-superuser owns or can create in) (`ExtensionSchemaNotAllowed`); downgrade extensions; drop extensions pgop did not create, or drop with `CASCADE`; get `EXECUTE` on `SECURITY DEFINER` or C functions, privileges on views, or `TRIGGER` through extension grants. Grant on objects owned by superusers or by roles outside the Cluster's Roles, on an extension's objects through object grants, or on the operator's `SECURITY DEFINER` or C functions, views or (with `TRIGGER`/`MAINTAIN`) tables (`ObjectGrantSkipped`); set default privileges for a superuser, the operator or a role no Role of the Cluster manages (`DefaultPrivilegeNotAllowed`). Manage the `postgres`, `template0` or `template1` databases or system schemas (`pg_*`, `information_schema`). Change the operator's session settings (`search_path`, `role`, timeouts, read-only) with `ALTER DATABASE ... SET`. |
 
 Because the policy lives on the **Cluster**, granting someone RBAC to create
 Roles (or Databases) no longer makes them superuser-equivalent: widening what

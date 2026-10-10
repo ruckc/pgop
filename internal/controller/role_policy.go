@@ -287,7 +287,7 @@ func reachableRoleProblem(r postgres.ReachableRole, policy *postgresv1alpha1.Rol
 		return p
 	}
 	if r.Superuser {
-		return "is a superuser"
+		return problemSuperuser
 	}
 	if p := attributeProblem(r, policy); p != "" {
 		return p

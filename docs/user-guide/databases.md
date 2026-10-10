@@ -19,7 +19,10 @@ The Database controller:
    asked (`dropOnRemoval`)
 8. Applies schema grants and grants on extension objects, and revokes removed
    ones
-9. Drops the database on deletion
+9. Applies [object grants](#object-grants) (tables, sequences, functions,
+   procedures, types) and [default privileges](#default-privileges), and
+   revokes removed ones
+10. Drops the database on deletion
 
 See [Security model](#security-model) for what a Database writer can and
 cannot do.
@@ -56,6 +59,16 @@ spec:
         - role: readonly_role
           privileges:
             - USAGE
+      objectGrants:             # existing objects
+        - role: readonly_role
+          kind: table
+          objects: ["*"]        # every table (and view) of the schema
+          privileges: [SELECT]
+      defaultPrivileges:        # objects app-user creates later
+        - forRole: app-user     # PostgreSQL role name of a Role of this Cluster
+          role: readonly_role
+          kind: table
+          privileges: [SELECT]
 ```
 
 ## Spec Reference
@@ -101,6 +114,30 @@ At least one of `schema`, `tables`, `sequences` and `functions` is required.
 | `name` | string | **required** | Schema name (not `pg_*` or `information_schema`; unique, at most 64 schemas) |
 | `owner` | string | database owner | PostgreSQL role name that owns the schema (see [Which schemas a Database manages](#which-schemas-a-database-manages)) |
 | `grants` | []GrantSpec | - | Schema privileges to grant (at most 16; see [Schema Grants](#schema-grants)) |
+| `objectGrants` | []ObjectGrantSpec | - | Privileges on the schema's tables, sequences, functions, procedures and types (at most 32; see [Object Grants](#object-grants)) |
+| `defaultPrivileges` | []DefaultPrivilegeSpec | - | Privileges on objects a role creates in the schema later (at most 32; see [Default Privileges](#default-privileges)) |
+
+### ObjectGrantSpec
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `role` | string | Grantee: a PostgreSQL role name or `PUBLIC` (see [Grantee policy](#grantee-policy)) |
+| `kind` | string | `table` (also views, materialized views, foreign tables), `sequence`, `function` (also aggregates), `procedure` or `type` (also domains, enums, ranges) |
+| `objects` | []string | Object names in the schema (at most 64, each at most 255 characters), or `["*"]` for every object of the kind. Functions and procedures: `name(argtypes)` for one, `name` for every overload |
+| `privileges` | []string | `table`: `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`, `REFERENCES`, `TRIGGER`, `MAINTAIN` (PostgreSQL 17+), `ALL` (all but `MAINTAIN`); `sequence`: `USAGE`, `SELECT`, `UPDATE`, `ALL`; `function`/`procedure`: `EXECUTE`, `ALL`; `type`: `USAGE`, `ALL` |
+| `withGrantOption` | bool | Allow the grantee to grant the privileges to others (not for `PUBLIC`) |
+
+### DefaultPrivilegeSpec
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `forRole` | string | PostgreSQL role whose future objects get the privileges; must be managed by a Role of the same Cluster and not a superuser |
+| `role` | string | Grantee: a PostgreSQL role name or `PUBLIC` (see [Grantee policy](#grantee-policy)) |
+| `kind` | string | `table`, `sequence`, `function` (also procedures) or `type` |
+| `privileges` | []string | As for `objectGrants` of the same kind |
+| `withGrantOption` | bool | Allow the grantee to grant the privileges to others (not for `PUBLIC`) |
+
+`forRole`, `role` and `kind` identify an entry (each combination at most once).
 
 ### GrantSpec
 
@@ -141,9 +178,12 @@ Unset or `true` leaves PostgreSQL's default alone (and restores what pgop revoke
 | `createdSchemas` | Schemas the Database manages (created by it, or existing and owned by the declared or database owner) |
 | `managedGrants` | Database privileges and grant options pgop added (revoked when removed from `grants`) |
 | `managedSchemaGrants` | Schema privileges and grant options pgop added (revoked when removed from `schemas[].grants`) |
+| `managedObjectGrants` | Privileges and grant options pgop added on schema objects, per object and grantee (revoked once no `objectGrants` entry selects the object) |
+| `managedDefaultPrivileges` | Default privileges pgop added, per schema, `forRole`, kind and grantee (removed when removed from `defaultPrivileges`) |
+| `objectGrants` | Per schema and kind: how many selected objects pgop grants on (`granted`), how many it skips (`skipped`) and up to five `skippedExamples` |
 | `revokedPublicPrivileges` | Default `PUBLIC` privileges pgop revoked (granted back when no longer requested) |
 | `managedSettings` | Parameter names pgop set (reset when removed from `settings`) |
-| `conditions` | Detailed status conditions |
+| `conditions` | `Available`, and `ObjectGrantsComplete` (see [Object Grants](#object-grants)) |
 
 ## Connection Secret
 
@@ -227,8 +267,14 @@ spec:
 - `extensions[].grants` grant privileges on an extension's own objects
   (owned by the superuser that installed it), such as pg_partman's tables and
   functions; see [Grants on extension objects](#grants-on-extension-objects).
+- `schemas[].objectGrants` grant privileges on tables, sequences, functions,
+  procedures and types that exist in a schema, and
+  `schemas[].defaultPrivileges` on the ones a role creates later; see
+  [Object Grants](#object-grants) and
+  [Default Privileges](#default-privileges).
 - There is no arbitrary SQL (`initSQL`): pgop declares grants instead (issue
-  #24). Objects your own roles own can be granted on from your migrations.
+  #24). Objects your own roles own can also be granted on from your
+  migrations.
 
 !!! note "Upgrade note: schema privileges are validated"
     Earlier versions passed `schemas[].grants[].privileges` into the `GRANT`
@@ -321,7 +367,8 @@ They follow the same rules as [database grants](#database-grants):
 
 ### What pgop tracks
 
-The same rules hold for `grants`, `schemas[].grants` and Role
+The same rules hold for `grants`, `schemas[].grants`, `schemas[].objectGrants`,
+`schemas[].defaultPrivileges`, `extensions[].grants` and Role
 `parameterGrants`:
 
 - pgop compares each declared grant with the privileges the grantee holds
@@ -362,7 +409,9 @@ The same rules hold for `grants`, `schemas[].grants` and Role
   someone grants by hand what pgop already granted, removing the entry from
   the spec revokes it.
 - The ledgers are bounded (`managedGrants` 512 entries, `managedSchemaGrants`
-  2048, `managedParameterGrants` 512). A change whose declared grants plus the
+  2048, `managedExtensionGrants` 1024, `managedObjectGrants` 4096 (one entry
+  per object and grantee), `managedDefaultPrivileges` 2048,
+  `managedParameterGrants` 512). A change whose declared grants plus the
   grants pgop still tracks would exceed that is refused as a whole with reason
   `TooManyGrants`; nothing of that kind is granted or revoked until grants are
   removed from the spec, and nothing tracked is lost.
@@ -402,10 +451,194 @@ are created owned by the operator; such a schema that is removed from
 `SchemaNotManaged`. Give the schema an `owner` (or the Database an `owner`) to
 avoid that.
 
+## Object Grants
+
+`schemas[].objectGrants` grants privileges on objects that exist in a schema
+the Database manages: tables (also views, materialized views and foreign
+tables), sequences, functions (also aggregates), procedures and types (also
+domains, enums and ranges).
+
+```yaml
+spec:
+  schemas:
+    - name: app
+      owner: app_owner
+      grants:
+        - role: app_ro
+          privileges: [USAGE]          # needed to reach the objects at all
+      objectGrants:
+        - role: app_ro
+          kind: table
+          objects: ["*"]               # every table of app, re-evaluated on every reconcile
+          privileges: [SELECT]
+        - role: app_rw
+          kind: sequence
+          objects: [orders_id_seq]
+          privileges: [USAGE, SELECT]
+        - role: rs_control
+          kind: function
+          objects: ["caller_access(text)", "refresh"]   # one overload; every overload of refresh
+          privileges: [EXECUTE]
+        - role: app_ro
+          kind: type
+          objects: [mood]
+          privileges: [USAGE]
+```
+
+### Selecting objects
+
+- `objects` lists names as PostgreSQL stores them (case-sensitive, without
+  quotes and without the schema): `Orders` and `orders` are different
+  tables. Names are only ever passed to catalog queries as parameters, never
+  spliced into SQL, so a name with quotes or semicolons is just a name.
+- A function or procedure is named `name(argtypes)`, for example
+  `caller_access(text)` or `f(integer, app.mood)`; the server resolves the
+  signature (`to_regprocedure`), so `int4` and `integer` are the same.
+  Argument types outside `pg_catalog` must be schema-qualified. `name` alone
+  (without parentheses) selects every overload.
+- `["*"]` selects every object of the kind in the schema at the time of the
+  reconcile, listed again on every reconcile. At most 5000 objects per kind
+  and schema: beyond that pgop grants and revokes nothing for that kind and
+  schema and reports `TooManyObjects`.
+- Reconciles are event-driven (a spec change, a change of a Role the
+  Database names, the periodic resync): a table created by a migration is
+  granted on by `"*"` at the next reconcile, not immediately. Pair `"*"` with
+  [default privileges](#default-privileges) for objects created later, or
+  touch the Database (an annotation) after a migration.
+- A named object that does not exist (yet) is reported with reason
+  `ObjectNotFound` and retried; the other grants are still applied.
+- pgop reads each kind of each schema with one catalog query per reconcile.
+
+### Which objects pgop grants on
+
+pgop runs `GRANT` as a superuser, which would let it grant on any object
+whatever its owner. It does not: a Database writer may only reach objects of
+the Cluster's trust domain. An object is granted on only when:
+
+- it is in a schema the Database manages (see
+  [Which schemas a Database manages](#which-schemas-a-database-manages); never
+  `pg_catalog`, `information_schema` or other system schemas);
+- it does not belong to an extension (`pg_depend` type `e`): grant on
+  extension objects with [`extensions[].grants`](#grants-on-extension-objects),
+  which has its own safety rules; and
+- its owner is the database owner or a role managed by a Role of the same
+  Cluster (neither of them a superuser), or the operator itself. The schema's
+  declared `owner` counts only when it is such a role: a Database writer can
+  declare any existing role the `owner` of an existing schema that role owns
+  (see [Which schemas a Database manages](#which-schemas-a-database-manages)),
+  and that must not open up the role's tables.
+
+Objects the operator owns (created by a bootstrap Job with the Cluster
+credentials, for example) act with superuser privileges where they act as
+their owner, so the [extension rules](#grants-on-extension-objects) apply to
+them: `EXECUTE` only on SQL and PL/pgSQL functions that are not
+`SECURITY DEFINER`, table privileges only on plain and partitioned tables (a
+view reads its tables with its owner's privileges), and never `TRIGGER` or
+`MAINTAIN` (a trigger, or an index expression evaluated by maintenance, on a
+table that superuser jobs write to would run code as that superuser).
+
+Everything else is skipped: objects owned by another superuser or by a role
+outside the Cluster's Roles (including roles listed in
+`allowedExistingRoles`), extension members, and the operator's objects above.
+A `SECURITY DEFINER` function owned by a managed (non-superuser) role is fine:
+it runs as that role.
+
+- Objects selected with `"*"` that are skipped are counted in
+  `status.objectGrants[]` (`skipped`, with up to five `skippedExamples`
+  naming the object and the reason) and make the `ObjectGrantsComplete`
+  condition `False` with reason `ObjectGrantSkipped`; they do not make the
+  Database unavailable (an extension in the schema is enough to skip
+  objects).
+- A **named** object that is skipped makes the Database `Available=False`
+  with reason `ObjectGrantSkipped`; the other grants are still applied.
+- An object that stops qualifying (its owner changed, a function became
+  `SECURITY DEFINER` under a superuser) has the privileges pgop added revoked.
+
+### Tracking and revoking
+
+- On every reconcile pgop compares what each grantee holds on each selected
+  object with the declared privileges and grants only what is missing, as
+  for the other grants (see [What pgop tracks](#what-pgop-tracks)).
+- `status.managedObjectGrants` records, **per object and grantee**, the
+  privileges and grant options pgop added (written before the `GRANT`). An
+  object that an entry no longer selects (the entry or a name was removed, a
+  `"*"` became a list, the object no longer qualifies) has exactly those
+  revoked; privileges granted by hand or held before are never revoked.
+- An object that was dropped is forgotten. So is one that was renamed or
+  moved to another schema (the privileges stay on it; pgop no longer tracks
+  them, and a `"*"` that selects it again finds them held and does not record
+  them).
+- The ledger holds at most 4096 entries (one per object and grantee): a
+  change that would exceed it is refused as a whole (`TooManyGrants`). For
+  large schemas, grant to one group role and make the application roles
+  members of it.
+- Grantees follow the [grantee policy](#grantee-policy); grants to a Role
+  being deleted are paused and revoked (see
+  [Roles: deletion](roles.md#deletion)).
+- Column privileges (`GRANT SELECT (col) ON ...`) are not supported.
+
+## Default Privileges
+
+`schemas[].defaultPrivileges` sets privileges for objects a role creates in
+the schema **later** (`ALTER DEFAULT PRIVILEGES FOR ROLE ... IN SCHEMA ...
+GRANT ...`). The typical case is a migrator role that creates tables which a
+read-only role must be able to read:
+
+```yaml
+spec:
+  schemas:
+    - name: app
+      owner: app_owner
+      grants:
+        - role: app_migrator
+          privileges: [USAGE, CREATE]
+        - role: app_ro
+          privileges: [USAGE]
+      defaultPrivileges:
+        - forRole: app_migrator        # tables app_migrator creates in app ...
+          role: app_ro                 # ... can be read by app_ro
+          kind: table
+          privileges: [SELECT]
+        - forRole: app_migrator
+          role: app_rw
+          kind: sequence
+          privileges: [USAGE, SELECT]
+      objectGrants:                    # tables that exist already
+        - role: app_ro
+          kind: table
+          objects: ["*"]
+          privileges: [SELECT]
+```
+
+- `forRole` is a raw PostgreSQL role name. It must be managed by a Role of the
+  same Cluster (created or adopted by it, recorded in its status, carrying its
+  marker) and must not be a superuser; `postgres`, `pgop_*` (the operator),
+  `pg_*` and `PUBLIC` are rejected by the API server. Anything else is refused
+  with reason `DefaultPrivilegeNotAllowed` (and what pgop set for it earlier
+  is removed); a `forRole` that does not exist yet is retried. Default
+  privileges only affect objects `forRole` creates in this schema of this
+  database.
+- `role` follows the [grantee policy](#grantee-policy) (`PUBLIC` allowed).
+- `kind`: `table` (tables, views, materialized views, foreign tables),
+  `sequence`, `function` (functions and procedures) or `type`, with the
+  privileges of `objectGrants`.
+- Default privileges only apply to objects created **after** they were set.
+  Use `objectGrants` with `"*"` for the existing ones (as above).
+- pgop records what it added in `status.managedDefaultPrivileges` and, when an
+  entry or a privilege is removed, runs `ALTER DEFAULT PRIVILEGES ...
+  REVOKE` for exactly that. Objects created in the meantime keep the
+  privileges they were created with (PostgreSQL copies them into the
+  object's own ACL); revoke them with `objectGrants` removal or by hand.
+- Deleting the `forRole`'s or the grantee's Role pauses the entry and
+  removes what pgop set. The grantee's Role deletion also revokes what the
+  default privileges gave it on the objects `forRole` created (see
+  [Roles: deletion](roles.md#deletion)).
+
 ## Grantee policy
 
-pgop grants as a superuser, so the grantee of every entry in `grants` and
-`schemas[].grants` must be one of:
+pgop grants as a superuser, so the grantee of every entry in `grants`,
+`schemas[].grants`, `schemas[].objectGrants`, `schemas[].defaultPrivileges`
+and `extensions[].grants` must be one of:
 
 - `PUBLIC` (see below);
 - a role managed by a Role of the same Cluster: the Role created or adopted it
@@ -486,7 +719,8 @@ spec:
 ## How two resources interact
 
 Every privilege pgop tracks belongs to exactly one resource: database,
-schema and extension grants are on the Database's own PostgreSQL database, which no other
+schema, extension and object grants and default privileges are on the
+Database's own PostgreSQL database, which no other
 Database manages (a second Database with the same PostgreSQL name reports
 `DuplicateDatabaseName` and does nothing), and a Role's parameter grants and
 memberships are for its own role (`DuplicateRoleName` likewise). So two
@@ -501,8 +735,9 @@ a privilege revoked by one is restored by the next reconcile of the other.
 Privileges granted outside pgop that are also declared are not tracked by
 the declaring resource and never revoked by it (see
 [What pgop tracks](#what-pgop-tracks)). Deleting a Role revokes the privileges its role holds on
-every database and schema, whatever Database granted them; the Databases stop
-granting to it while it is being deleted.
+every database and schema, whatever Database granted them, and the object
+grants and default privileges the Databases recorded for it; the Databases
+stop granting to it while it is being deleted.
 
 ## Database Settings
 
@@ -943,6 +1178,18 @@ the server:
 - grants on extension objects never include `EXECUTE` on `SECURITY DEFINER`
   or C functions, privileges on views, or `TRIGGER` (see
   [Grants on extension objects](#grants-on-extension-objects));
+- object grants only reach objects in schemas the Database manages whose
+  owner is in the Cluster's trust domain (the database owner or a role of the
+  Cluster's Roles, neither a superuser, or the operator under the extension
+  rules); objects of other superusers or
+  outside roles, extension members, and the operator's `SECURITY DEFINER`
+  and C functions, views and `TRIGGER`/`MAINTAIN` on its tables are refused
+  (see [Which objects pgop grants on](#which-objects-pgop-grants-on)).
+  pgop's `GRANT` runs as a superuser and could reach any of them; these
+  restrictions are what keeps a Database writer inside the trust domain;
+- default privileges are only set for non-superuser roles managed by the
+  Cluster's Roles, never for the operator, `postgres` or a DBA's role (see
+  [Default Privileges](#default-privileges));
 - system schemas (`pg_catalog`, `pg_toast`, other `pg_*` names and
   `information_schema`) cannot be created, owned or granted on (reason
   `SchemaNotAllowed`): `CREATE` on `pg_catalog` would let the grantee shadow
@@ -1089,6 +1336,9 @@ Database never drops it. A database's comment never authorizes a take-over
 - `PUBLIC` must be written in upper case and cannot get `withGrantOption`.
 - `schemas` names must be unique (at most 64 schemas) and each schema's
   `grants` lists a role at most once (at most 16 grants).
+- New: `schemas[].objectGrants` and `schemas[].defaultPrivileges` (see
+  [Object Grants](#object-grants)). Nothing changes for Databases that do not
+  use them. A Database that does gets the `ObjectGrantsComplete` condition.
 
 ## Schema with Grants
 
@@ -1105,8 +1355,9 @@ schemas:
 ```
 
 `USAGE` lets the role look up objects in the schema. Table privileges such as
-`SELECT` are not schema privileges and are not managed by pgop yet; grant them
-in your migrations (for example with `ALTER DEFAULT PRIVILEGES`).
+`SELECT` are not schema privileges: grant them with
+[`objectGrants`](#object-grants) and [`defaultPrivileges`](#default-privileges),
+or in your migrations.
 
 ## Multi-Schema Application
 
