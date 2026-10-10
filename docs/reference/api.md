@@ -366,7 +366,10 @@ setting is refused, `ExtensionNotAllowed` when an extension is refused,
 in `grants` or `schemas[].grants` is not allowed (grants to it are not
 applied, and revoked if pgop granted them), `PublicPrivilegeConflict` when
 `publicPrivileges` revokes what a `PUBLIC` grant grants, `TooManyGrants` when
-more schema grants are declared than pgop tracks (in all these cases the other
+the declared grants plus those pgop still tracks exceed the status ledger,
+`RevokeSkipped` (reported once) when a revoke was blocked by dependent
+privileges pgop did not enable, `SchemaNotManaged` for an existing schema the
+Database neither created nor owns (in all these cases the other
 settings, grants, extensions and schemas are still reconciled), `ReservedName` for a reserved
 database name, `DatabaseNotManaged` when the database exists but the Database neither
 created it (`status.databaseName`) nor may adopt it (the Cluster's
@@ -385,16 +388,18 @@ status:
   installedExtensions:
     - string               # List of installed extension names
   createdSchemas:
-    - string               # List of created schema names
-  managedGrants:           # Database privileges pgop granted (revoked when removed); max 512
+    - string               # Schemas the Database manages (created, or owned by the declared/database owner)
+  # Ledgers record only what pgop added (privileges the grantee did not hold,
+  # grant options it did not have); only these are revoked when removed.
+  managedGrants:           # max 512
     - role: string         # Role name or PUBLIC
       privileges: [string] # Normalized: CONNECT, CREATE, TEMPORARY
-      withGrantOption: boolean
-  managedSchemaGrants:     # Schema privileges pgop granted (revoked when removed); max 2048
+      grantOptions: [string]   # Privileges whose grant option pgop added
+  managedSchemaGrants:     # max 2048
     - schema: string
       role: string         # Role name or PUBLIC
       privileges: [string] # Normalized: CREATE, USAGE
-      withGrantOption: boolean
+      grantOptions: [string]
   revokedPublicPrivileges: # Default PUBLIC privileges pgop revoked (granted back when no longer requested)
     - string               # connect, temporary, publicSchemaUsage, publicSchemaCreate
   managedSettings:         # Lowercased parameter names pgop set (reset when removed)

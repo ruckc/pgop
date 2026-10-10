@@ -359,11 +359,13 @@ spec:
   `postgresql.auto.conf`, which overrides the Cluster's `spec.parameters`.
 - On a server older than PostgreSQL 15 the Role reports `Available=False` with
   reason `UnsupportedServerVersion`; nothing is granted.
-- pgop records what it granted in `status.managedParameterGrants`. Removing a
-  parameter (or turning `withGrantOption` off) revokes what pgop granted;
-  privileges granted outside pgop are never revoked. A revoke of privileges
-  granted with `withGrantOption` uses `CASCADE`, so grants the role passed on
-  are revoked too.
+- pgop grants only what the role does not hold yet and records only that (and
+  the grant options it added) in `status.managedParameterGrants`. Removing a
+  parameter (or turning `withGrantOption` off) revokes exactly that;
+  privileges the role already held, for example granted by hand, are never
+  revoked. Revoking a grant option pgop added uses `CASCADE`, so grants the
+  role passed on are revoked too (see
+  [Databases: what pgop tracks](databases.md#what-pgop-tracks)).
 - Only parameters whose `pg_settings.context` is `superuser` (the point of
   the feature) or `user`, and custom placeholders the server does not know,
   are granted. Other contexts are refused with `ParameterNotAllowed` (and a

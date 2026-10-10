@@ -209,7 +209,7 @@ func (r *DatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	// Schema grants and PUBLIC's privileges on the schema public, once every
 	// schema exists. Like the database grants, a problem here is reported
 	// after the credentials Secret is reconciled.
-	accessErr = errors.Join(refusedErr, accessErr, reconcileSchemaAccess(ctx, dbClient, database, pgName, checker))
+	accessErr = errors.Join(refusedErr, accessErr, reconcileSchemaAccess(ctx, dbClient, database, pgName, createdSchemas, checker))
 
 	if err := r.reconcileCredentialsSecret(ctx, database, ownerRole, cluster); err != nil {
 		log.Error(err, "Failed to reconcile database credentials secret")
@@ -253,28 +253,110 @@ func installExtensions(ctx context.Context, pg *postgres.Client, policy *postgre
 	return installed, refusedErr, nil
 }
 
-// reconcileSchemas creates the Database's schemas (their grants are applied
-// by reconcileSchemaGrants). System schemas are refused. It returns the
-// created schemas, a SchemaNotAllowed error listing the refused ones (nil
-// when none) and the error that stopped it.
-func reconcileSchemas(ctx context.Context, pg *postgres.Client, database *postgresv1alpha1.Database) (created []string, refusedErr, err error) {
-	created = make([]string, 0, len(database.Spec.Schemas))
-	var refused []string
-	for _, schema := range database.Spec.Schemas {
+// schemaClient is the subset of *postgres.Client used to create schemas and
+// decide which existing schemas a Database manages.
+type schemaClient interface {
+	SchemaOwner(ctx context.Context, name string) (owner string, exists bool, err error)
+	CurrentDatabaseOwner(ctx context.Context) (string, error)
+	CreateSchema(ctx context.Context, name, owner string) error
+	AlterSchemaOwner(ctx context.Context, name, owner string) error
+	LookupRole(ctx context.Context, name string) (*postgres.ReachableRole, error)
+}
+
+var _ schemaClient = (*postgres.Client)(nil)
+
+// pgDatabaseOwnerRole is the predefined role that stands for the owner of
+// the current database (it owns the schema public since PostgreSQL 15).
+const pgDatabaseOwnerRole = "pg_database_owner"
+
+// reconcileSchemas creates the Database's schemas and sets the owner of the
+// ones it manages (their grants are applied by reconcileSchemaGrants). A
+// schema is managed when the Database created it (it is recorded in
+// status.createdSchemas) or, for an existing schema, when it is owned by a
+// role that is not a superuser and is the schema's declared owner, the
+// database's owner, or pg_database_owner. Any other existing schema (one an
+// extension script, the operator or another role created) is left alone:
+// its owner is not changed and no grants are applied on it (reason
+// SchemaNotManaged). System schemas are refused (SchemaNotAllowed). A schema
+// without a declared owner is created owned by the database's owner. It
+// returns the managed schemas, an error listing the refused ones (nil when
+// none) and the error that stopped it.
+func reconcileSchemas(ctx context.Context, pg schemaClient, database *postgresv1alpha1.Database) (managed []string, refusedErr, err error) {
+	recorded := map[string]bool{}
+	for _, s := range database.Status.CreatedSchemas {
+		recorded[s] = true
+	}
+	managed = make([]string, 0, len(database.Spec.Schemas))
+	// On an error, schemas not reached yet keep their record.
+	keepRecorded := func(from int) []string {
+		for _, s := range database.Spec.Schemas[from:] {
+			if recorded[s.Name] {
+				managed = append(managed, s.Name)
+			}
+		}
+		return managed
+	}
+	dbOwner, err := pg.CurrentDatabaseOwner(ctx)
+	if err != nil {
+		return keepRecorded(0), nil, err
+	}
+	var system, notManaged []string
+	for i, schema := range database.Spec.Schemas {
 		if systemSchemaName(schema.Name) {
-			refused = append(refused, schema.Name)
+			system = append(system, schema.Name)
 			continue
 		}
-		if err := pg.CreateSchema(ctx, schema.Name, schema.Owner); err != nil {
-			return created, nil, fmt.Errorf("schema %q: %w", schema.Name, err)
+		owner, exists, err := pg.SchemaOwner(ctx, schema.Name)
+		if err != nil {
+			return keepRecorded(i), nil, err
 		}
-		created = append(created, schema.Name)
+		if !exists {
+			createAs := schema.Owner
+			if createAs == "" {
+				createAs = dbOwner
+			}
+			err := pg.CreateSchema(ctx, schema.Name, createAs)
+			if errors.Is(err, postgres.ErrObjectExists) {
+				notManaged = append(notManaged, schema.Name+" (created by someone else meanwhile)")
+				continue
+			}
+			if err != nil {
+				return keepRecorded(i), nil, fmt.Errorf("schema %q: %w", schema.Name, err)
+			}
+			managed = append(managed, schema.Name)
+			continue
+		}
+		allowed := recorded[schema.Name]
+		if !allowed && (owner == schema.Owner || owner == dbOwner || owner == pgDatabaseOwnerRole) {
+			r, err := pg.LookupRole(ctx, owner)
+			if err != nil {
+				return keepRecorded(i), nil, err
+			}
+			allowed = r != nil && !r.Superuser
+		}
+		if !allowed {
+			notManaged = append(notManaged, fmt.Sprintf("%s (owned by %s)", schema.Name, owner))
+			continue
+		}
+		if schema.Owner != "" && owner != schema.Owner {
+			if err := pg.AlterSchemaOwner(ctx, schema.Name, schema.Owner); err != nil {
+				return keepRecorded(i), nil, fmt.Errorf("schema %q: %w", schema.Name, err)
+			}
+		}
+		managed = append(managed, schema.Name)
 	}
-	if len(refused) > 0 {
-		refusedErr = &conditionError{reason: ReasonSchemaNotAllowed, err: fmt.Errorf(
-			"system schemas cannot be managed: %s", strings.Join(refused, ", "))}
+	var errs []error
+	if len(system) > 0 {
+		errs = append(errs, &conditionError{reason: ReasonSchemaNotAllowed, err: fmt.Errorf(
+			"system schemas cannot be managed: %s", strings.Join(system, ", "))})
 	}
-	return created, refusedErr, nil
+	if len(notManaged) > 0 {
+		errs = append(errs, &conditionError{reason: ReasonSchemaNotManaged, err: fmt.Errorf(
+			"existing schemas this Database did not create and that are not owned by the declared owner or the "+
+				"database owner (or are owned by a superuser) are left alone, without owner change or grants: %s",
+			strings.Join(notManaged, ", "))})
+	}
+	return managed, errors.Join(errs...), nil
 }
 
 // databaseOwnershipClient is the subset of *postgres.Client used to create a
@@ -464,12 +546,22 @@ func (r *DatabaseReconciler) reconcileDatabaseAccess(ctx context.Context, pg *po
 	return checker, accessErr, nil
 }
 
-// reconcileSchemaAccess applies the schema grants and PUBLIC's privileges on
-// the schema public, on a connection to the database.
+// setOf returns the elements of s as a set.
+func setOf(s []string) map[string]bool {
+	out := make(map[string]bool, len(s))
+	for _, x := range s {
+		out[x] = true
+	}
+	return out
+}
+
+// reconcileSchemaAccess applies the grants on the schemas the Database
+// manages and PUBLIC's privileges on the schema public, on a connection to
+// the database.
 func reconcileSchemaAccess(ctx context.Context, pg *postgres.Client, database *postgresv1alpha1.Database, pgName string,
-	checker *granteeChecker) error {
+	managedSchemas []string, checker *granteeChecker) error {
 	err := errors.Join(
-		reconcileSchemaGrants(ctx, pg, database, checker),
+		reconcileSchemaGrants(ctx, pg, database, setOf(managedSchemas), checker),
 		reconcilePublicPrivileges(ctx, pg, database, pgName, postgres.ObjectSchema),
 	)
 	if err != nil {
@@ -600,7 +692,12 @@ func (r *DatabaseReconciler) getCluster(ctx context.Context, database *postgresv
 func (r *DatabaseReconciler) updateStatus(ctx context.Context, database *postgresv1alpha1.Database, ready bool, extensions, schemas []string, reconcileErr error) (ctrl.Result, error) {
 	database.Status.Ready = ready
 	database.Status.InstalledExtensions = extensions
-	database.Status.CreatedSchemas = schemas
+	// nil means the schemas were not reconciled: keep the record of the
+	// schemas the Database manages (it decides which existing schemas it may
+	// change).
+	if schemas != nil {
+		database.Status.CreatedSchemas = schemas
+	}
 
 	condition := metav1.Condition{
 		Type:               ConditionTypeAvailable,

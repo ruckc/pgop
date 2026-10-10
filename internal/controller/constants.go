@@ -162,9 +162,19 @@ const (
 	// privilege from PUBLIC that spec.grants or schemas[public].grants grant
 	// to PUBLIC. That PUBLIC privilege is left as it is.
 	ReasonPublicPrivilegeConflict = "PublicPrivilegeConflict"
-	// ReasonTooManyGrants: the Database declares more schema grants than pgop
-	// tracks. Nothing is granted or revoked on schemas.
+	// ReasonTooManyGrants: the grants declared, together with those pgop
+	// still tracks, exceed what the status ledger can hold. Nothing of that
+	// kind is granted or revoked until grants are removed from the spec.
 	ReasonTooManyGrants = "TooManyGrants"
+	// ReasonRevokeSkipped: a privilege pgop granted could not be revoked
+	// without CASCADE because the grantee passed it on with a grant option
+	// pgop did not give. pgop does not cascade into that; it stops tracking
+	// the privilege and reports it once.
+	ReasonRevokeSkipped = "RevokeSkipped"
+	// ReasonSchemaNotManaged: Database.spec.schemas names an existing schema
+	// the Database neither created nor owns (for example one an extension or
+	// another role created). pgop does not change its owner or its grants.
+	ReasonSchemaNotManaged = "SchemaNotManaged"
 
 	DefaultPostgresImage    = "postgres:18"
 	DefaultOperatorUsername = "pgop_operator"

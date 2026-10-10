@@ -67,7 +67,7 @@ func TestPrivilegesIntegration(t *testing.T) {
 	dbObj := PrivilegeObject{Kind: ObjectDatabase, Name: db}
 	publicOn := func(c *Client, obj PrivilegeObject) []string {
 		t.Helper()
-		privs, found, err := c.PublicPrivileges(ctx, obj)
+		privs, _, found, err := c.HeldPrivileges(ctx, obj, PublicGrantee)
 		if err != nil || !found {
 			t.Fatalf("PublicPrivileges(%s) = %v %t %v", obj, privs, found, err)
 		}
@@ -76,7 +76,7 @@ func TestPrivilegesIntegration(t *testing.T) {
 	if got := publicOn(admin, dbObj); !slices.Equal(got, []string{PrivilegeConnect, PrivilegeTemporary}) {
 		t.Errorf("default PUBLIC privileges on the database = %v", got)
 	}
-	if _, found, err := admin.PublicPrivileges(ctx, PrivilegeObject{Kind: ObjectDatabase, Name: "pgop_priv_missing"}); err != nil || found {
+	if _, _, found, err := admin.HeldPrivileges(ctx, PrivilegeObject{Kind: ObjectDatabase, Name: "pgop_priv_missing"}, PublicGrantee); err != nil || found {
 		t.Errorf("PublicPrivileges of a missing database: found=%t err=%v", found, err)
 	}
 
@@ -113,7 +113,68 @@ WHERE d.datname = $1 AND a.grantee = (SELECT oid FROM pg_roles WHERE rolname = '
 	defer func() { _ = c.Close() }()
 	exec(c, `CREATE SCHEMA app`)
 	checkSchemaPrivilegesIntegration(ctx, t, c, publicOn)
+	checkHeldPrivilegesIntegration(ctx, t, c, cfg.User, exec)
 	_ = c.Close()
+}
+
+// checkHeldPrivilegesIntegration checks HeldPrivileges (the owner's implicit
+// privileges, grants with the grant option, parameters) and the detection of
+// "dependent privileges exist", on a connection to a database whose schema
+// app is owned by operator (see TestPrivilegesIntegration).
+func checkHeldPrivilegesIntegration(ctx context.Context, t *testing.T, c *Client, operator string, exec func(*Client, string)) {
+	t.Helper()
+	app := PrivilegeObject{Kind: ObjectSchema, Name: testMember}
+	held := func(obj PrivilegeObject, grantee string) ([]string, []string) {
+		t.Helper()
+		privs, grantable, found, err := c.HeldPrivileges(ctx, obj, grantee)
+		if err != nil || !found {
+			t.Fatalf("HeldPrivileges(%s, %s) = %v %v %t %v", obj, grantee, privs, grantable, found, err)
+		}
+		return privs, grantable
+	}
+	both := []string{PrivilegeCreate, PrivilegeUsage}
+	if p, g := held(app, operator); !slices.Equal(p, both) || !slices.Equal(g, both) {
+		t.Errorf("the owner's implicit privileges = %v / %v, want %v with the grant option", p, g, both)
+	}
+	if p, _ := held(app, "pgop_priv_reader"); len(p) != 0 {
+		t.Errorf("privileges before any grant = %v", p)
+	}
+	if err := c.GrantPrivileges(ctx, app, "pgop_priv_reader", []string{PrivilegeUsage}, true); err != nil {
+		t.Fatal(err)
+	}
+	if p, g := held(app, "pgop_priv_reader"); !slices.Equal(p, []string{PrivilegeUsage}) || !slices.Equal(g, []string{PrivilegeUsage}) {
+		t.Errorf("after GRANT USAGE WITH GRANT OPTION: %v / %v", p, g)
+	}
+
+	// The grantee passes the privilege on: a plain REVOKE fails with
+	// "dependent privileges exist", which pgop recognizes.
+	exec(c, `CREATE ROLE pgop_priv_dep`)
+	t.Cleanup(func() { _, _ = c.db.ExecContext(ctx, `DROP OWNED BY pgop_priv_dep; DROP ROLE IF EXISTS pgop_priv_dep`) })
+	exec(c, `SET ROLE pgop_priv_reader; GRANT USAGE ON SCHEMA app TO pgop_priv_dep; RESET ROLE`)
+	err := c.RevokePrivileges(ctx, app, "pgop_priv_reader", []string{PrivilegeUsage}, RevokeMode{})
+	if !DependentPrivilegesExist(err) {
+		t.Errorf("plain REVOKE with dependents = %v, want dependent privileges exist", err)
+	}
+	if err := c.RevokePrivileges(ctx, app, "pgop_priv_reader", []string{PrivilegeUsage}, RevokeMode{Cascade: true}); err != nil {
+		t.Fatal(err)
+	}
+	if p, _ := held(app, "pgop_priv_dep"); len(p) != 0 {
+		t.Errorf("the cascade left %v to the dependent role", p)
+	}
+
+	param := PrivilegeObject{Kind: ObjectParameter, Name: "Log_Statement"}
+	if p, _ := held(param, "pgop_priv_reader"); len(p) != 0 {
+		t.Errorf("parameter privileges before any grant = %v", p)
+	}
+	if err := c.GrantPrivileges(ctx, param, "pgop_priv_reader", []string{PrivilegeSet}, false); err != nil {
+		t.Fatal(err)
+	}
+	if p, g := held(param, "pgop_priv_reader"); !slices.Equal(p, []string{PrivilegeSet}) || len(g) != 0 {
+		t.Errorf("after GRANT SET ON PARAMETER: %v / %v", p, g)
+	}
+	if err := c.RevokePrivileges(ctx, param, "pgop_priv_reader", []string{PrivilegeSet}, RevokeMode{}); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // checkRoleGrantsIntegration checks grants with the grant option, cascading
@@ -173,7 +234,7 @@ func checkSchemaPrivilegesIntegration(ctx context.Context, t *testing.T, c *Clie
 			t.Errorf("SchemaExists(%s) = %t %v", name, got, err)
 		}
 	}
-	if _, found, err := c.PublicPrivileges(ctx, PrivilegeObject{Kind: ObjectSchema, Name: "pgop_missing"}); err != nil || found {
+	if _, _, found, err := c.HeldPrivileges(ctx, PrivilegeObject{Kind: ObjectSchema, Name: "pgop_missing"}, PublicGrantee); err != nil || found {
 		t.Errorf("PublicPrivileges of a missing schema: found=%t err=%v", found, err)
 	}
 }

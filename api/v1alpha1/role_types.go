@@ -248,14 +248,19 @@ type ManagedParameterGrant struct {
 	// parameter is the parameter name, normalized to lowercase.
 	Parameter string `json:"parameter"`
 
-	// privileges are the granted privileges.
-	// +listType=set
-	Privileges []string `json:"privileges"`
-
-	// withGrantOption records whether pgop granted the privileges with the
-	// grant option.
+	// privileges are the privileges pgop added: those the role did not hold
+	// before pgop granted them. Only these are revoked once they leave the
+	// spec.
 	// +optional
-	WithGrantOption bool `json:"withGrantOption,omitempty"`
+	// +listType=set
+	Privileges []string `json:"privileges,omitempty"`
+
+	// grantOptions are the privileges whose grant option pgop added (the
+	// grantee could not grant them on before). Revoking them cascades to
+	// what the grantee passed on.
+	// +optional
+	// +listType=set
+	GrantOptions []string `json:"grantOptions,omitempty"`
 }
 
 // RoleStatus defines the observed state of Role.

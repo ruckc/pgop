@@ -442,8 +442,12 @@ spec:
                 - type
                 x-kubernetes-list-type: map
               createdSchemas:
-                description: createdSchemas lists schemas that have been successfully
-                  created
+                description: |-
+                  createdSchemas lists the schemas this Database manages: those it
+                  created, and existing ones owned by a non-superuser that is the
+                  schema's declared owner, the database owner or pg_database_owner. Only
+                  these are re-owned and granted on; a schema listed here stays managed
+                  while it is in spec.schemas.
                 items:
                   type: string
                 type: array
@@ -465,10 +469,20 @@ spec:
                   description: ManagedDatabaseGrant records database privileges that
                     pgop granted to a role.
                   properties:
+                    grantOptions:
+                      description: |-
+                        grantOptions are the privileges whose grant option pgop added (the
+                        grantee could not grant them on before). Revoking them cascades to
+                        what the grantee passed on.
+                      items:
+                        type: string
+                      type: array
+                      x-kubernetes-list-type: set
                     privileges:
                       description: |-
-                        privileges are the granted privileges, normalized (TEMP is recorded as
-                        TEMPORARY and ALL as CONNECT, CREATE and TEMPORARY).
+                        privileges are the privileges pgop added: those the grantee did not
+                        hold before pgop granted them (normalized: TEMPORARY, not TEMP; ALL is
+                        expanded). Only these are revoked once they leave the spec.
                       items:
                         type: string
                       type: array
@@ -477,13 +491,7 @@ spec:
                       description: role is the PostgreSQL role the privileges were
                         granted to.
                       type: string
-                    withGrantOption:
-                      description: |-
-                        withGrantOption records whether pgop granted the privileges with the
-                        grant option.
-                      type: boolean
                   required:
-                  - privileges
                   - role
                   type: object
                 maxItems: 512
@@ -499,10 +507,20 @@ spec:
                   description: ManagedSchemaGrant records schema privileges that pgop
                     granted to a role.
                   properties:
+                    grantOptions:
+                      description: |-
+                        grantOptions are the privileges whose grant option pgop added (the
+                        grantee could not grant them on before). Revoking them cascades to
+                        what the grantee passed on.
+                      items:
+                        type: string
+                      type: array
+                      x-kubernetes-list-type: set
                     privileges:
                       description: |-
-                        privileges are the granted privileges, normalized (ALL is recorded as
-                        CREATE and USAGE).
+                        privileges are the privileges pgop added: those the grantee did not
+                        hold before pgop granted them (normalized: ALL is expanded to CREATE
+                        and USAGE). Only these are revoked once they leave the spec.
                       items:
                         type: string
                       type: array
@@ -513,13 +531,7 @@ spec:
                     schema:
                       description: schema is the schema the privileges are on.
                       type: string
-                    withGrantOption:
-                      description: |-
-                        withGrantOption records whether pgop granted the privileges with the
-                        grant option.
-                      type: boolean
                   required:
-                  - privileges
                   - role
                   - schema
                   type: object

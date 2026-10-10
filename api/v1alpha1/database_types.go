@@ -183,15 +183,19 @@ type ManagedDatabaseGrant struct {
 	// role is the PostgreSQL role the privileges were granted to.
 	Role string `json:"role"`
 
-	// privileges are the granted privileges, normalized (TEMP is recorded as
-	// TEMPORARY and ALL as CONNECT, CREATE and TEMPORARY).
-	// +listType=set
-	Privileges []string `json:"privileges"`
-
-	// withGrantOption records whether pgop granted the privileges with the
-	// grant option.
+	// privileges are the privileges pgop added: those the grantee did not
+	// hold before pgop granted them (normalized: TEMPORARY, not TEMP; ALL is
+	// expanded). Only these are revoked once they leave the spec.
 	// +optional
-	WithGrantOption bool `json:"withGrantOption,omitempty"`
+	// +listType=set
+	Privileges []string `json:"privileges,omitempty"`
+
+	// grantOptions are the privileges whose grant option pgop added (the
+	// grantee could not grant them on before). Revoking them cascades to
+	// what the grantee passed on.
+	// +optional
+	// +listType=set
+	GrantOptions []string `json:"grantOptions,omitempty"`
 }
 
 // ExtensionSpec defines a PostgreSQL extension to install
@@ -286,15 +290,19 @@ type ManagedSchemaGrant struct {
 	// role is the grantee: a PostgreSQL role, or PUBLIC.
 	Role string `json:"role"`
 
-	// privileges are the granted privileges, normalized (ALL is recorded as
-	// CREATE and USAGE).
-	// +listType=set
-	Privileges []string `json:"privileges"`
-
-	// withGrantOption records whether pgop granted the privileges with the
-	// grant option.
+	// privileges are the privileges pgop added: those the grantee did not
+	// hold before pgop granted them (normalized: ALL is expanded to CREATE
+	// and USAGE). Only these are revoked once they leave the spec.
 	// +optional
-	WithGrantOption bool `json:"withGrantOption,omitempty"`
+	// +listType=set
+	Privileges []string `json:"privileges,omitempty"`
+
+	// grantOptions are the privileges whose grant option pgop added (the
+	// grantee could not grant them on before). Revoking them cascades to
+	// what the grantee passed on.
+	// +optional
+	// +listType=set
+	GrantOptions []string `json:"grantOptions,omitempty"`
 }
 
 // DatabaseStatus defines the observed state of Database.
@@ -316,7 +324,11 @@ type DatabaseStatus struct {
 	// +optional
 	InstalledExtensions []string `json:"installedExtensions,omitempty"`
 
-	// createdSchemas lists schemas that have been successfully created
+	// createdSchemas lists the schemas this Database manages: those it
+	// created, and existing ones owned by a non-superuser that is the
+	// schema's declared owner, the database owner or pg_database_owner. Only
+	// these are re-owned and granted on; a schema listed here stays managed
+	// while it is in spec.schemas.
 	// +optional
 	CreatedSchemas []string `json:"createdSchemas,omitempty"`
 

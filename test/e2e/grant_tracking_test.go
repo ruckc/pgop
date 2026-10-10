@@ -197,6 +197,44 @@ spec:
 			waitReady(dbRes)
 		})
 
+		It("never revokes privileges the grantee already held, and leaves unmanaged schemas alone", func() {
+			By("declaring grants PostgreSQL's defaults and the schema owner already give")
+			patch(dbRes, `{"spec":{"grants":[{"role":"track_reader","privileges":["CONNECT"]},{"role":"PUBLIC","privileges":["CONNECT"]}],`+
+				`"schemas":[{"name":"public","grants":[{"role":"PUBLIC","privileges":["USAGE"]}]},`+
+				`{"name":"owned","owner":"track_reader","grants":[{"role":"track_reader","privileges":["ALL"],"withGrantOption":true}]}]}}`)
+			Eventually(func(g Gomega) {
+				g.Expect(queryDB(g, "track_db", `SELECT count(*) FROM pg_namespace WHERE nspname = 'owned'`)).To(Equal("1"))
+				g.Expect(jsonpath(g, dbRes, "{.status.ready}")).To(Equal("true"))
+				// Nothing was added, so nothing is recorded.
+				g.Expect(jsonpath(g, dbRes, "{.status.managedSchemaGrants}")).To(BeEmpty())
+				g.Expect(jsonpath(g, dbRes, "{.status.managedGrants}")).NotTo(ContainSubstring("PUBLIC"))
+			}).Should(Succeed())
+
+			By("removing them keeps PUBLIC's defaults and the owner's privileges")
+			patch(dbRes, `{"spec":{"grants":[{"role":"track_reader","privileges":["CONNECT"]}],"schemas":null}}`)
+			Consistently(func(g Gomega) {
+				g.Expect(queryDB(g, "postgres", publicOnDB)).To(Equal("CONNECT,TEMPORARY"))
+				g.Expect(queryDB(g, "track_db", publicOnSchema("public"))).To(Equal("USAGE"))
+				g.Expect(queryDB(g, "track_db", `SELECT has_schema_privilege('track_reader', 'owned', 'CREATE')`)).To(Equal("t"))
+				g.Expect(queryDB(g, "track_db", `SELECT has_schema_privilege('track_reader', 'owned', 'USAGE')`)).To(Equal("t"))
+			}, 20*time.Second, 2*time.Second).Should(Succeed())
+			waitReady(dbRes)
+
+			By("refusing to take over or grant on a schema the Database did not create and does not own")
+			_, err := psqlDB("track_db", `CREATE SCHEMA foreign_s`)
+			Expect(err).NotTo(HaveOccurred())
+			patch(dbRes, `{"spec":{"schemas":[{"name":"foreign_s","owner":"track_reader","grants":[{"role":"track_reader","privileges":["USAGE"]}]}]}}`)
+			Eventually(func(g Gomega) {
+				g.Expect(jsonpath(g, dbRes, availableReason)).To(Equal("SchemaNotManaged"))
+			}).Should(Succeed())
+			Consistently(func(g Gomega) {
+				g.Expect(queryDB(g, "track_db", `SELECT pg_get_userbyid(nspowner) <> 'track_reader' FROM pg_namespace WHERE nspname = 'foreign_s'`)).To(Equal("t"))
+				g.Expect(queryDB(g, "track_db", `SELECT has_schema_privilege('track_reader', 'foreign_s', 'USAGE')`)).To(Equal("f"))
+			}, 10*time.Second, 2*time.Second).Should(Succeed())
+			patch(dbRes, `{"spec":{"schemas":null}}`)
+			waitReady(dbRes)
+		})
+
 		It("refuses grantees outside the policy and revokes them once they are no longer allowed", func() {
 			for _, q := range []string{`CREATE ROLE track_outsider NOLOGIN`, `CREATE ROLE track_su NOLOGIN SUPERUSER`} {
 				_, err := psql(q)

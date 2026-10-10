@@ -33,7 +33,6 @@ import (
 // interface so the logic can be tested without a server.
 type databaseGrantClient interface {
 	privilegeExecutor
-	publicPrivilegeClient
 	RoleExists(ctx context.Context, name string) (bool, error)
 	SetDatabaseParameter(ctx context.Context, database, parameter, value string) error
 	ResetDatabaseParameter(ctx context.Context, database, parameter string) error
@@ -41,6 +40,13 @@ type databaseGrantClient interface {
 }
 
 var _ databaseGrantClient = (*postgres.Client)(nil)
+
+// Ledger limits: the maxItems of status.managedGrants and
+// status.managedSchemaGrants.
+const (
+	databaseGrantLedgerLimit ledgerLimit = 512
+	schemaGrantLedgerLimit   ledgerLimit = 2048
+)
 
 // databaseTarget is the ledger target of a database grant to grantee.
 func databaseTarget(database, grantee string) grantTarget {
@@ -65,7 +71,7 @@ func desiredDatabaseGrants(grants []postgresv1alpha1.DatabaseGrantSpec, pgName s
 		if err != nil {
 			return nil, fmt.Errorf("grants[%s]: %w", g.Role, err)
 		}
-		out = append(out, privilegeGrant{Target: t, Privileges: privs, WithGrantOption: g.WithGrantOption})
+		out = append(out, desiredGrant(t, privs, g.WithGrantOption))
 	}
 	return out, nil
 }
@@ -85,11 +91,11 @@ func roleGone(pg interface {
 }
 
 // reconcileDatabaseGrants brings the database-level privileges on pgName to
-// the state declared by database.Spec.Grants and records the grants pgop
-// manages in database.Status.ManagedGrants (the caller persists the status).
-// Grants to grantees the checker holds back (refused by the grantee policy,
-// missing, or whose Role is being deleted) are not applied, revoked when
-// pgop granted them, and reported after the others are applied.
+// the state declared by database.Spec.Grants and records what pgop added in
+// database.Status.ManagedGrants (the caller persists the status). Grants to
+// grantees the checker holds back (refused by the grantee policy, missing, or
+// whose Role is being deleted) are not applied, revoked as far as pgop added
+// them, and reported after the others are applied.
 func reconcileDatabaseGrants(ctx context.Context, pg databaseGrantClient, database *postgresv1alpha1.Database, pgName string,
 	checker *granteeChecker) error {
 	all, err := desiredDatabaseGrants(database.Spec.Grants, pgName)
@@ -98,7 +104,7 @@ func reconcileDatabaseGrants(ctx context.Context, pg databaseGrantClient, databa
 	}
 	managed := make([]privilegeGrant, 0, len(database.Status.ManagedGrants))
 	for _, m := range database.Status.ManagedGrants {
-		managed = append(managed, privilegeGrant{Target: databaseTarget(pgName, m.Role), Privileges: m.Privileges, WithGrantOption: m.WithGrantOption})
+		managed = append(managed, privilegeGrant{Target: databaseTarget(pgName, m.Role), Privileges: m.Privileges, GrantOptions: m.GrantOptions})
 	}
 	if len(all) == 0 && len(managed) == 0 {
 		return nil
@@ -109,11 +115,11 @@ func reconcileDatabaseGrants(ctx context.Context, pg databaseGrantClient, databa
 		return err
 	}
 
-	after, err := applyPrivilegeGrants(ctx, desired, managed, executorOps(pg, roleGone(pg)))
+	after, err := applyPrivilegeGrants(ctx, desired, managed, executorOps(pg, roleGone(pg)), databaseGrantLedgerLimit)
 	database.Status.ManagedGrants = nil
 	for _, g := range after {
 		database.Status.ManagedGrants = append(database.Status.ManagedGrants, postgresv1alpha1.ManagedDatabaseGrant{
-			Role: g.Target.Grantee, Privileges: g.Privileges, WithGrantOption: g.WithGrantOption,
+			Role: g.Target.Grantee, Privileges: g.Privileges, GrantOptions: g.GrantOptions,
 		})
 	}
 	return errors.Join(err, held.err())
@@ -129,25 +135,20 @@ type schemaGrantClient interface {
 
 var _ schemaGrantClient = (*postgres.Client)(nil)
 
-// maxSchemaGrants bounds the schema grants pgop tracks per Database (the CRD
-// allows 64 schemas with 16 grants each), which keeps
-// status.managedSchemaGrants well below the object size limit.
-const maxSchemaGrants = 1024
-
 // schemaTarget is the ledger target of a schema grant to grantee.
 func schemaTarget(schema, grantee string) grantTarget {
 	return grantTarget{Kind: postgres.ObjectSchema, Name: schema, Grantee: postgres.CanonicalGrantee(grantee)}
 }
 
 // desiredSchemaGrants converts spec.schemas[].grants to canonical privilege
-// grants, grouped by the schema field they come from (in spec order). System
-// schemas are skipped (they are refused by reconcileSchemas).
-func desiredSchemaGrants(schemas []postgresv1alpha1.SchemaSpec) (fields []string, grants map[string][]privilegeGrant, err error) {
+// grants, grouped by the schema field they come from (in spec order). Only
+// schemas in managedSchemas are included: system schemas and existing
+// schemas the Database does not manage are refused by reconcileSchemas.
+func desiredSchemaGrants(schemas []postgresv1alpha1.SchemaSpec, managedSchemas map[string]bool) (fields []string, grants map[string][]privilegeGrant, err error) {
 	grants = map[string][]privilegeGrant{}
 	seen := map[string]bool{}
-	total := 0
 	for _, s := range schemas {
-		if systemSchemaName(s.Name) || len(s.Grants) == 0 {
+		if !managedSchemas[s.Name] || len(s.Grants) == 0 {
 			continue
 		}
 		field := fmt.Sprintf("schemas[%s].grants", s.Name)
@@ -169,33 +170,30 @@ func desiredSchemaGrants(schemas []postgresv1alpha1.SchemaSpec) (fields []string
 			if err != nil {
 				return nil, nil, fmt.Errorf("%s[%s]: %w", field, g.Role, err)
 			}
-			list = append(list, privilegeGrant{Target: t, Privileges: privs, WithGrantOption: g.WithGrantOption})
+			list = append(list, desiredGrant(t, privs, g.WithGrantOption))
 		}
 		grants[field] = list
-		total += len(list)
-	}
-	if total > maxSchemaGrants {
-		return nil, nil, &conditionError{reason: ReasonTooManyGrants, err: fmt.Errorf(
-			"schemas declare %d grants; pgop tracks at most %d per Database", total, maxSchemaGrants)}
 	}
 	return fields, grants, nil
 }
 
 // reconcileSchemaGrants brings the schema privileges to the state declared
-// by spec.schemas[].grants and records the grants pgop manages in
+// by spec.schemas[].grants and records what pgop added in
 // database.Status.ManagedSchemaGrants (the caller persists the status). It
-// runs on a connection to the database, after the schemas were created.
-// Privileges pgop granted are revoked once they leave the spec, also when the
+// runs on a connection to the database, after the schemas were created;
+// managedSchemas are the schemas the Database manages (see reconcileSchemas).
+// Privileges pgop added are revoked once they leave the spec, also when the
 // whole schema entry is removed (the schema is not dropped); a schema or
 // grantee that no longer exists holds nothing to revoke.
-func reconcileSchemaGrants(ctx context.Context, pg schemaGrantClient, database *postgresv1alpha1.Database, checker *granteeChecker) error {
-	fields, all, err := desiredSchemaGrants(database.Spec.Schemas)
+func reconcileSchemaGrants(ctx context.Context, pg schemaGrantClient, database *postgresv1alpha1.Database,
+	managedSchemas map[string]bool, checker *granteeChecker) error {
+	fields, all, err := desiredSchemaGrants(database.Spec.Schemas, managedSchemas)
 	if err != nil {
 		return err
 	}
 	managed := make([]privilegeGrant, 0, len(database.Status.ManagedSchemaGrants))
 	for _, m := range database.Status.ManagedSchemaGrants {
-		managed = append(managed, privilegeGrant{Target: schemaTarget(m.Schema, m.Role), Privileges: m.Privileges, WithGrantOption: m.WithGrantOption})
+		managed = append(managed, privilegeGrant{Target: schemaTarget(m.Schema, m.Role), Privileges: m.Privileges, GrantOptions: m.GrantOptions})
 	}
 	if len(fields) == 0 && len(managed) == 0 {
 		return nil
@@ -218,19 +216,14 @@ func reconcileSchemaGrants(ctx context.Context, pg schemaGrantClient, database *
 		}
 		return roleIsGone(ctx, t)
 	}
-	after, err := applyPrivilegeGrants(ctx, desired, managed, executorOps(pg, gone))
+	after, err := applyPrivilegeGrants(ctx, desired, managed, executorOps(pg, gone), schemaGrantLedgerLimit)
 	database.Status.ManagedSchemaGrants = nil
 	for _, g := range after {
 		database.Status.ManagedSchemaGrants = append(database.Status.ManagedSchemaGrants, postgresv1alpha1.ManagedSchemaGrant{
-			Schema: g.Target.Name, Role: g.Target.Grantee, Privileges: g.Privileges, WithGrantOption: g.WithGrantOption,
+			Schema: g.Target.Name, Role: g.Target.Grantee, Privileges: g.Privileges, GrantOptions: g.GrantOptions,
 		})
 	}
 	return errors.Join(err, held.err())
-}
-
-// publicPrivilegeClient reads the privileges PUBLIC holds on an object.
-type publicPrivilegeClient interface {
-	PublicPrivileges(ctx context.Context, obj postgres.PrivilegeObject) (privileges []string, found bool, err error)
 }
 
 // publicSchemaName is the schema spec.publicPrivileges.publicSchema* act on.
@@ -288,24 +281,19 @@ func publicGrantConflict(database *postgresv1alpha1.Database, it publicPrivilege
 	return false
 }
 
-// publicPrivilegeExecutor is what reconcilePublicPrivileges needs.
-type publicPrivilegeExecutor interface {
-	privilegeExecutor
-	publicPrivilegeClient
-}
-
 // reconcilePublicPrivileges applies spec.publicPrivileges for the items of
 // kind (the database items run on the admin connection, the schema items on
 // a connection to the database) and records what pgop revoked in
 // database.Status.RevokedPublicPrivileges.
 //
 // A privilege is revoked from PUBLIC, and recorded, only while PUBLIC holds
-// it, so the record lists exactly what pgop took away; once the spec no
-// longer asks for the revoke, pgop grants exactly that back to PUBLIC. The
-// check runs on every reconcile, so a privilege granted back to PUBLIC
-// outside pgop is revoked again. A privilege the spec also grants to PUBLIC
-// is left alone and reported (reason PublicPrivilegeConflict).
-func reconcilePublicPrivileges(ctx context.Context, pg publicPrivilegeExecutor, database *postgresv1alpha1.Database,
+// it (from the object's owner, the grantor pgop's statements act as), so the
+// record lists exactly what pgop took away; once the spec no longer asks for
+// the revoke, pgop grants exactly that back to PUBLIC. The check runs on
+// every reconcile, so a privilege granted back to PUBLIC outside pgop is
+// revoked again. A privilege the spec also grants to PUBLIC is left alone and
+// reported (reason PublicPrivilegeConflict).
+func reconcilePublicPrivileges(ctx context.Context, pg privilegeExecutor, database *postgresv1alpha1.Database,
 	pgName string, kind postgres.ObjectKind) error {
 	recorded := map[postgresv1alpha1.PublicPrivilege]bool{}
 	for _, p := range database.Status.RevokedPublicPrivileges {
@@ -330,7 +318,7 @@ func reconcilePublicPrivileges(ctx context.Context, pg publicPrivilegeExecutor, 
 		if h, ok := cache[obj]; ok {
 			return h, nil
 		}
-		privs, found, err := pg.PublicPrivileges(ctx, obj)
+		privs, _, found, err := pg.HeldPrivileges(ctx, obj, postgres.PublicGrantee)
 		if err != nil {
 			return held{}, err
 		}
@@ -339,6 +327,7 @@ func reconcilePublicPrivileges(ctx context.Context, pg publicPrivilegeExecutor, 
 	}
 
 	var conflicts []string
+	var errs []error
 	for _, it := range publicPrivilegeItems {
 		if it.kind != kind {
 			continue
@@ -371,24 +360,26 @@ func reconcilePublicPrivileges(ctx context.Context, pg publicPrivilegeExecutor, 
 		switch {
 		case wantRevoked && holds:
 			if err := pg.RevokePrivileges(ctx, obj, postgres.PublicGrantee, []string{it.privilege}, postgres.RevokeMode{}); err != nil {
-				return err
+				errs = append(errs, err)
+				continue
 			}
 			recorded[it.field] = true
 		case !wantRevoked:
 			if !holds {
 				if err := pg.GrantPrivileges(ctx, obj, postgres.PublicGrantee, []string{it.privilege}, false); err != nil {
-					return err
+					errs = append(errs, err)
+					continue
 				}
 			}
 			delete(recorded, it.field)
 		}
 	}
 	if len(conflicts) > 0 {
-		return &conditionError{reason: ReasonPublicPrivilegeConflict, err: fmt.Errorf(
+		errs = append(errs, &conditionError{reason: ReasonPublicPrivilegeConflict, err: fmt.Errorf(
 			"publicPrivileges %s: the same privilege is granted to PUBLIC in grants or schemas[public].grants; "+
-				"PUBLIC's privilege is left as it is", strings.Join(conflicts, ", "))}
+				"PUBLIC's privilege is left as it is", strings.Join(conflicts, ", "))})
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 // desiredDatabaseSettings returns spec.settings keyed by normalized

@@ -24,6 +24,8 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+
+	"github.com/lib/pq"
 )
 
 // Privilege keywords accepted by the GRANT/REVOKE builders.
@@ -381,49 +383,86 @@ func (c *Client) RevokePrivileges(ctx context.Context, obj PrivilegeObject, gran
 	return nil
 }
 
-// publicPrivilegesQueries list the privileges PUBLIC holds on a database or
-// schema: the entries for grantee 0 in its ACL, or in the default ACL when
-// the ACL is NULL (PostgreSQL's built-in defaults). A missing object yields
-// no row; an object PUBLIC holds nothing on yields one row with a NULL
-// privilege. The schema query reads the catalog of the database the client
-// is connected to.
-var publicPrivilegesQueries = map[ObjectKind]string{
-	ObjectDatabase: `SELECT a.privilege_type FROM pg_catalog.pg_database d
-LEFT JOIN LATERAL pg_catalog.aclexplode(COALESCE(d.datacl, pg_catalog.acldefault('d', d.datdba))) a ON a.grantee = 0
+// granteeOIDExpr is the OID of the grantee in the held-privileges queries: 0
+// for PUBLIC ($2 true), otherwise the role named $3 (NULL when it does not
+// exist, so nothing matches).
+const granteeOIDExpr = `CASE WHEN $2 THEN 0::oid ELSE (SELECT r.oid FROM pg_catalog.pg_roles r WHERE r.rolname = $3) END`
+
+// heldPrivilegesQueries list the ACL entries a grantee holds on an object
+// with the object's owner as grantor, which is the grantor of every GRANT and
+// REVOKE a superuser issues (PostgreSQL acts as the owner). The default ACL
+// is used when the ACL is NULL, so PostgreSQL's built-in defaults (PUBLIC's
+// CONNECT and TEMPORARY on a database, the owner's own privileges) count as
+// held. The owner's privileges count as grantable: an owner can always grant
+// on its object, although its ACL entry shows no grant option. For databases and schemas a missing object yields no row and an
+// object the grantee holds nothing on one row of NULLs; parameters always
+// exist (pg_parameter_acl only has rows for parameters with grants, whose
+// grantor is the bootstrap superuser). The schema query reads the catalog of
+// the database the client is connected to.
+var heldPrivilegesQueries = map[ObjectKind]string{
+	ObjectDatabase: `SELECT a.privilege_type, a.is_grantable OR a.grantee = d.datdba FROM pg_catalog.pg_database d
+LEFT JOIN LATERAL pg_catalog.aclexplode(COALESCE(d.datacl, pg_catalog.acldefault('d', d.datdba))) a
+  ON a.grantor = d.datdba AND a.grantee = ` + granteeOIDExpr + `
 WHERE d.datname = $1`,
-	ObjectSchema: `SELECT a.privilege_type FROM pg_catalog.pg_namespace n
-LEFT JOIN LATERAL pg_catalog.aclexplode(COALESCE(n.nspacl, pg_catalog.acldefault('n', n.nspowner))) a ON a.grantee = 0
+	ObjectSchema: `SELECT a.privilege_type, a.is_grantable OR a.grantee = n.nspowner FROM pg_catalog.pg_namespace n
+LEFT JOIN LATERAL pg_catalog.aclexplode(COALESCE(n.nspacl, pg_catalog.acldefault('n', n.nspowner))) a
+  ON a.grantor = n.nspowner AND a.grantee = ` + granteeOIDExpr + `
 WHERE n.nspname = $1`,
+	ObjectParameter: `SELECT a.privilege_type, a.is_grantable FROM (SELECT 1) one
+LEFT JOIN (pg_catalog.pg_parameter_acl p CROSS JOIN LATERAL pg_catalog.aclexplode(p.paracl) a)
+  ON lower(p.parname) = lower($1) AND a.grantor = 10 AND a.grantee = ` + granteeOIDExpr,
 }
 
-// PublicPrivileges returns the privileges PUBLIC holds on obj (a database,
-// or a schema of the connected database), sorted. found is false when the
-// object does not exist.
-func (c *Client) PublicPrivileges(ctx context.Context, obj PrivilegeObject) (privileges []string, found bool, err error) {
-	query, ok := publicPrivilegesQueries[obj.Kind]
+// HeldPrivileges returns the privileges grantee (a role name or PUBLIC)
+// holds directly on obj, granted by the object's owner (as every GRANT a
+// superuser issues is), and those it holds WITH GRANT OPTION, both sorted.
+// Privileges held through role membership do not count. found is false when
+// the database or schema does not exist.
+func (c *Client) HeldPrivileges(ctx context.Context, obj PrivilegeObject, grantee string) (privileges, grantable []string, found bool, err error) {
+	query, ok := heldPrivilegesQueries[obj.Kind]
 	if !ok {
-		return nil, false, fmt.Errorf("unsupported object kind %q", obj.Kind)
+		return nil, nil, false, fmt.Errorf("unsupported object kind %q", obj.Kind)
 	}
-	rows, err := c.db.QueryContext(ctx, query, obj.Name)
+	name := obj.Name
+	if obj.Kind == ObjectParameter {
+		if name, err = NormalizeParameterName(name); err != nil {
+			return nil, nil, false, err
+		}
+	}
+	rows, err := c.db.QueryContext(ctx, query, name, IsPublic(grantee), grantee)
 	if err != nil {
-		return nil, false, fmt.Errorf("failed to read the privileges of PUBLIC on %s: %w", obj, err)
+		return nil, nil, false, fmt.Errorf("failed to read the privileges of %q on %s: %w", grantee, obj, err)
 	}
 	defer func() { _ = rows.Close() }()
 	for rows.Next() {
 		found = true
 		var p sql.NullString
-		if err := rows.Scan(&p); err != nil {
-			return nil, false, fmt.Errorf("failed to scan privilege: %w", err)
+		var g sql.NullBool
+		if err := rows.Scan(&p, &g); err != nil {
+			return nil, nil, false, fmt.Errorf("failed to scan privilege: %w", err)
 		}
-		if p.Valid {
-			privileges = append(privileges, p.String)
+		if !p.Valid {
+			continue
+		}
+		privileges = append(privileges, p.String)
+		if g.Valid && g.Bool {
+			grantable = append(grantable, p.String)
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return nil, false, fmt.Errorf("failed to read the privileges of PUBLIC on %s: %w", obj, err)
+		return nil, nil, false, fmt.Errorf("failed to read the privileges of %q on %s: %w", grantee, obj, err)
 	}
 	slices.Sort(privileges)
-	return slices.Compact(privileges), found, nil
+	slices.Sort(grantable)
+	return slices.Compact(privileges), slices.Compact(grantable), found, nil
+}
+
+// DependentPrivilegesExist reports whether err is PostgreSQL's
+// "dependent privileges exist" error (SQLSTATE 2BP01): a REVOKE without
+// CASCADE of a privilege the grantee passed on to others.
+func DependentPrivilegesExist(err error) bool {
+	pqErr, ok := errors.AsType[*pq.Error](err)
+	return ok && pqErr.Code == sqlStateDependentObjects
 }
 
 // SchemaExists reports whether the schema exists in the database the client
