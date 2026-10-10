@@ -257,7 +257,7 @@ spec:
     search_path: '"$user", app, public'
     statement_timeout: 30s
     work_mem: 64MB
-    myapp.tenant: acme            # custom parameters are allowed
+    myapp.tenant: acme            # needs rolePolicy.allowedSettingPrefixes: [myapp]
 ```
 
 - Keys must be parameter names: identifiers (`[A-Za-z_][A-Za-z0-9_]*`),
@@ -281,12 +281,29 @@ spec:
 The operator runs `ALTER DATABASE ... SET` as the cluster superuser, so it
 restricts what a Database author can set:
 
-- Only parameters with context `user` in `pg_settings` (those any role may set
-  in its own session) and custom parameters the server does not know yet (such
-  as `myapp.tenant`) are applied. Superuser-only parameters (for example
-  `log_statement`, `session_preload_libraries`), and parameters that cannot be
-  set per database anyway (`postmaster`, `sighup`, `internal`, `backend`), are
-  refused.
+- Parameters the server knows (listed in `pg_settings`: the built-in ones,
+  and those of extensions loaded in every session) are applied only with
+  context `user`, which any role may set in its own session. Superuser-only
+  parameters (for example `log_statement`, `session_preload_libraries`), and
+  parameters that cannot be set per database anyway (`postmaster`, `sighup`,
+  `internal`, `backend`), are refused.
+- Custom parameters the server does not know (placeholders, such as
+  `myapp.tenant`) are applied only when their namespace (the part before the
+  first dot) is listed in the Cluster's
+  [`rolePolicy.allowedSettingPrefixes`](clusters.md#role-policy). Their
+  context cannot be checked, and PostgreSQL trusts a value stored by a
+  superuser: if an extension that defines the parameter as superuser-only is
+  loaded later (for example `auto_explain`, `plperl.on_plperl_init`, which
+  runs Perl code, or `postgis.gdal_enabled_drivers`, which reads server
+  files), the stored value applies even though the role could not set it
+  itself. So without a Cluster editor's decision no placeholder is set, and
+  extension namespaces whose settings run code, read server files or are
+  superuser-only (`plperl`, `pltcl`, `plv8`, `plpgsql`, `postgis`,
+  `auto_explain`, `pg_stat_statements`, `pgaudit`, `cron`, ...; the full list
+  is `DeniedSettingPrefixes` in the API) can never be listed. `plpgsql.*`
+  is among them because `plpgsql.variable_conflict` is superuser-only; set the
+  user-context `plpgsql.*` options in sessions or function `SET` clauses
+  instead.
 - These parameters are always refused, whatever their context: `role`,
   `session_authorization` (they would switch the identity of every session,
   the operator's included), `session_preload_libraries`,
@@ -305,11 +322,15 @@ restricts what a Database author can set:
 
 !!! warning "Remaining risk"
     User-context parameters still affect every other session in the
-    database (the operator's own sessions are pinned, see below). Custom
-    placeholder parameters are accepted without a context check;
-    if an extension that defines them is loaded later, their value applies
-    with that extension's rules. Restrict who may create or edit Database
-    resources accordingly.
+    database (the operator's own sessions are pinned, see below), and so do
+    placeholders in the namespaces the Cluster allows: only list namespaces
+    that belong to your applications, never to an extension. Restrict who may
+    create or edit Database resources accordingly.
+
+!!! note "Upgrade / breaking change"
+    Earlier versions applied every custom placeholder (`myapp.tenant`). They
+    are now refused (`SettingNotAllowed`, and reset if pgop set them) until
+    the Cluster lists their namespace in `rolePolicy.allowedSettingPrefixes`.
 
 The operator's own sessions pin their settings, so neither `spec.settings`
 nor an `ALTER DATABASE ... SET` / `ALTER ROLE ... IN DATABASE ... SET` run by

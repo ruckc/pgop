@@ -39,24 +39,40 @@ type roleSettingsClient interface {
 
 var _ roleSettingsClient = (*postgres.Client)(nil)
 
+// maxIdentifierBytes is PostgreSQL's identifier limit (NAMEDATALEN - 1).
+// Longer names are truncated by the server, so pgop would look for a database
+// that can never exist.
+const maxIdentifierBytes = 63
+
 // desiredRoleDatabaseSettings returns spec.databaseSettings as normalized
-// settings per database.
-func desiredRoleDatabaseSettings(entries []postgresv1alpha1.RoleDatabaseSettings) (map[string]map[string]string, error) {
-	out := make(map[string]map[string]string, len(entries))
+// settings per database. Entries whose database name is longer than
+// PostgreSQL allows are left out and reported in invalid.
+func desiredRoleDatabaseSettings(entries []postgresv1alpha1.RoleDatabaseSettings) (out map[string]map[string]string,
+	invalid error, err error) {
+	out = make(map[string]map[string]string, len(entries))
+	var tooLong []string
 	for _, e := range entries {
 		if e.Database == "" {
-			return nil, errors.New("databaseSettings: database must not be empty")
+			return nil, nil, errors.New("databaseSettings: database must not be empty")
+		}
+		if len(e.Database) > maxIdentifierBytes {
+			tooLong = append(tooLong, fmt.Sprintf("%q (%d bytes)", e.Database, len(e.Database)))
+			continue
 		}
 		if _, dup := out[e.Database]; dup {
-			return nil, fmt.Errorf("databaseSettings: database %q is listed more than once", e.Database)
+			return nil, nil, fmt.Errorf("databaseSettings: database %q is listed more than once", e.Database)
 		}
 		s, err := normalizeSettings(fmt.Sprintf("databaseSettings[%s].settings", e.Database), e.Settings)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		out[e.Database] = s
 	}
-	return out, nil
+	if len(tooLong) > 0 {
+		invalid = fmt.Errorf("databaseSettings: database names longer than %d bytes cannot exist in PostgreSQL "+
+			"(they are truncated); these entries are ignored: %s", maxIdentifierBytes, strings.Join(tooLong, ", "))
+	}
+	return out, invalid, nil
 }
 
 // clearStaleRoleSettings forgets the settings ledger when it was not written
@@ -83,8 +99,10 @@ func clearStaleRoleSettings(role *postgresv1alpha1.Role, pgName, clusterUID stri
 // SettingNotAllowed after the others are applied. databaseSettings for a
 // database that does not exist are returned in pending instead of failing
 // the reconcile: a Database owned by this Role waits for the Role to be
-// Ready, so failing would deadlock.
-func reconcileRoleSettings(ctx context.Context, pg roleSettingsClient, role *postgresv1alpha1.Role, pgName string) (pending []string, err error) {
+// Ready, so failing would deadlock. policy is the Cluster's role policy
+// (custom parameter namespaces, see settingAllowed).
+func reconcileRoleSettings(ctx context.Context, pg roleSettingsClient, role *postgresv1alpha1.Role, pgName string,
+	policy *postgresv1alpha1.RolePolicySpec) (pending []string, err error) {
 	// Defense in depth: the CRD, checkRoleName and the ownership checks
 	// already keep reserved roles (postgres, pgop_*, pg_*) out, whose
 	// sessions include the operator's own.
@@ -95,16 +113,16 @@ func reconcileRoleSettings(ctx context.Context, pg roleSettingsClient, role *pos
 	if err != nil {
 		return nil, err
 	}
-	desiredDB, err := desiredRoleDatabaseSettings(role.Spec.DatabaseSettings)
+	desiredDB, invalid, err := desiredRoleDatabaseSettings(role.Spec.DatabaseSettings)
 	if err != nil {
 		return nil, err
 	}
 
-	var errs []error
+	errs := []error{invalid}
 	var refused []string
 
 	if len(desired) > 0 || len(role.Status.ManagedSettings) > 0 {
-		after, r, err := applySettings(ctx, pg, desired, role.Status.ManagedSettings, roleSettingOps(pg, pgName, ""))
+		after, r, err := applySettings(ctx, pg, policy, desired, role.Status.ManagedSettings, roleSettingOps(pg, pgName, ""))
 		role.Status.ManagedSettings = after
 		errs = append(errs, err)
 		for _, s := range r {
@@ -144,7 +162,7 @@ func reconcileRoleSettings(ctx context.Context, pg roleSettingsClient, role *pos
 			}
 			continue
 		}
-		after, r, err := applySettings(ctx, pg, want, managed, roleSettingOps(pg, pgName, db))
+		after, r, err := applySettings(ctx, pg, policy, want, managed, roleSettingOps(pg, pgName, db))
 		afterDB[db] = after
 		errs = append(errs, err)
 		for _, s := range r {

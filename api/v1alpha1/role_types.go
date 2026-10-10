@@ -253,9 +253,12 @@ type RoleDatabaseSettings struct {
 	// database is the PostgreSQL name of the database (a raw PostgreSQL
 	// database name, not a Database resource name). The settings only affect
 	// this role's sessions in it, so any database of the Cluster may be named.
+	// At most 63 bytes (PostgreSQL's identifier limit; non-ASCII characters
+	// take several bytes).
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:XValidation:rule="bytes(self).size() <= 63",message="database must be at most 63 bytes (PostgreSQL's identifier limit)"
 	Database string `json:"database"`
 
 	// settings are the parameter defaults for this role in database, with the

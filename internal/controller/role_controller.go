@@ -22,8 +22,10 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	mathrand "math/rand/v2"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -63,6 +65,10 @@ type RoleReconciler struct {
 	// stale cache cannot cause a second rotation. Optional: when nil the
 	// cached Role is used.
 	APIReader client.Reader
+
+	// pendingBackoff spaces out retries of Roles whose databaseSettings wait
+	// for a database.
+	pendingBackoff requeueBackoff
 }
 
 // +kubebuilder:rbac:groups=pgop.ruck.io,resources=roles,verbs=get;list;watch;create;update;patch;delete
@@ -246,7 +252,7 @@ func (r *RoleReconciler) reconcileGrantsAndSettings(ctx context.Context, pgClien
 	policyErr error) (pending []string, err error) {
 	var settingsErr error
 	if policyErr == nil {
-		pending, settingsErr = reconcileRoleSettings(ctx, pgClient, role, pgName)
+		pending, settingsErr = reconcileRoleSettings(ctx, pgClient, role, pgName, policy)
 	}
 	return pending, errors.Join(policyErr, r.reconcileRoleGrants(ctx, pgClient, role, cluster, pgName, policy, signer), settingsErr)
 }
@@ -267,16 +273,62 @@ func (r *RoleReconciler) readyResult(ctx context.Context, role *postgresv1alpha1
 	if next := nextRotationIn(role, time.Now()); next > 0 {
 		result.RequeueAfter = next
 	}
-	if len(pendingSettings) > 0 && (result.RequeueAfter == 0 || result.RequeueAfter > pendingSettingsRequeue) {
-		result.RequeueAfter = pendingSettingsRequeue
+	if len(pendingSettings) == 0 {
+		r.pendingBackoff.reset(role.UID)
+		return result, nil
+	}
+	if wait := r.pendingBackoff.next(role.UID); result.RequeueAfter == 0 || result.RequeueAfter > wait {
+		result.RequeueAfter = wait
 	}
 	return result, nil
 }
 
-// pendingSettingsRequeue is how often a Role whose databaseSettings name a
-// missing database is reconciled again (the Database watch usually wakes it
-// up sooner).
-const pendingSettingsRequeue = 30 * time.Second
+// Retry interval of a Role whose databaseSettings name a missing database:
+// it starts at pendingSettingsMinRequeue and doubles up to
+// pendingSettingsMaxRequeue (with jitter), because each retry reconnects and
+// re-applies the whole Role. A Database event for one of the databases
+// resets it and wakes the Role up immediately.
+const (
+	pendingSettingsMinRequeue = 30 * time.Second
+	pendingSettingsMaxRequeue = 5 * time.Minute
+)
+
+// requeueBackoff tracks, per Role, how many reconciles in a row ended with
+// pending databaseSettings. The zero value is ready to use.
+type requeueBackoff struct {
+	mu       sync.Mutex
+	attempts map[types.UID]int
+}
+
+// next returns the delay before the next retry for uid and counts the
+// attempt: min * 2^attempts, capped at max, plus up to 20% jitter.
+func (b *requeueBackoff) next(uid types.UID) time.Duration {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.attempts == nil {
+		b.attempts = map[types.UID]int{}
+	}
+	n := b.attempts[uid]
+	b.attempts[uid] = n + 1
+	return backoffDelay(n, mathrand.Float64())
+}
+
+// reset forgets the attempts of uid.
+func (b *requeueBackoff) reset(uid types.UID) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	delete(b.attempts, uid)
+}
+
+// backoffDelay returns pendingSettingsMinRequeue * 2^attempt capped at
+// pendingSettingsMaxRequeue, plus jitter (0 <= jitter < 1) times 20% of it.
+func backoffDelay(attempt int, jitter float64) time.Duration {
+	d := pendingSettingsMaxRequeue
+	if attempt < 16 {
+		d = min(pendingSettingsMinRequeue<<attempt, pendingSettingsMaxRequeue)
+	}
+	return d + time.Duration(jitter*0.2*float64(d))
+}
 
 // dropPostgresRole drops the Role's PostgreSQL role during deletion. Privileges
 // held by the role block DROP ROLE, so it first revokes the parameter grants
@@ -896,6 +948,7 @@ func (r *RoleReconciler) rolesForDatabase(ctx context.Context, obj client.Object
 		if slices.ContainsFunc(role.Spec.DatabaseSettings, func(s postgresv1alpha1.RoleDatabaseSettings) bool {
 			return s.Database == pgName
 		}) {
+			r.pendingBackoff.reset(role.UID)
 			requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(role)})
 		}
 	}

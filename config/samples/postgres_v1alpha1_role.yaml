@@ -30,7 +30,8 @@ spec:
   #   - parameter: log_statement
   # Optional defaults for this role's sessions (ALTER ROLE ... SET), and per
   # database (ALTER ROLE ... IN DATABASE ... SET). Only user-context and
-  # custom parameters; removed entries pgop set are reset. Values are
+  # custom parameters in namespaces the Cluster lists in
+  # rolePolicy.allowedSettingPrefixes; removed entries pgop set are reset. Values are
   # readable by every role on the server: no secrets.
   # settings:
   #   statement_timeout: 30s

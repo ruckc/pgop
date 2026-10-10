@@ -169,7 +169,7 @@ func (r *DatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	// not exist yet, a setting that is not allowed) does not hold up the
 	// extensions, schemas and credentials below: it is reported once those
 	// are done, and the Database stays not ready until it is fixed.
-	accessErr := r.reconcileSettingsAndGrants(ctx, adminClient, database, pgName)
+	accessErr := r.reconcileSettingsAndGrants(ctx, adminClient, database, pgName, cluster.Spec.RolePolicy)
 	if accessErr != nil {
 		log.Error(accessErr, "Failed to reconcile database settings or grants")
 	}
@@ -439,13 +439,13 @@ func extensionAllowed(ctx context.Context, pg extensionClient, policy *postgresv
 // before the database connection used for extensions is opened) and the
 // database-level grants. Both are attempted even when the other fails.
 func (r *DatabaseReconciler) reconcileSettingsAndGrants(ctx context.Context, pg databaseGrantClient,
-	database *postgresv1alpha1.Database, pgName string) error {
+	database *postgresv1alpha1.Database, pgName string, policy *postgresv1alpha1.RolePolicySpec) error {
 	deleting, err := r.deletingRoleNames(ctx, database)
 	if err != nil {
 		return err
 	}
 	return errors.Join(
-		reconcileDatabaseSettings(ctx, pg, database, pgName),
+		reconcileDatabaseSettings(ctx, pg, database, pgName, policy),
 		reconcileDatabaseGrants(ctx, pg, database, pgName, deleting),
 	)
 }

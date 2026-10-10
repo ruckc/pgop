@@ -107,9 +107,15 @@ spec:
                         database is the PostgreSQL name of the database (a raw PostgreSQL
                         database name, not a Database resource name). The settings only affect
                         this role's sessions in it, so any database of the Cluster may be named.
+                        At most 63 bytes (PostgreSQL's identifier limit; non-ASCII characters
+                        take several bytes).
                       maxLength: 63
                       minLength: 1
                       type: string
+                      x-kubernetes-validations:
+                      - message: database must be at most 63 bytes (PostgreSQL's identifier
+                          limit)
+                        rule: bytes(self).size() <= 63
                     settings:
                       additionalProperties:
                         type: string

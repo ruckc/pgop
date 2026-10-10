@@ -90,6 +90,12 @@ spec:
     # extensions are always allowed).
     allowedExtensions:
       - string
+    # Custom parameter namespaces (e.g. myapp for myapp.tenant) whose
+    # placeholders Database/Role settings may set (max 32, ^[a-z_][a-z0-9_]*$).
+    # Extension namespaces (plperl, pltcl, plv8, plpgsql, postgis,
+    # auto_explain, pg_stat_statements, pgaudit, cron, ...) are rejected.
+    allowedSettingPrefixes:
+      - string
 ```
 
 See [Clusters → TLS](../user-guide/clusters.md#tls),
@@ -208,8 +214,9 @@ spec:
       withGrantOption: boolean # WITH GRANT OPTION (default: false)
 
   # Defaults for this role's sessions (ALTER ROLE ... SET name TO value).
-  # Same rules as Database spec.settings: user-context and custom parameters
-  # only (others: SettingNotAllowed), same denylist, list syntax for
+  # Same rules as Database spec.settings: user-context parameters, and
+  # placeholders in the Cluster's rolePolicy.allowedSettingPrefixes, only
+  # (others: SettingNotAllowed), same denylist, list syntax for
   # search_path/temp_tablespaces. pgop-set entries removed are RESET.
   settings:                # max 256
     string: string         # parameter name: value (value max 4096 chars)
@@ -217,7 +224,7 @@ spec:
   # Defaults for this role's sessions in one database
   # (ALTER ROLE ... IN DATABASE db SET name TO value).
   databaseSettings:        # max 32, each database at most once
-    - database: string     # PostgreSQL database name (required); a missing
+    - database: string     # PostgreSQL database name (required, max 63 bytes); a missing
                            # database is pending, not an error
       settings:            # max 64, same rules as settings
         string: string
@@ -264,7 +271,8 @@ or is already a password hash (`SCRAM-SHA-256$...` or `md5` + 32 hex digits),
 `UnsupportedServerVersion` when `parameterGrants` is set on a server older
 than PostgreSQL 15, `ParameterNotAllowed` when `parameterGrants` names a
 denylisted parameter, `SettingNotAllowed` when `settings` or
-`databaseSettings` name a parameter that is not `user`-context or custom (the
+`databaseSettings` name a parameter that is not `user`-context, or a
+placeholder whose namespace the Cluster does not allow (the
 others are applied; refused ones pgop set before are reset),
 `RolePolicyViolation` when the Role requests a
 privileged attribute the Cluster's `rolePolicy` does not allow (the role then
@@ -354,7 +362,9 @@ spec:
   # Per-database parameter defaults (ALTER DATABASE ... SET name TO 'value').
   # Keys: parameter names (identifiers, optionally dotted, max 127 chars).
   # Values: max 4096 chars. pgop-set keys removed from the spec are RESET.
-  # Only "user"-context and custom parameters are applied; superuser-only
+  # Only "user"-context parameters, and placeholders (custom parameters the
+  # server does not know) whose namespace is in the Cluster's
+  # rolePolicy.allowedSettingPrefixes, are applied; superuser-only
   # parameters and role, session_authorization, *_preload_libraries,
   # dynamic_library_path, jit_provider, session_replication_role, lo_compat_privileges, pgaudit.*,
   # set_user.*, anon.*, sepgsql.* are refused (reason SettingNotAllowed).

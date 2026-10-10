@@ -44,6 +44,16 @@ const (
 	rsLoCompatPrivileges = "lo_compat_privileges"
 )
 
+// Calls recorded by the settings tests.
+const (
+	setWorkMemAppDB     = "set work_mem on app_db to 64MB"
+	setWorkMemRoleAppDB = `set work_mem for app in "app_db" to 64MB`
+)
+
+// testSettingPolicy lets the settings tests set custom parameters in the
+// myapp namespace (grantTestParam).
+var testSettingPolicy = &postgresv1alpha1.RolePolicySpec{AllowedSettingPrefixes: []string{"myapp"}}
+
 // fakeRoleSettingsClient records role settings statements.
 type fakeRoleSettingsClient struct {
 	fakeGrantClient
@@ -72,7 +82,7 @@ var _ = Describe("Role settings", func() {
 
 	It("does nothing without settings or a ledger", func() {
 		f := &fakeRoleSettingsClient{}
-		pending, err := reconcileRoleSettings(ctx, f, newRole(nil), grantTestRole)
+		pending, err := reconcileRoleSettings(ctx, f, newRole(nil), grantTestRole, testSettingPolicy)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(pending).To(BeEmpty())
 		Expect(f.calls).To(BeEmpty())
@@ -87,14 +97,14 @@ var _ = Describe("Role settings", func() {
 			{Database: appDB, Settings: []string{"temp_buffers", testWorkMem}},
 			{Database: otherDB, Settings: []string{testWorkMem}},
 		}
-		pending, err := reconcileRoleSettings(ctx, f, role, grantTestRole)
+		pending, err := reconcileRoleSettings(ctx, f, role, grantTestRole, testSettingPolicy)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(pending).To(BeEmpty())
 		Expect(f.calls).To(Equal([]string{
 			`set myapp.tenant for app in "" to acme`,
 			`set statement_timeout for app in "" to 30s`,
 			`reset lock_timeout for app in ""`,
-			`set work_mem for app in "app_db" to 64MB`,
+			setWorkMemRoleAppDB,
 			`reset temp_buffers for app in "app_db"`,
 			`reset work_mem for app in "other_db"`,
 		}))
@@ -121,7 +131,7 @@ var _ = Describe("Role settings", func() {
 		role.Status.ManagedDatabaseSettings = []postgresv1alpha1.ManagedRoleDatabaseSettings{
 			{Database: appDB, Settings: []string{grantTestReplicationRole}},
 		}
-		pending, err := reconcileRoleSettings(ctx, f, role, grantTestRole)
+		pending, err := reconcileRoleSettings(ctx, f, role, grantTestRole, testSettingPolicy)
 		Expect(pending).To(BeEmpty())
 		ce, ok := errors.AsType[*conditionError](err)
 		Expect(ok).To(BeTrue(), "expected a conditionError, got %v", err)
@@ -158,10 +168,10 @@ var _ = Describe("Role settings", func() {
 		role.Status.ManagedDatabaseSettings = []postgresv1alpha1.ManagedRoleDatabaseSettings{
 			{Database: goneDB, Settings: []string{testWorkMem}},
 		}
-		pending, err := reconcileRoleSettings(ctx, f, role, grantTestRole)
+		pending, err := reconcileRoleSettings(ctx, f, role, grantTestRole, testSettingPolicy)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(pending).To(Equal([]string{otherDB}))
-		Expect(f.calls).To(Equal([]string{`set work_mem for app in "app_db" to 64MB`}))
+		Expect(f.calls).To(Equal([]string{setWorkMemRoleAppDB}))
 		Expect(role.Status.ManagedDatabaseSettings).To(Equal([]postgresv1alpha1.ManagedRoleDatabaseSettings{
 			{Database: appDB, Settings: []string{testWorkMem}},
 		}))
@@ -172,7 +182,7 @@ var _ = Describe("Role settings", func() {
 		role := newRole(nil,
 			postgresv1alpha1.RoleDatabaseSettings{Database: appDB, Settings: map[string]string{testWorkMem: grantTestValue}})
 		role.Status.ManagedSettings = []string{testWorkMem}
-		_, err := reconcileRoleSettings(ctx, f, role, grantTestRole)
+		_, err := reconcileRoleSettings(ctx, f, role, grantTestRole, testSettingPolicy)
 		Expect(err).To(MatchError(ContainSubstring("boom")))
 		Expect(role.Status.ManagedSettings).To(Equal([]string{testWorkMem}))
 		Expect(role.Status.ManagedDatabaseSettings).To(Equal([]postgresv1alpha1.ManagedRoleDatabaseSettings{
@@ -182,22 +192,34 @@ var _ = Describe("Role settings", func() {
 
 	It("rejects invalid and case-duplicate parameter names before running anything", func() {
 		f := &fakeRoleSettingsClient{}
-		_, err := reconcileRoleSettings(ctx, f, newRole(map[string]string{"work_mem; ALTER ROLE app SUPERUSER": "1"}), grantTestRole)
+		_, err := reconcileRoleSettings(ctx, f, newRole(map[string]string{"work_mem; ALTER ROLE app SUPERUSER": "1"}), grantTestRole, testSettingPolicy)
 		Expect(err).To(MatchError(ContainSubstring("invalid parameter name")))
 		_, err = reconcileRoleSettings(ctx, f, newRole(nil, postgresv1alpha1.RoleDatabaseSettings{
-			Database: appDB, Settings: map[string]string{grantTestMixedCase: "1", testWorkMem: "2"}}), grantTestRole)
+			Database: appDB, Settings: map[string]string{grantTestMixedCase: "1", testWorkMem: "2"}}), grantTestRole, testSettingPolicy)
 		Expect(err).To(MatchError(ContainSubstring("more than once")))
 		_, err = reconcileRoleSettings(ctx, f, newRole(nil,
 			postgresv1alpha1.RoleDatabaseSettings{Database: appDB},
-			postgresv1alpha1.RoleDatabaseSettings{Database: appDB}), grantTestRole)
+			postgresv1alpha1.RoleDatabaseSettings{Database: appDB}), grantTestRole, testSettingPolicy)
 		Expect(err).To(MatchError(ContainSubstring("listed more than once")))
 		Expect(f.calls).To(BeEmpty())
+	})
+
+	It("ignores database names longer than PostgreSQL allows and applies the rest", func() {
+		f := &fakeRoleSettingsClient{}
+		long := strings.Repeat("é", 32) // 32 characters, 64 bytes
+		role := newRole(nil,
+			postgresv1alpha1.RoleDatabaseSettings{Database: long, Settings: map[string]string{testWorkMem: grantTestValue}},
+			postgresv1alpha1.RoleDatabaseSettings{Database: appDB, Settings: map[string]string{testWorkMem: grantTestValue}})
+		pending, err := reconcileRoleSettings(ctx, f, role, grantTestRole, testSettingPolicy)
+		Expect(err).To(MatchError(ContainSubstring("longer than 63 bytes")))
+		Expect(pending).To(BeEmpty())
+		Expect(f.calls).To(Equal([]string{setWorkMemRoleAppDB}))
 	})
 
 	It("never touches reserved roles", func() {
 		for _, name := range []string{bootstrapRoleName, DefaultOperatorUsername, "pg_monitor"} {
 			f := &fakeRoleSettingsClient{}
-			_, err := reconcileRoleSettings(ctx, f, newRole(map[string]string{testWorkMem: grantTestValue}), name)
+			_, err := reconcileRoleSettings(ctx, f, newRole(map[string]string{testWorkMem: grantTestValue}), name, testSettingPolicy)
 			ce, ok := errors.AsType[*conditionError](err)
 			Expect(ok).To(BeTrue(), "%s: expected a conditionError, got %v", name, err)
 			Expect(ce.reason).To(Equal(ReasonReservedName))
@@ -278,5 +300,149 @@ var _ = Describe("Role settings CRD validation", func() {
 			{Database: ""}}}))
 		expectInvalid(create(postgresv1alpha1.RoleSpec{DatabaseSettings: []postgresv1alpha1.RoleDatabaseSettings{
 			{Database: appDB}, {Database: appDB}}}))
+	})
+
+	It("limits database names to 63 bytes", func() {
+		expectInvalid(create(postgresv1alpha1.RoleSpec{DatabaseSettings: []postgresv1alpha1.RoleDatabaseSettings{
+			{Database: strings.Repeat("é", 32)}}}))
+		Expect(create(postgresv1alpha1.RoleSpec{DatabaseSettings: []postgresv1alpha1.RoleDatabaseSettings{
+			{Database: strings.Repeat("é", 31) + "x"}}})).To(Succeed())
+	})
+
+	Context("Cluster spec.rolePolicy.allowedSettingPrefixes", func() {
+		newCluster := func(prefixes ...string) *postgresv1alpha1.Cluster {
+			return &postgresv1alpha1.Cluster{
+				ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("prefixes-%d", time.Now().UnixNano()), Namespace: ns},
+				Spec: postgresv1alpha1.ClusterSpec{Image: DefaultPostgresImage,
+					RolePolicy: &postgresv1alpha1.RolePolicySpec{AllowedSettingPrefixes: prefixes}},
+			}
+		}
+		createCluster := func(c *postgresv1alpha1.Cluster) error {
+			err := k8sClient.Create(ctx, c)
+			if err == nil {
+				DeferCleanup(func() { _ = k8sClient.Delete(ctx, c) })
+			}
+			return err
+		}
+
+		It("accepts application namespaces", func() {
+			Expect(createCluster(newCluster("myapp", "tenant_cfg", "_x"))).To(Succeed())
+		})
+
+		It("rejects every denied namespace", func() {
+			for _, p := range postgresv1alpha1.DeniedSettingPrefixes {
+				expectInvalid(createCluster(newCluster("myapp", p)))
+			}
+		})
+
+		It("rejects malformed prefixes and too many entries", func() {
+			for _, p := range []string{"MyApp", "myapp.", "my-app", "1app", "", strings.Repeat("a", 64)} {
+				expectInvalid(createCluster(newCluster(p)))
+			}
+			many := make([]string, 33)
+			for i := range many {
+				many[i] = fmt.Sprintf("p%d", i)
+			}
+			expectInvalid(createCluster(newCluster(many...)))
+		})
+	})
+})
+
+var _ = Describe("Setting policy", func() {
+	ctx := context.Background()
+	f := &fakeGrantClient{contexts: map[string]string{
+		testWorkMem: pgContextUser, grantTestSuperuserParam: pgContextSuperuser,
+		// Extension parameters the operator's session knows (loaded in
+		// every session) are checked by their context.
+		"pg_trgm.similarity_threshold": pgContextUser, "auto_explain.log_min_duration": pgContextSuperuser,
+	}}
+	policy := &postgresv1alpha1.RolePolicySpec{AllowedSettingPrefixes: []string{"myapp", "plperl", "auto_explain"}}
+
+	DescribeTable("decides per parameter",
+		func(policy *postgresv1alpha1.RolePolicySpec, name, want string) {
+			norm, err := postgres.NormalizeParameterName(name)
+			Expect(err).NotTo(HaveOccurred())
+			reason, err := settingAllowed(ctx, f, policy, norm)
+			Expect(err).NotTo(HaveOccurred())
+			if want == "" {
+				Expect(reason).To(BeEmpty())
+			} else {
+				Expect(reason).To(ContainSubstring(want))
+			}
+		},
+		Entry("user-context built-in", nil, testWorkMem, ""),
+		Entry("superuser built-in", policy, grantTestSuperuserParam, `context "superuser"`),
+		Entry("denylisted", policy, "Session_Replication_Role", "denylist"),
+		Entry("unknown name without a dot (typo, PostgreSQL rejects it)", nil, "work_mme", ""),
+		Entry("known user-context extension parameter", nil, "pg_trgm.similarity_threshold", ""),
+		Entry("known superuser extension parameter", policy, "auto_explain.log_min_duration", `context "superuser"`),
+		Entry("placeholder without a policy", nil, grantTestParam, "allowedSettingPrefixes"),
+		Entry("placeholder with an empty policy", &postgresv1alpha1.RolePolicySpec{}, grantTestParam, "allowedSettingPrefixes"),
+		Entry("placeholder in an allowed namespace", policy, grantTestParam, ""),
+		Entry("placeholder in an allowed namespace, mixed case", policy, "MyApp.Tenant", ""),
+		Entry("placeholder with many dots", policy, "myapp.a.b.c.d", ""),
+		Entry("prefix match is per namespace, not per string", policy, "myapp2.tenant", "allowedSettingPrefixes"),
+		Entry("allowed namespace only as a later part", policy, "other.myapp.tenant", "allowedSettingPrefixes"),
+		Entry("denied namespace even when listed", policy, "plperl.on_plperl_init", "never sets"),
+		Entry("denied namespace, mixed case", policy, "PlPerl.on_plperl_init", "never sets"),
+		Entry("denied namespace, unloaded auto_explain", policy, "auto_explain.log_analyze", "never sets"),
+		Entry("plpgsql (variable_conflict is superuser-only)", policy, "plpgsql.variable_conflict", "never sets"),
+		Entry("postgis file access", policy, "postgis.gdal_enabled_drivers", "never sets"),
+		Entry("pgaudit (static denylist)", policy, "pgaudit.log", "denylist"),
+	)
+
+	It("rejects names that are not ASCII identifiers before deciding", func() {
+		for _, name := range []string{"plperl .on_init", " myapp.tenant", "myapp.tenänt", "ｍyapp.x", "myapp..x", "myapp."} {
+			_, err := postgres.NormalizeParameterName(name)
+			Expect(err).To(HaveOccurred(), name)
+		}
+	})
+
+	It("never allows a denied namespace through the API helper", func() {
+		for _, p := range postgresv1alpha1.DeniedSettingPrefixes {
+			Expect((&postgresv1alpha1.RolePolicySpec{AllowedSettingPrefixes: []string{p}}).AllowsSettingPrefix(p)).To(BeFalse(), p)
+		}
+	})
+
+	It("resets a managed placeholder once its namespace is no longer allowed", func() {
+		g := &fakeGrantClient{}
+		db := &postgresv1alpha1.Database{Spec: postgresv1alpha1.DatabaseSpec{
+			Settings: map[string]string{grantTestParam: grantTestTenant, testWorkMem: grantTestValue}}}
+		db.Status.ManagedSettings = []string{grantTestParam}
+		err := reconcileDatabaseSettings(ctx, g, db, "app_db", nil)
+		ce, ok := errors.AsType[*conditionError](err)
+		Expect(ok).To(BeTrue(), "expected a conditionError, got %v", err)
+		Expect(ce.reason).To(Equal(ReasonSettingNotAllowed))
+		Expect(err.Error()).To(ContainSubstring(grantTestParam))
+		Expect(g.calls).To(Equal([]string{setWorkMemAppDB, "reset myapp.tenant on app_db"}))
+		Expect(db.Status.ManagedSettings).To(Equal([]string{testWorkMem}))
+
+		r := &fakeRoleSettingsClient{}
+		role := &postgresv1alpha1.Role{Spec: postgresv1alpha1.RoleSpec{Settings: map[string]string{grantTestParam: grantTestTenant}}}
+		role.Status.ManagedSettings = []string{grantTestParam}
+		_, err = reconcileRoleSettings(ctx, r, role, grantTestRole, &postgresv1alpha1.RolePolicySpec{})
+		Expect(err).To(MatchError(ContainSubstring("allowedSettingPrefixes")))
+		Expect(r.calls).To(Equal([]string{`reset myapp.tenant for app in ""`}))
+		Expect(role.Status.ManagedSettings).To(BeEmpty())
+	})
+})
+
+var _ = Describe("Pending databaseSettings backoff", func() {
+	It("doubles from 30s up to 5m with at most 20% jitter", func() {
+		want := []time.Duration{30 * time.Second, time.Minute, 2 * time.Minute, 4 * time.Minute, 5 * time.Minute, 5 * time.Minute}
+		for i, w := range want {
+			Expect(backoffDelay(i, 0)).To(Equal(w))
+			Expect(backoffDelay(i, 0.999)).To(BeNumerically("<", w+w/5))
+		}
+		Expect(backoffDelay(100, 0)).To(Equal(pendingSettingsMaxRequeue))
+	})
+
+	It("counts attempts per Role and resets", func() {
+		var b requeueBackoff
+		Expect(b.next("a")).To(BeNumerically("<", 36*time.Second))
+		Expect(b.next("a")).To(BeNumerically(">=", time.Minute))
+		Expect(b.next("b")).To(BeNumerically("<", 36*time.Second))
+		b.reset("a")
+		Expect(b.next("a")).To(BeNumerically("<", 36*time.Second))
 	})
 })

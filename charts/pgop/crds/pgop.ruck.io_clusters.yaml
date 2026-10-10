@@ -366,6 +366,44 @@ spec:
                     maxItems: 32
                     type: array
                     x-kubernetes-list-type: set
+                  allowedSettingPrefixes:
+                    description: |-
+                      allowedSettingPrefixes lists the custom parameter namespaces (the part
+                      before the first dot, for example myapp for myapp.tenant) whose
+                      parameters Database spec.settings and Role spec.settings /
+                      databaseSettings may set while the server does not know them (custom
+                      placeholders). pgop sets them as a superuser, and PostgreSQL then
+                      trusts the stored value like a superuser's: if an extension that
+                      defines the parameter as superuser-only is loaded later, the value
+                      applies anyway. So list only namespaces of your applications, never
+                      those of extensions. Namespaces of extensions whose settings run code,
+                      read server files or are superuser-only (see DeniedSettingPrefixes:
+                      plperl, pltcl, plv8, plpgsql, postgis, auto_explain,
+                      pg_stat_statements, pgaudit, ...) cannot be listed. Parameters the
+                      server knows (built-in ones, and those of extensions loaded in every
+                      session) are not affected: they are checked by their context.
+                    items:
+                      maxLength: 63
+                      minLength: 1
+                      pattern: ^[a-z_][a-z0-9_]*$
+                      type: string
+                    maxItems: 32
+                    type: array
+                    x-kubernetes-list-type: set
+                    x-kubernetes-validations:
+                    - message: allowedSettingPrefixes must not list namespaces of
+                        extensions whose settings run code, read server files or are
+                        superuser-only (plperl, plperlu, plpython*, pltcl, pltclu,
+                        plv8, pljava, plpgsql, postgis, postgis_raster, auto_explain,
+                        pg_stat_statements, pg_stat_monitor, pgaudit, set_user, anon,
+                        sepgsql, pg_hint_plan, pg_partman_bgw, cron, pgsodium, pg_net,
+                        pg_prewarm, pgcrypto, pgtle)
+                      rule: self.all(p, !(p in ['plperl', 'plperlu', 'plpython', 'plpythonu',
+                        'plpython2u', 'plpython3', 'plpython3u', 'pltcl', 'pltclu',
+                        'plv8', 'pljava', 'plpgsql', 'postgis', 'postgis_raster',
+                        'auto_explain', 'pg_stat_statements', 'pg_stat_monitor', 'pgaudit',
+                        'set_user', 'anon', 'sepgsql', 'pg_hint_plan', 'pg_partman_bgw',
+                        'cron', 'pgsodium', 'pg_net', 'pg_prewarm', 'pgcrypto', 'pgtle']))
                 type: object
               storage:
                 description: storage defines the persistent storage configuration

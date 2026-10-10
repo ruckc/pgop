@@ -261,6 +261,52 @@ type RolePolicySpec struct {
 	// +kubebuilder:validation:items:MaxLength=63
 	// +kubebuilder:validation:items:Pattern=`^[A-Za-z0-9_-]+$`
 	AllowedExtensions []string `json:"allowedExtensions,omitempty"`
+
+	// allowedSettingPrefixes lists the custom parameter namespaces (the part
+	// before the first dot, for example myapp for myapp.tenant) whose
+	// parameters Database spec.settings and Role spec.settings /
+	// databaseSettings may set while the server does not know them (custom
+	// placeholders). pgop sets them as a superuser, and PostgreSQL then
+	// trusts the stored value like a superuser's: if an extension that
+	// defines the parameter as superuser-only is loaded later, the value
+	// applies anyway. So list only namespaces of your applications, never
+	// those of extensions. Namespaces of extensions whose settings run code,
+	// read server files or are superuser-only (see DeniedSettingPrefixes:
+	// plperl, pltcl, plv8, plpgsql, postgis, auto_explain,
+	// pg_stat_statements, pgaudit, ...) cannot be listed. Parameters the
+	// server knows (built-in ones, and those of extensions loaded in every
+	// session) are not affected: they are checked by their context.
+	// +optional
+	// +listType=set
+	// +kubebuilder:validation:MaxItems=32
+	// +kubebuilder:validation:items:MinLength=1
+	// +kubebuilder:validation:items:MaxLength=63
+	// +kubebuilder:validation:items:Pattern=`^[a-z_][a-z0-9_]*$`
+	// +kubebuilder:validation:XValidation:rule="self.all(p, !(p in ['plperl', 'plperlu', 'plpython', 'plpythonu', 'plpython2u', 'plpython3', 'plpython3u', 'pltcl', 'pltclu', 'plv8', 'pljava', 'plpgsql', 'postgis', 'postgis_raster', 'auto_explain', 'pg_stat_statements', 'pg_stat_monitor', 'pgaudit', 'set_user', 'anon', 'sepgsql', 'pg_hint_plan', 'pg_partman_bgw', 'cron', 'pgsodium', 'pg_net', 'pg_prewarm', 'pgcrypto', 'pgtle']))",message="allowedSettingPrefixes must not list namespaces of extensions whose settings run code, read server files or are superuser-only (plperl, plperlu, plpython*, pltcl, pltclu, plv8, pljava, plpgsql, postgis, postgis_raster, auto_explain, pg_stat_statements, pg_stat_monitor, pgaudit, set_user, anon, sepgsql, pg_hint_plan, pg_partman_bgw, cron, pgsodium, pg_net, pg_prewarm, pgcrypto, pgtle)"
+	AllowedSettingPrefixes []string `json:"allowedSettingPrefixes,omitempty"`
+}
+
+// DeniedSettingPrefixes are custom parameter namespaces that pgop never sets
+// while the server does not know them, even when the Cluster lists them in
+// spec.rolePolicy.allowedSettingPrefixes: they belong to extensions whose
+// settings run code (plperl.on_plperl_init, pltcl.start_proc,
+// plv8.start_proc, ...), read server files (postgis.gdal_enabled_drivers,
+// postgis.enable_outdb_rasters) or are superuser-only (auto_explain.*,
+// pg_stat_statements.*, plpgsql.variable_conflict, ...). The CEL rule on
+// allowedSettingPrefixes must list exactly these names; a test checks it.
+var DeniedSettingPrefixes = []string{
+	"plperl", "plperlu", "plpython", "plpythonu", "plpython2u", "plpython3", "plpython3u",
+	"pltcl", "pltclu", "plv8", "pljava", "plpgsql",
+	"postgis", "postgis_raster", "auto_explain", "pg_stat_statements", "pg_stat_monitor",
+	"pgaudit", "set_user", "anon", "sepgsql", "pg_hint_plan", "pg_partman_bgw", "cron",
+	"pgsodium", "pg_net", "pg_prewarm", "pgcrypto", "pgtle",
+}
+
+// AllowsSettingPrefix reports whether custom placeholder parameters in the
+// namespace prefix (lowercase, without the dot) may be set. A nil policy
+// allows none, and DeniedSettingPrefixes are never allowed.
+func (p *RolePolicySpec) AllowsSettingPrefix(prefix string) bool {
+	return p != nil && slices.Contains(p.AllowedSettingPrefixes, prefix) && !slices.Contains(DeniedSettingPrefixes, prefix)
 }
 
 // GrantablePredefinedRoles are the predefined roles a Cluster can allow in

@@ -40,6 +40,7 @@ func RegisterRoleSettingsTests() {
 			clusterName = "example-cluster"
 			roleRes     = "role.pgop.ruck.io/"
 			dbRes       = "database.pgop.ruck.io/"
+			clusterRes  = "cluster.pgop.ruck.io/" + clusterName
 		)
 
 		apply := func(manifest string) {
@@ -94,12 +95,24 @@ func RegisterRoleSettingsTests() {
 				`LEFT JOIN pg_database d ON d.oid = s.setdatabase WHERE r.rolname = '`+role+`' ORDER BY 1`)
 		}
 
+		// setPrefixes sets the Cluster's rolePolicy.allowedSettingPrefixes
+		// (null removes it).
+		setPrefixes := func(prefixes string) {
+			patch(clusterRes, `{"spec":{"rolePolicy":{"allowedSettingPrefixes":`+prefixes+`}}}`)
+		}
+		// dbSettings returns rs_db2's ALTER DATABASE ... SET entries.
+		dbSettings := func(g Gomega) string {
+			return query(g, `SELECT coalesce(array_to_string(s.setconfig, '|'), '') FROM pg_database d `+
+				`LEFT JOIN pg_db_role_setting s ON s.setdatabase = d.oid AND s.setrole = 0 WHERE d.datname = 'rs_db2'`)
+		}
+
 		AfterAll(func() {
-			for _, res := range []string{dbRes + "rs-db", roleRes + "rs-app", roleRes + "rs-dba"} {
+			for _, res := range []string{dbRes + "rs-db2", dbRes + "rs-db", roleRes + "rs-app", roleRes + "rs-dba"} {
 				_, _ = utils.Run(exec.Command("kubectl", "delete", "-n", namespace, "--ignore-not-found",
 					"--wait=true", "--timeout=2m", res))
 			}
 			_, _ = psql(`DROP ROLE IF EXISTS rs_dba`)
+			setPrefixes(`null`)
 		})
 
 		It("applies, changes and resets role settings", func() {
@@ -115,7 +128,6 @@ spec:
   settings:
     statement_timeout: 30s
     search_path: '"$user", App'
-    myapp.note: "it's \\ quoted"
   databaseSettings:
     - database: rs_db
       settings:
@@ -131,7 +143,6 @@ spec:
 				g.Expect(settings).To(ContainSubstring("*:"))
 				g.Expect(settings).To(ContainSubstring("statement_timeout=30s"))
 				g.Expect(settings).To(ContainSubstring(`search_path="$user", app`))
-				g.Expect(settings).To(ContainSubstring(`myapp.note=it's \ quoted`))
 				g.Expect(settings).NotTo(ContainSubstring("rs_db:"))
 			}).Should(Succeed())
 
@@ -167,7 +178,7 @@ spec:
 
 			By("changing a value, dropping one and asking for refused ones")
 			patch(roleRes+"rs-app", `{"spec":{"settings":{"statement_timeout":"45s","search_path":null,`+
-				`"log_statement":"none","myapp.note":"x"},`+
+				`"log_statement":"none"},`+
 				`"databaseSettings":[{"database":"rs_db","settings":{"work_mem":"16MB","log_min_duration_statement":"0"}}]}}`)
 			Eventually(func(g Gomega) {
 				settings := roleSettings(g, "rs_app")
@@ -197,6 +208,69 @@ spec:
 				g.Expect(jsonpath(g, roleRes+"rs-app", "{.status.managedSettings}{.status.managedDatabaseSettings}")).To(BeEmpty())
 			}).Should(Succeed())
 			waitReady(roleRes + "rs-app")
+		})
+
+		It("sets custom parameters only in namespaces the Cluster allows", func() {
+			By("refusing placeholders by default while applying the other settings")
+			patch(roleRes+"rs-app", `{"spec":{"settings":{"statement_timeout":"10s","myapp.note":"it's \\ quoted"}}}`)
+			// A Database without an owner, so its reconcile does not wait for
+			// rs-app (which is not Available while a setting is refused).
+			apply(`
+apiVersion: pgop.ruck.io/v1alpha1
+kind: Database
+metadata:
+  name: rs-db2
+spec:
+  clusterRef:
+    name: example-cluster
+  databaseName: rs_db2
+  settings:
+    work_mem: 8MB
+    myapp.dbnote: x
+`)
+			Eventually(func(g Gomega) {
+				settings := roleSettings(g, "rs_app")
+				g.Expect(settings).To(ContainSubstring("statement_timeout=10s"))
+				g.Expect(settings).NotTo(ContainSubstring("myapp"))
+				g.Expect(jsonpath(g, roleRes+"rs-app", availableReason)).To(Equal("SettingNotAllowed"))
+				g.Expect(jsonpath(g, roleRes+"rs-app", availableMessage)).
+					To(ContainSubstring(`myapp.note is a custom parameter the server does not know; its namespace "myapp"`))
+				g.Expect(dbSettings(g)).To(Equal("work_mem=8MB"))
+				g.Expect(jsonpath(g, dbRes+"rs-db2", availableReason)).To(Equal("SettingNotAllowed"))
+				g.Expect(jsonpath(g, dbRes+"rs-db2", availableMessage)).To(ContainSubstring("myapp.dbnote"))
+			}).Should(Succeed())
+
+			By("rejecting extension namespaces in the Cluster's allowedSettingPrefixes")
+			_, err := utils.Run(exec.Command("kubectl", "patch", clusterRes, "-n", namespace, "--type=merge",
+				"-p", `{"spec":{"rolePolicy":{"allowedSettingPrefixes":["myapp","plperl"]}}}`))
+			Expect(err).To(HaveOccurred())
+
+			By("applying them once the Cluster lists the namespace")
+			setPrefixes(`["myapp"]`)
+			waitReady(roleRes + "rs-app")
+			waitReady(dbRes + "rs-db2")
+			Eventually(func(g Gomega) {
+				g.Expect(roleSettings(g, "rs_app")).To(ContainSubstring(`myapp.note=it's \ quoted`))
+				g.Expect(dbSettings(g)).To(ContainSubstring("myapp.dbnote=x"))
+			}).Should(Succeed())
+
+			By("resetting them when the namespace is removed from the Cluster again")
+			setPrefixes(`null`)
+			Eventually(func(g Gomega) {
+				settings := roleSettings(g, "rs_app")
+				g.Expect(settings).NotTo(ContainSubstring("myapp"))
+				g.Expect(settings).To(ContainSubstring("statement_timeout=10s"))
+				g.Expect(dbSettings(g)).To(Equal("work_mem=8MB"))
+				g.Expect(jsonpath(g, roleRes+"rs-app", "{.status.managedSettings}")).NotTo(ContainSubstring("myapp"))
+				g.Expect(jsonpath(g, dbRes+"rs-db2", "{.status.managedSettings}")).NotTo(ContainSubstring("myapp"))
+				g.Expect(jsonpath(g, roleRes+"rs-app", availableReason)).To(Equal("SettingNotAllowed"))
+				g.Expect(jsonpath(g, dbRes+"rs-db2", availableReason)).To(Equal("SettingNotAllowed"))
+			}).Should(Succeed())
+
+			patch(roleRes+"rs-app", `{"spec":{"settings":null}}`)
+			patch(dbRes+"rs-db2", `{"spec":{"settings":null}}`)
+			waitReady(roleRes + "rs-app")
+			waitReady(dbRes + "rs-db2")
 		})
 
 		It("applies no settings to a role it does not manage", func() {

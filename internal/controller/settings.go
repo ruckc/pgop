@@ -21,7 +21,9 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"strings"
 
+	postgresv1alpha1 "github.com/ruckc/pgop/api/v1alpha1"
 	"github.com/ruckc/pgop/internal/postgres"
 )
 
@@ -52,16 +54,24 @@ func normalizeSettings(field string, settings map[string]string) (map[string]str
 	return out, nil
 }
 
-// settingAllowed reports why pgop refuses to set parameter name as a
-// per-database or per-role default, or "" when it may. Parameters on the
-// static denylist are refused, and so is every parameter the server knows
-// with a context other than "user" (only superusers may set superuser-context
-// parameters, and postmaster, sighup, internal and backend parameters cannot
-// be set as defaults at all): pgop runs ALTER DATABASE / ALTER ROLE as a
-// superuser, so without this check a writer could set superuser-only
-// parameters for sessions. Unknown parameters are custom placeholders (or
-// typos, which PostgreSQL then rejects).
-func settingAllowed(ctx context.Context, pg parameterContextClient, name string) (string, error) {
+// settingAllowed reports why pgop refuses to set parameter name (normalized)
+// as a per-database or per-role default, or "" when it may. pgop runs ALTER
+// DATABASE / ALTER ROLE as a superuser, and PostgreSQL trusts what a
+// superuser stored, so the writer must not get more than a user could set:
+//
+//   - parameters on the static denylist are refused;
+//   - a parameter the server knows must have context "user" (only
+//     superusers may set superuser-context parameters, and postmaster,
+//     sighup, internal and backend parameters cannot be set as defaults);
+//   - a custom parameter the server does not know (a placeholder, name with
+//     a dot) is only set when its namespace is in the Cluster's
+//     rolePolicy.allowedSettingPrefixes and not in DeniedSettingPrefixes:
+//     its context cannot be checked, and if an extension defining it as
+//     superuser-only is loaded later the superuser-stored value applies.
+//
+// Unknown names without a dot are typos, which PostgreSQL rejects.
+func settingAllowed(ctx context.Context, pg parameterContextClient, policy *postgresv1alpha1.RolePolicySpec,
+	name string) (string, error) {
 	if postgres.DeniedParameter(name) {
 		return "is on pgop's denylist", nil
 	}
@@ -69,8 +79,23 @@ func settingAllowed(ctx context.Context, pg parameterContextClient, name string)
 	if err != nil {
 		return "", err
 	}
-	if found && pgContext != pgContextUser {
-		return fmt.Sprintf("has context %q (only %q parameters may be set)", pgContext, pgContextUser), nil
+	if found {
+		if pgContext != pgContextUser {
+			return fmt.Sprintf("has context %q (only %q parameters may be set)", pgContext, pgContextUser), nil
+		}
+		return "", nil
+	}
+	prefix, _, custom := strings.Cut(name, ".")
+	if !custom {
+		return "", nil
+	}
+	if slices.Contains(postgresv1alpha1.DeniedSettingPrefixes, prefix) {
+		return fmt.Sprintf("is a custom parameter in the %q namespace, which pgop never sets "+
+			"(its extension's settings run code, read server files or are superuser-only)", prefix), nil
+	}
+	if !policy.AllowsSettingPrefix(prefix) {
+		return fmt.Sprintf("is a custom parameter the server does not know; its namespace %q is not listed "+
+			"in the Cluster's spec.rolePolicy.allowedSettingPrefixes", prefix), nil
 	}
 	return "", nil
 }
@@ -86,12 +111,13 @@ type settingOps struct {
 // resets the managed names that are no longer desired or no longer allowed.
 // It returns the names pgop manages afterwards (sorted; on an error, what was
 // set so far plus the resets still pending) and the refused settings as
-// "<name> <reason>". desired is not modified.
-func applySettings(ctx context.Context, pg parameterContextClient, desired map[string]string, managed []string,
-	ops settingOps) (after []string, refused []string, err error) {
+// "<name> <reason>". desired is not modified. policy is the Cluster's role
+// policy (see settingAllowed).
+func applySettings(ctx context.Context, pg parameterContextClient, policy *postgresv1alpha1.RolePolicySpec,
+	desired map[string]string, managed []string, ops settingOps) (after []string, refused []string, err error) {
 	allowed := make(map[string]string, len(desired))
 	for _, name := range slices.Sorted(maps.Keys(desired)) {
-		reason, err := settingAllowed(ctx, pg, name)
+		reason, err := settingAllowed(ctx, pg, policy, name)
 		if err != nil {
 			return managed, nil, err
 		}

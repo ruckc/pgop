@@ -15,7 +15,8 @@ spec:
   #   - role: app_reader
   #     privileges: [CONNECT]
   # Optional per-database parameter defaults (ALTER DATABASE ... SET).
-  # Removed keys are reset. Only user-settable and custom parameters are
+  # Removed keys are reset. Only user-settable parameters, and custom ones in
+  # namespaces the Cluster lists in rolePolicy.allowedSettingPrefixes, are
   # allowed. The YAML single quotes below are only quoting; the value is the
   # postgresql.conf list "$user", app, public.
   # settings:

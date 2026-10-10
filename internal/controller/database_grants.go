@@ -127,7 +127,8 @@ func reconcileDatabaseGrants(ctx context.Context, pg databaseGrantClient, databa
 // database.Status.ManagedSettings. Settings that are not allowed (see
 // settingAllowed) are skipped and reported with reason SettingNotAllowed
 // after the others are applied.
-func reconcileDatabaseSettings(ctx context.Context, pg databaseGrantClient, database *postgresv1alpha1.Database, pgName string) error {
+func reconcileDatabaseSettings(ctx context.Context, pg databaseGrantClient, database *postgresv1alpha1.Database, pgName string,
+	policy *postgresv1alpha1.RolePolicySpec) error {
 	desired, err := normalizeSettings("settings", database.Spec.Settings)
 	if err != nil {
 		return err
@@ -136,7 +137,7 @@ func reconcileDatabaseSettings(ctx context.Context, pg databaseGrantClient, data
 	if len(desired) == 0 && len(managed) == 0 {
 		return nil
 	}
-	after, refused, err := applySettings(ctx, pg, desired, managed, settingOps{
+	after, refused, err := applySettings(ctx, pg, policy, desired, managed, settingOps{
 		set: func(ctx context.Context, name, value string) error {
 			return pg.SetDatabaseParameter(ctx, pgName, name, value)
 		},
