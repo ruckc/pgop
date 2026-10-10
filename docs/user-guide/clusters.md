@@ -59,6 +59,9 @@ spec:
 | `tls.requireTLS` | bool | `true` | Reject non-TLS TCP connections |
 | `tls.minProtocolVersion` | string | `TLSv1.2` | `TLSv1.2` or `TLSv1.3` |
 | `parameters` | map[string]string | - | PostgreSQL configuration parameters. See [Parameters](#parameters) |
+| `rolePolicy.allowedAttributes` | []string | `[]` | Privileged attributes Roles may request: `createRole`, `replication`, `bypassRLS`. See [Role policy](#role-policy) |
+| `rolePolicy.allowedPredefinedRoles` | []string | `[]` | Predefined `pg_*` roles Roles may be members of. See [Role policy](#role-policy) |
+| `rolePolicy.allowedExtensions` | []string | `[]` | Untrusted extensions Databases may install (trusted ones are always allowed). See [Role policy](#role-policy) |
 
 ## Status
 
@@ -186,6 +189,70 @@ container restart reads the corrected file, so no manual pod deletion is
 needed. (If you instead remove *all* parameters, the pod template changes and
 a StatefulSet stuck on a crash-looping pod may need `kubectl delete pod` to
 roll forward.)
+
+## Role Policy
+
+pgop creates roles, grants memberships and installs extensions as a superuser
+on behalf of whoever can create Role and Database resources. `spec.rolePolicy`
+decides how far that goes. It lives on the Cluster so that only someone with
+RBAC to **edit the Cluster** can widen it; RBAC to create Roles or Databases
+alone does not make anyone superuser-equivalent.
+
+```yaml
+spec:
+  rolePolicy:
+    allowedAttributes: [bypassRLS]          # createRole, replication, bypassRLS
+    allowedPredefinedRoles: [pg_monitor]    # see the list below
+    allowedExtensions: [postgis, file_fdw]  # untrusted extensions
+```
+
+Without `rolePolicy` (the default):
+
+- Roles are never superusers (there is no such field), and get no
+  `CREATEROLE`, `REPLICATION` or `BYPASSRLS`. A Role requesting one reports
+  `Available=False` with reason `RolePolicyViolation` and gets none of them;
+  an existing role is altered down.
+- Roles cannot be members of any predefined `pg_*` role, of a superuser role,
+  or of a role with an attribute the policy does not allow (reason
+  `MembershipNotAllowed`; memberships pgop granted earlier are revoked). See
+  [Roles: membership policy](roles.md#membership-policy).
+- Databases can only install extensions the server marks as trusted (reason
+  `ExtensionNotAllowed` otherwise). See
+  [Databases: extension policy](databases.md#extension-policy).
+
+`allowedPredefinedRoles` accepts these roles (others are rejected by the API
+server):
+
+| Role | Gives | Notes |
+|------|-------|-------|
+| `pg_monitor`, `pg_read_all_settings`, `pg_read_all_stats`, `pg_stat_scan_tables` | Read server settings and statistics views | All databases |
+| `pg_signal_backend` | Cancel or terminate other non-superuser sessions | Other Roles' sessions included |
+| `pg_signal_autovacuum_worker` (PG 18) | Signal autovacuum workers | |
+| `pg_checkpoint` (PG 15), `pg_use_reserved_connections` (PG 16) | Operational | |
+| `pg_maintain` (PG 17) | `VACUUM`, `ANALYZE`, `REINDEX`, `REFRESH`, `CLUSTER`, `LOCK TABLE` on every table | All databases; can block other workloads |
+| `pg_create_subscription` (PG 16) | Create logical replication subscriptions | Outbound connections from the server |
+| `pg_read_all_data`, `pg_write_all_data` | Read / write every table, bypassing privileges | **All databases of the Cluster**, other teams' included |
+
+`pg_execute_server_program`, `pg_read_server_files` and
+`pg_write_server_files` give shell or file access on the server and can never
+be allowed.
+
+Allowing `createRole` on PostgreSQL 15 or older is close to allowing
+superuser: there, `CREATEROLE` can grant membership in any non-superuser role,
+including `pg_execute_server_program`. PostgreSQL 16 and later limit it to
+roles the role created itself.
+
+Changing `rolePolicy` re-reconciles the Cluster's Roles and Databases: removing
+an entry takes the attribute away, revokes the membership pgop granted, or
+stops installing the extension (extensions already installed are not
+dropped).
+
+!!! note "Upgrade / breaking change"
+    Earlier versions applied whatever a Role or Database requested, including
+    `superuser: true`. Roles that relied on `createRole`, `replication`,
+    `bypassRLS` or `pg_*` memberships, and Databases using untrusted
+    extensions, need the matching `rolePolicy` entries; see
+    [Roles: upgrade](roles.md#upgrade-breaking-changes).
 
 ## Storage Retention
 

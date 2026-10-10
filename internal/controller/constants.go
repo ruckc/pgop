@@ -120,6 +120,23 @@ const (
 	// ReasonRoleDropBlocked: the role cannot be dropped because objects or
 	// privileges that pgop does not manage still depend on it.
 	ReasonRoleDropBlocked = "RoleDropBlocked"
+	// ReasonRolePolicyViolation: the Role requests something the Cluster's
+	// spec.rolePolicy does not allow (a privileged attribute), or names an
+	// existing PostgreSQL role pgop must not take over.
+	ReasonRolePolicyViolation = "RolePolicyViolation"
+	// ReasonMembershipNotAllowed: Role.spec.memberships/memberOf names a role
+	// whose membership the policy does not allow. The other memberships are
+	// still applied; a forbidden membership pgop granted earlier is revoked.
+	ReasonMembershipNotAllowed = "MembershipNotAllowed"
+	// ReasonReservedName: the Role or Database maps to a PostgreSQL name
+	// reserved for PostgreSQL or the operator. Nothing is done in PostgreSQL.
+	ReasonReservedName = "ReservedName"
+	// ReasonExtensionNotAllowed: Database.spec.extensions names an extension
+	// that is neither trusted nor listed in the Cluster's
+	// spec.rolePolicy.allowedExtensions. It is not installed.
+	ReasonExtensionNotAllowed = "ExtensionNotAllowed"
+	// ReasonSchemaNotAllowed: Database.spec.schemas names a system schema.
+	ReasonSchemaNotAllowed = "SchemaNotAllowed"
 
 	DefaultPostgresImage    = "postgres:18"
 	DefaultOperatorUsername = "pgop_operator"

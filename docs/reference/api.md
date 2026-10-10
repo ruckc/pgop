@@ -59,9 +59,29 @@ spec:
   # hot_standby, primary_conninfo, primary_slot_name) are rejected.
   parameters:
     <name>: string
+
+  # What Roles and Databases on this Cluster may obtain (optional). Only
+  # whoever can edit the Cluster can widen it. Absent = all lists empty.
+  rolePolicy:
+    # Privileged Role attributes Roles may request.
+    allowedAttributes:          # createRole | replication | bypassRLS
+      - string
+    # Predefined roles Roles may be members of. One of: pg_checkpoint,
+    # pg_create_subscription, pg_maintain, pg_monitor, pg_read_all_data,
+    # pg_read_all_settings, pg_read_all_stats, pg_signal_autovacuum_worker,
+    # pg_signal_backend, pg_stat_scan_tables, pg_use_reserved_connections,
+    # pg_write_all_data. (pg_execute_server_program, pg_read_server_files and
+    # pg_write_server_files can never be allowed.)
+    allowedPredefinedRoles:
+      - string
+    # Untrusted extensions Databases may install (max 128; trusted
+    # extensions are always allowed).
+    allowedExtensions:
+      - string
 ```
 
 See [Clusters → TLS](../user-guide/clusters.md#tls),
+[Clusters → Role policy](../user-guide/clusters.md#role-policy),
 [Clusters → Parameters](../user-guide/clusters.md#parameters) and
 [Replication](../user-guide/replication.md) for details.
 
@@ -111,21 +131,27 @@ spec:
     name: string           # Cluster name
 
   # Optional PostgreSQL role name (default: metadata.name). Immutable.
-  # Must match ^[a-z_][a-z0-9_]*$, max 63 chars, no "pg_" prefix,
-  # not "postgres", "pgop_operator" or "pgop_replicator".
+  # Must match ^[a-z_][a-z0-9_]*$, max 63 chars, no "pg_" or "pgop_"
+  # prefix, not "postgres". Required when metadata.name is "postgres".
   roleName: string
 
   # PostgreSQL role options
-  login: boolean           # LOGIN/NOLOGIN (default: false)
-  superuser: boolean       # SUPERUSER/NOSUPERUSER (default: false)
+  login: boolean           # LOGIN/NOLOGIN (default: true)
   createDB: boolean        # CREATEDB/NOCREATEDB (default: false)
-  createRole: boolean      # CREATEROLE/NOCREATEROLE (default: false)
+  createRole: boolean      # CREATEROLE/NOCREATEROLE (default: false); needs the Cluster's rolePolicy
   inherit: boolean         # INHERIT/NOINHERIT (default: true)
-  replication: boolean     # REPLICATION/NOREPLICATION (default: false)
-  bypassRLS: boolean       # BYPASSRLS/NOBYPASSRLS (default: false)
+  replication: boolean     # REPLICATION/NOREPLICATION (default: false); needs the Cluster's rolePolicy
+  bypassRLS: boolean       # BYPASSRLS/NOBYPASSRLS (default: false); needs the Cluster's rolePolicy
+  # Roles are always NOSUPERUSER (spec.superuser was removed).
   connectionLimit: integer # CONNECTION LIMIT (default: -1)
 
-  # Role memberships (PostgreSQL role names, not Role resource names)
+  # Role memberships (PostgreSQL role names, not Role resource names).
+  # Rejected by the API server: postgres, pgop_*, pg_execute_server_program,
+  # pg_read_server_files, pg_write_server_files. Refused by the operator
+  # (reason MembershipNotAllowed; revoked if pgop granted them): superuser
+  # roles, pg_* roles not in the Cluster's rolePolicy.allowedPredefinedRoles,
+  # roles with attributes the policy does not allow, and roles that are
+  # members of any of these. Applies to memberOf as well.
   memberships:             # max 256, each role at most once
     - role: string         # Role to be a member of (required)
       inherit: boolean     # INHERIT option (optional; PostgreSQL 16+)
@@ -203,7 +229,13 @@ The `Available` condition is `False` with reason `PasswordSecretNotFound` when
 or is already a password hash (`SCRAM-SHA-256$...` or `md5` + 32 hex digits),
 `UnsupportedServerVersion` when `parameterGrants` is set on a server older
 than PostgreSQL 15, `ParameterNotAllowed` when `parameterGrants` names a
-denylisted parameter, `RoleDropBlocked` while a deleted Role cannot be dropped
+denylisted parameter, `RolePolicyViolation` when the Role requests a
+privileged attribute the Cluster's `rolePolicy` does not allow (the role then
+has none of `createRole`, `replication`, `bypassRLS`), names an existing role
+pgop must not take over, or names a pgop-managed Secret in `passwordSecretRef`,
+`MembershipNotAllowed` when a membership is refused (the others are applied;
+refused ones pgop granted before are revoked), `ReservedName` when the
+PostgreSQL name is reserved, `RoleDropBlocked` while a deleted Role cannot be dropped
 because objects or privileges pgop does not manage depend on it (the message
 lists them), and `ReconcileError` for other failures (errors from `CREATE`/`ALTER ROLE` are
 redacted). A rotation emits a `PasswordRotated` Event on the Role.
@@ -220,9 +252,11 @@ hand into the credentials Secret gets the same checks as a
 **Security:** the operator reads the Secret named by `passwordSecretRef` with
 its own permissions and copies the key into the role (and database)
 credentials Secrets. Anyone who can create or update Roles in a namespace can
-therefore read every Secret in it, including `<cluster>-credentials`. Grant
-write access to `roles.pgop.ruck.io` only to subjects that may already read
-the namespace's Secrets. See
+therefore read the Secrets in it, except those pgop manages (labeled
+`app.kubernetes.io/managed-by: pgop` or owned by a pgop resource, such as
+`<cluster>-credentials`) and Cluster TLS Secrets, which are refused with
+reason `RolePolicyViolation`. Grant write access to `roles.pgop.ruck.io` only
+to subjects that may already read the namespace's other Secrets. See
 [Roles: who can read a passwordSecretRef Secret](../user-guide/roles.md#security-who-can-read-a-passwordsecretref-secret).
 
 ---
@@ -241,21 +275,25 @@ spec:
 
   # Optional PostgreSQL database name (default: metadata.name). Immutable.
   # Must match ^[a-z_][a-z0-9_]*$, max 63 chars,
-  # not "postgres", "template0" or "template1".
+  # not "postgres", "template0" or "template1". Required when metadata.name
+  # is one of those.
   databaseName: string
 
   # Name of the owning Role resource (same namespace). The database is owned
   # by that Role's effective PostgreSQL name.
   owner: string
 
-  # Extensions to install
+  # Extensions to install (max 64). Only extensions the server marks as
+  # trusted, or listed in the Cluster's rolePolicy.allowedExtensions, are
+  # installed (reason ExtensionNotAllowed otherwise). Never dropped.
   extensions:
-    - name: string         # Extension name
-      schema: string       # Optional schema
+    - name: string         # Extension name ([A-Za-z0-9_-], max 63 chars)
+      schema: string       # Optional schema (default: control file schema, else public)
+      version: string      # Optional version (default: the default version)
 
   # Schemas to create
   schemas:
-    - name: string         # Schema name
+    - name: string         # Schema name (not pg_* or information_schema)
       owner: string        # Schema owner
       grants:
         - role: string     # PostgreSQL role to grant to
@@ -286,8 +324,10 @@ spec:
 ```
 
 The `Available` condition is `False` with reason `SettingNotAllowed` when a
-setting is refused (the other settings, grants, extensions and schemas are
-still reconciled) and `ReconcileError` for other failures, such as a grantee
+setting is refused, `ExtensionNotAllowed` when an extension is refused,
+`SchemaNotAllowed` for a system schema (the other settings, grants,
+extensions and schemas are still reconciled), `ReservedName` for a reserved
+database name, and `ReconcileError` for other failures, such as a grantee
 role that does not exist yet.
 
 ### DatabaseStatus

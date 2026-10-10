@@ -65,3 +65,56 @@ func TestReservedParametersMatchCRD(t *testing.T) {
 		}
 	}
 }
+
+// TestGrantablePredefinedRolesMatchCRD checks that the enum on
+// spec.rolePolicy.allowedPredefinedRoles lists exactly
+// GrantablePredefinedRoles, and that none of them is always forbidden.
+func TestGrantablePredefinedRolesMatchCRD(t *testing.T) {
+	raw, err := os.ReadFile("../../config/crd/bases/pgop.ruck.io_clusters.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	crd := &apiextensionsv1.CustomResourceDefinition{}
+	if err := yaml.Unmarshal(raw, crd); err != nil {
+		t.Fatal(err)
+	}
+	field := crd.Spec.Versions[0].Schema.OpenAPIV3Schema.Properties["spec"].Properties["rolePolicy"].Properties["allowedPredefinedRoles"]
+	if field.Items == nil || field.Items.Schema == nil {
+		t.Fatal("allowedPredefinedRoles has no item schema")
+	}
+	inEnum := make([]string, 0, len(field.Items.Schema.Enum))
+	for _, v := range field.Items.Schema.Enum {
+		inEnum = append(inEnum, strings.Trim(string(v.Raw), `"`))
+	}
+	slices.Sort(inEnum)
+	want := slices.Sorted(slices.Values(GrantablePredefinedRoles))
+	if !slices.Equal(inEnum, want) {
+		t.Errorf("CRD enum lists %v, GrantablePredefinedRoles is %v", inEnum, want)
+	}
+	for _, name := range ForbiddenPredefinedRoles {
+		if slices.Contains(GrantablePredefinedRoles, name) {
+			t.Errorf("%s is both grantable and forbidden", name)
+		}
+	}
+}
+
+func TestRolePolicyAllows(t *testing.T) {
+	var none *RolePolicySpec
+	if none.AllowsAttribute(RoleAttributeCreateRole) || none.AllowsPredefinedRole("pg_monitor") || none.AllowsExtension("x") {
+		t.Error("a nil policy must allow nothing")
+	}
+	p := &RolePolicySpec{
+		AllowedAttributes:      []RoleAttribute{RoleAttributeBypassRLS},
+		AllowedPredefinedRoles: []string{"pg_monitor", "pg_execute_server_program"},
+		AllowedExtensions:      []string{"file_fdw"},
+	}
+	if !p.AllowsAttribute(RoleAttributeBypassRLS) || p.AllowsAttribute(RoleAttributeReplication) {
+		t.Error("allowedAttributes not honored")
+	}
+	if !p.AllowsPredefinedRole("pg_monitor") || p.AllowsPredefinedRole("pg_execute_server_program") {
+		t.Error("allowedPredefinedRoles must only allow grantable roles")
+	}
+	if !p.AllowsExtension("file_fdw") || p.AllowsExtension("dblink") {
+		t.Error("allowedExtensions not honored")
+	}
+}

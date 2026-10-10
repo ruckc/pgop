@@ -27,6 +27,7 @@ type RoleMembership struct {
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:XValidation:rule="!(self in ['postgres', 'pg_execute_server_program', 'pg_read_server_files', 'pg_write_server_files']) && !self.startsWith('pgop_')",message="membership in postgres, pgop_* roles, pg_execute_server_program, pg_read_server_files or pg_write_server_files is not allowed"
 	Role string `json:"role"`
 
 	// inherit sets the grant's INHERIT option: whether the member automatically
@@ -75,30 +76,29 @@ type RoleSpec struct {
 	// roleName is the name of the role in PostgreSQL. It defaults to
 	// metadata.name when unset, and lets the PostgreSQL name use characters
 	// (such as underscores) that Kubernetes object names do not allow.
-	// It must be a lowercase unquoted identifier, must not start with "pg_",
-	// must not be a reserved name (postgres, pgop_operator, pgop_replicator),
-	// and cannot be changed after creation.
+	// It must be a lowercase unquoted identifier, must not start with "pg_"
+	// (reserved by PostgreSQL) or "pgop_" (reserved for the operator's own
+	// roles), must not be "postgres", and cannot be changed after creation.
 	// +optional
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=63
 	// +kubebuilder:validation:Pattern=`^[a-z_][a-z0-9_]*$`
 	// +kubebuilder:validation:XValidation:rule="!self.startsWith('pg_')",message="roleName must not start with 'pg_' (reserved by PostgreSQL)"
-	// +kubebuilder:validation:XValidation:rule="!(self in ['postgres', 'pgop_operator', 'pgop_replicator'])",message="roleName must not be a reserved role name (postgres, pgop_operator, pgop_replicator)"
+	// +kubebuilder:validation:XValidation:rule="self != 'postgres' && !self.startsWith('pgop_')",message="roleName must not be postgres or start with 'pgop_' (reserved for the operator)"
 	RoleName string `json:"roleName,omitempty"`
 
 	// login allows the role to log in (connect to the database)
 	// +kubebuilder:default=true
 	Login *bool `json:"login,omitempty"`
 
-	// superuser grants superuser privileges to the role
-	// +optional
-	Superuser bool `json:"superuser,omitempty"`
-
 	// createDB allows the role to create new databases
 	// +optional
 	CreateDB bool `json:"createDB,omitempty"`
 
-	// createRole allows the role to create other roles
+	// createRole allows the role to create other roles. It is a privileged
+	// attribute: the Cluster must list createRole in
+	// spec.rolePolicy.allowedAttributes (reason RolePolicyViolation
+	// otherwise).
 	// +optional
 	CreateRole bool `json:"createRole,omitempty"`
 
@@ -106,11 +106,17 @@ type RoleSpec struct {
 	// +kubebuilder:default=true
 	Inherit *bool `json:"inherit,omitempty"`
 
-	// replication allows the role to initiate replication connections
+	// replication allows the role to initiate replication connections. It is
+	// a privileged attribute: the Cluster must list replication in
+	// spec.rolePolicy.allowedAttributes (reason RolePolicyViolation
+	// otherwise).
 	// +optional
 	Replication bool `json:"replication,omitempty"`
 
-	// bypassRLS allows the role to bypass row-level security policies
+	// bypassRLS allows the role to bypass row-level security policies. It is
+	// a privileged attribute: the Cluster must list bypassRLS in
+	// spec.rolePolicy.allowedAttributes (reason RolePolicyViolation
+	// otherwise).
 	// +optional
 	BypassRLS bool `json:"bypassRLS,omitempty"`
 
@@ -130,12 +136,22 @@ type RoleSpec struct {
 	// +optional
 	// +kubebuilder:validation:MaxItems=256
 	// +kubebuilder:validation:items:MaxLength=63
+	// +kubebuilder:validation:XValidation:rule="self.all(r, !(r in ['postgres', 'pg_execute_server_program', 'pg_read_server_files', 'pg_write_server_files']) && !r.startsWith('pgop_'))",message="membership in postgres, pgop_* roles, pg_execute_server_program, pg_read_server_files or pg_write_server_files is not allowed"
 	MemberOf []string `json:"memberOf,omitempty"`
 
 	// memberships lists PostgreSQL roles this role should be a member of, with
 	// per-grant options. Memberships that pgop granted and that are later
 	// removed from the spec are revoked (see revokeRemovedMemberships);
 	// memberships granted outside pgop are never revoked.
+	//
+	// Memberships that would give the role more than the Cluster's
+	// spec.rolePolicy allows are refused with reason MembershipNotAllowed
+	// (and revoked if pgop granted them before): postgres, pgop_* roles,
+	// pg_execute_server_program, pg_read_server_files, pg_write_server_files,
+	// predefined pg_* roles not listed in allowedPredefinedRoles, and any
+	// role that is (or is, directly or indirectly, a member of) a superuser,
+	// a forbidden role, or a role with a privileged attribute the policy does
+	// not allow. The other memberships are still applied.
 	// +optional
 	// +listType=map
 	// +listMapKey=role
@@ -166,7 +182,10 @@ type RoleSpec struct {
 	// PasswordSecretInvalid otherwise).
 	// Security: the operator reads the referenced Secret with its own
 	// permissions, so whoever can create or update Roles in a namespace can
-	// read any Secret in it through the credentials Secret.
+	// read the Secrets in it through the credentials Secret. Secrets managed
+	// by pgop (labeled app.kubernetes.io/managed-by=pgop or owned by a pgop
+	// resource, such as the Cluster's superuser credentials) and Cluster TLS
+	// Secrets are refused (reason RolePolicyViolation).
 	// +optional
 	PasswordSecretRef *SecretKeySelector `json:"passwordSecretRef,omitempty"`
 
@@ -296,6 +315,7 @@ type RoleStatus struct {
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
+// +kubebuilder:validation:XValidation:rule="has(self.spec.roleName) || self.metadata.name != 'postgres'",message="a Role named postgres must set spec.roleName: the PostgreSQL role postgres is reserved"
 // +kubebuilder:printcolumn:name="Cluster",type="string",JSONPath=".spec.clusterRef.name"
 // +kubebuilder:printcolumn:name="PGName",type="string",JSONPath=".status.roleName"
 // +kubebuilder:printcolumn:name="Ready",type="boolean",JSONPath=".status.ready"

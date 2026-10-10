@@ -213,10 +213,11 @@ func (c *Client) Settings(ctx context.Context) ([]Setting, error) {
 	return out, nil
 }
 
-// RoleOptions defines PostgreSQL role attributes
+// RoleOptions defines PostgreSQL role attributes. Roles managed by pgop are
+// never superusers: the generated statement always says NOSUPERUSER, so an
+// existing superuser role is demoted.
 type RoleOptions struct {
 	Login           bool
-	Superuser       bool
 	CreateDB        bool
 	CreateRole      bool
 	Inherit         bool
@@ -321,11 +322,7 @@ func (c *Client) buildRoleOptions(opts RoleOptions) []string {
 		parts = append(parts, "NOLOGIN")
 	}
 
-	if opts.Superuser {
-		parts = append(parts, "SUPERUSER")
-	} else {
-		parts = append(parts, "NOSUPERUSER")
-	}
+	parts = append(parts, "NOSUPERUSER")
 
 	if opts.CreateDB {
 		parts = append(parts, "CREATEDB")
@@ -387,6 +384,56 @@ func (c *Client) RoleExists(ctx context.Context, name string) (bool, error) {
 		return false, fmt.Errorf("failed to check role existence: %w", err)
 	}
 	return exists, nil
+}
+
+// ReachableRole is a role that another role reaches through role
+// memberships, with its privileged attributes.
+type ReachableRole struct {
+	// Name is the role's name.
+	Name string
+	// Via is the direct membership through which the role is reached, or ""
+	// for the starting role itself.
+	Via string
+	// Superuser, CreateRole, Replication and BypassRLS are the role's
+	// attributes.
+	Superuser   bool
+	CreateRole  bool
+	Replication bool
+	BypassRLS   bool
+}
+
+// MembershipClosure returns the role name itself (Via "") followed by every
+// role it is a member of, directly or indirectly, whatever the grant
+// options. It returns nil when the role does not exist.
+func (c *Client) MembershipClosure(ctx context.Context, name string) ([]ReachableRole, error) {
+	const query = `WITH RECURSIVE reach(oid, via) AS (
+    SELECT oid, NULL::name FROM pg_catalog.pg_roles WHERE rolname = $1
+  UNION
+    SELECT m.roleid, COALESCE(reach.via, r.rolname)
+    FROM reach
+    JOIN pg_catalog.pg_auth_members m ON m.member = reach.oid
+    JOIN pg_catalog.pg_roles r ON r.oid = m.roleid
+)
+SELECT r.rolname, COALESCE(reach.via, ''), r.rolsuper, r.rolcreaterole, r.rolreplication, r.rolbypassrls
+FROM reach JOIN pg_catalog.pg_roles r ON r.oid = reach.oid
+ORDER BY reach.via NULLS FIRST, r.rolname`
+	rows, err := c.db.QueryContext(ctx, query, name)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list the roles %q is a member of: %w", name, err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []ReachableRole
+	for rows.Next() {
+		var r ReachableRole
+		if err := rows.Scan(&r.Name, &r.Via, &r.Superuser, &r.CreateRole, &r.Replication, &r.BypassRLS); err != nil {
+			return nil, fmt.Errorf("failed to scan role: %w", err)
+		}
+		out = append(out, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to list the roles %q is a member of: %w", name, err)
+	}
+	return out, nil
 }
 
 // MinMembershipOptionsVersion is the first server_version_num that supports
@@ -579,9 +626,27 @@ func (c *Client) DatabaseExists(ctx context.Context, name string) (bool, error) 
 	return exists, nil
 }
 
-// CreateExtension creates a PostgreSQL extension in a database
-// Note: This must be called on a connection to the target database
-func (c *Client) CreateExtension(ctx context.Context, name, schema, version string) error {
+// ExtensionTrusted reports whether the given version of an extension (its
+// default version when version is empty) is marked trusted in
+// pg_available_extension_versions, and whether that version is available on
+// the server at all. Requires PostgreSQL 13 or later.
+func (c *Client) ExtensionTrusted(ctx context.Context, name, version string) (trusted, available bool, err error) {
+	const query = `SELECT v.trusted
+FROM pg_catalog.pg_available_extension_versions v
+JOIN pg_catalog.pg_available_extensions e ON e.name = v.name
+WHERE v.name = $1 AND v.version = COALESCE(NULLIF($2, ''), e.default_version)`
+	err = c.db.QueryRowContext(ctx, query, name, version).Scan(&trusted)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, false, nil
+	}
+	if err != nil {
+		return false, false, fmt.Errorf("failed to look up extension %q: %w", name, err)
+	}
+	return trusted, true, nil
+}
+
+// buildCreateExtensionQuery builds CREATE EXTENSION IF NOT EXISTS.
+func buildCreateExtensionQuery(name, schema, version string) string {
 	query := fmt.Sprintf("CREATE EXTENSION IF NOT EXISTS %s", quoteIdent(name))
 	if schema != "" {
 		query += fmt.Sprintf(" SCHEMA %s", quoteIdent(schema))
@@ -589,9 +654,37 @@ func (c *Client) CreateExtension(ctx context.Context, name, schema, version stri
 	if version != "" {
 		query += " VERSION " + quoteLiteral(version)
 	}
+	return query
+}
 
-	_, err := c.db.ExecContext(ctx, query)
+// CreateExtension creates a PostgreSQL extension in a database
+// Note: This must be called on a connection to the target database
+//
+// Operator sessions run with search_path pinned to pg_catalog (see
+// buildDSN), which would make pg_catalog the default schema for the new
+// extension. Without an explicit schema the statement therefore runs with
+// search_path set to public for its transaction only, which is where the
+// extension went with PostgreSQL's default search_path.
+func (c *Client) CreateExtension(ctx context.Context, name, schema, version string) error {
+	query := buildCreateExtensionQuery(name, schema, version)
+	if schema != "" {
+		if _, err := c.db.ExecContext(ctx, query); err != nil {
+			return fmt.Errorf("failed to create extension: %w", err)
+		}
+		return nil
+	}
+	tx, err := c.db.BeginTx(ctx, nil)
 	if err != nil {
+		return fmt.Errorf("failed to create extension: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, "SET LOCAL search_path TO public"); err != nil {
+		return fmt.Errorf("failed to create extension: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, query); err != nil {
+		return fmt.Errorf("failed to create extension: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("failed to create extension: %w", err)
 	}
 	return nil

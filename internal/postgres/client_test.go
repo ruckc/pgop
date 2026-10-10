@@ -213,10 +213,9 @@ func TestBuildRoleOptions(t *testing.T) {
 			},
 		},
 		{
-			name: "superuser role",
+			name: "privileged role is still never a superuser",
 			opts: RoleOptions{
 				Login:           true,
-				Superuser:       true,
 				CreateDB:        true,
 				CreateRole:      true,
 				Inherit:         true,
@@ -226,7 +225,7 @@ func TestBuildRoleOptions(t *testing.T) {
 			},
 			expected: []string{
 				attrLogin,
-				"SUPERUSER",
+				attrNoSuperuser,
 				"CREATEDB",
 				"CREATEROLE",
 				"INHERIT",
@@ -392,13 +391,12 @@ func TestBuildAlterRoleQuery(t *testing.T) {
 			roleName: "app_user",
 			opts: RoleOptions{
 				Login:           false,
-				Superuser:       true,
 				ConnectionLimit: 50,
 			},
 			contains: []string{
 				`ALTER ROLE "app_user"`,
 				"NOLOGIN",
-				"SUPERUSER",
+				attrNoSuperuser,
 				"CONNECTION LIMIT 50",
 			},
 		},
@@ -477,7 +475,6 @@ func TestRoleOptions(t *testing.T) {
 	// Test that RoleOptions struct can be created
 	opts := RoleOptions{
 		Login:           true,
-		Superuser:       false,
 		CreateDB:        true,
 		CreateRole:      false,
 		Inherit:         true,
@@ -489,9 +486,6 @@ func TestRoleOptions(t *testing.T) {
 
 	if !opts.Login {
 		t.Error("Login should be true")
-	}
-	if opts.Superuser {
-		t.Error("Superuser should be false")
 	}
 	if !opts.CreateDB {
 		t.Error("CreateDB should be true")
@@ -547,4 +541,17 @@ func containsSubstring(s, substr string) bool {
 		}
 	}
 	return false
+}
+
+func TestBuildCreateExtensionQuery(t *testing.T) {
+	tests := []struct{ name, schema, version, want string }{
+		{"pg_trgm", "", "", `CREATE EXTENSION IF NOT EXISTS "pg_trgm"`},
+		{"uuid-ossp", "ext", "1.1", `CREATE EXTENSION IF NOT EXISTS "uuid-ossp" SCHEMA "ext" VERSION '1.1'`},
+		{`x"y`, `s"`, `1'0`, `CREATE EXTENSION IF NOT EXISTS "x""y" SCHEMA "s""" VERSION '1''0'`},
+	}
+	for _, tt := range tests {
+		if got := buildCreateExtensionQuery(tt.name, tt.schema, tt.version); got != tt.want {
+			t.Errorf("buildCreateExtensionQuery(%q, %q, %q) = %q, want %q", tt.name, tt.schema, tt.version, got, tt.want)
+		}
+	}
 }

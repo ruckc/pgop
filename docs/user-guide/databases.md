@@ -10,9 +10,13 @@ The Database controller:
 2. Creates the database with the specified owner
 3. Applies per-database settings (`ALTER DATABASE ... SET`) and resets removed ones
 4. Applies database-level grants (`GRANT ... ON DATABASE`) and revokes removed ones
-5. Installs requested extensions
+5. Installs requested extensions (trusted ones, or those the Cluster's
+   [role policy](clusters.md#role-policy) allows)
 6. Creates schemas with ownership and applies schema grants
 7. Drops the database on deletion
+
+See [Security model](#security-model) for what a Database writer can and
+cannot do.
 
 ## Example
 
@@ -35,7 +39,7 @@ spec:
   extensions:
     - name: uuid-ossp
     - name: pg_trgm
-    - name: postgis
+    - name: postgis            # untrusted: needs the Cluster's rolePolicy.allowedExtensions
       schema: public
   schemas:
     - name: app
@@ -64,14 +68,15 @@ spec:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `name` | string | **required** | Extension name |
-| `schema` | string | - | Schema to install extension in |
+| `name` | string | **required** | Extension name (`[A-Za-z0-9_-]`, at most 63 characters) |
+| `schema` | string | control file schema, else `public` | Schema to install extension in |
+| `version` | string | default version | Extension version to install |
 
 ### SchemaSpec
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `name` | string | **required** | Schema name |
+| `name` | string | **required** | Schema name (not `pg_*` or `information_schema`) |
 | `owner` | string | - | PostgreSQL role name that owns the schema |
 | `grants` | []GrantSpec | - | Privileges to grant |
 
@@ -159,7 +164,9 @@ spec:
 ```
 
 - `databaseName` must match `^[a-z_][a-z0-9_]*$`, be at most 63 characters, and
-  must not be `postgres`, `template0` or `template1`.
+  must not be `postgres`, `template0` or `template1`. A Database whose
+  `metadata.name` is one of those must set `databaseName`; the operator never
+  manages or drops these databases (reason `ReservedName`).
 - It is **immutable** after creation.
 - `owner` is always a **Role resource name**; the operator resolves it to that
   Role's PostgreSQL name (`spec.roleName`, or its `metadata.name`). In contrast,
@@ -303,6 +310,12 @@ restricts what a Database author can set:
     with that extension's rules. Restrict who may create or edit Database
     resources accordingly.
 
+The operator's own sessions always use `search_path = pg_catalog, pg_temp`
+(sent as a connection parameter, which takes precedence over
+`ALTER DATABASE ... SET search_path`), so a `search_path` setting cannot make
+the operator's superuser queries resolve functions or operators from a
+schema the Database writer controls.
+
 ## Ordering & Dependencies
 
 The operator is largely order-independent (it requeues on transient errors),
@@ -341,6 +354,34 @@ extensions:
   - name: timescaledb
 ```
 
+### Extension policy
+
+The operator installs extensions as a superuser. To keep that from being a
+way around the server's own rules, an extension is only installed when
+
+- the server marks the requested version (the default version when
+  `version` is unset) as **trusted** (`pg_available_extension_versions.trusted`;
+  for example `pg_trgm`, `pgcrypto`, `uuid-ossp`, `citext`, `hstore`,
+  `btree_gist`, `tablefunc`), or
+- the Cluster lists it in
+  [`spec.rolePolicy.allowedExtensions`](clusters.md#role-policy).
+
+Trusted extensions are those PostgreSQL lets any role with `CREATE` on the
+database install, so pgop installing them gives the Database writer nothing
+extra. Untrusted extensions, such as `file_fdw`, `dblink`, `adminpack`,
+`plpython3u`, `postgis` or anything added to a custom image, can give access to
+the server's files, network or code execution, or were simply not reviewed for
+that; a cluster administrator has to allow them.
+
+A refused extension is not installed; the other extensions and the schemas are
+still reconciled and the Database reports `Available=False` with reason
+`ExtensionNotAllowed`. An extension already installed in the database is never
+dropped (also not when it is removed from the list or no longer allowed).
+
+Without `schema`, the extension goes to the schema its control file names, or
+else `public` (the operator no longer uses the database's `search_path` for
+this).
+
 !!! warning "Extensions must exist in the image"
     The operator runs `CREATE EXTENSION IF NOT EXISTS`, which only succeeds if
     the extension's files are already present in the running image. It does
@@ -348,6 +389,45 @@ extensions:
     include PostGIS or TimescaleDB — to use `postgis` set the Cluster's
     `spec.image` to a PostGIS-capable image (e.g. `postgis/postgis:18-3.5`), and
     similarly use a TimescaleDB image for `timescaledb`.
+
+## Security model
+
+A Database writer is trusted with the contents of **their** database, not with
+the server:
+
+- they choose the owner (a Role resource), schema owners and grants, and
+  receive the owner's credentials in the connection Secret;
+- settings are limited to user-context parameters minus a denylist (see
+  [Which parameters may be set](#which-parameters-may-be-set));
+- extensions are limited to trusted ones unless the Cluster allows more (see
+  [Extension policy](#extension-policy));
+- system schemas (`pg_catalog`, `pg_toast`, other `pg_*` names and
+  `information_schema`) cannot be created, owned or granted on (reason
+  `SchemaNotAllowed`): `CREATE` on `pg_catalog` would let the grantee shadow
+  built-in functions for every session in the database, superusers included;
+- the `postgres`, `template0` and `template1` databases cannot be managed
+  (owning `template1` would put objects into every future database);
+- the operator's sessions pin `search_path` (see above).
+
+The policy for untrusted extensions lives on the Cluster, so allowing them
+needs RBAC to edit the Cluster, separately from RBAC to create Databases. See
+[Roles: security model](roles.md#security-model) for the overall picture.
+
+Known gaps: a Database whose name matches a database that already exists on
+the Cluster (created outside pgop) takes it over and changes its owner, and
+`schemas[].owner` / `grants[].role` accept any PostgreSQL role name on the
+Cluster.
+
+### Upgrade / breaking changes
+
+- Untrusted extensions are no longer installed unless the Cluster lists them
+  in `spec.rolePolicy.allowedExtensions` (reason `ExtensionNotAllowed`).
+- Extension names must match `[A-Za-z0-9_-]` (at most 63 characters); without
+  `schema`, extensions are installed into their control file schema or
+  `public`, no longer into the first schema of the database's `search_path`.
+- System schema names (`pg_*`, `information_schema`) are rejected in
+  `schemas`, and a Database named `postgres`, `template0` or `template1` must
+  set `databaseName`.
 
 ## Schema with Grants
 

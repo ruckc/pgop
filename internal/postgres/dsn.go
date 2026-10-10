@@ -65,6 +65,15 @@ func buildDSN(cfg ConnectionConfig) (string, error) {
 		{"password", cfg.Password},
 		{"dbname", cfg.Database},
 		{"sslmode", sslMode},
+		// Pin search_path for every operator session. The operator connects
+		// as a superuser to databases whose contents (and, through
+		// Database.spec.settings, whose default search_path) are controlled
+		// by less trusted users; a search_path that lists a schema they can
+		// write to would let them shadow functions and operators used by
+		// the operator's queries and run code as a superuser. Startup
+		// parameters take precedence over ALTER DATABASE / ALTER ROLE
+		// settings.
+		{"search_path", operatorSearchPath},
 	}
 	parts := make([]string, 0, len(pairs))
 	for _, p := range pairs {
@@ -72,6 +81,10 @@ func buildDSN(cfg ConnectionConfig) (string, error) {
 	}
 	return strings.Join(parts, " "), nil
 }
+
+// operatorSearchPath is the search_path of every connection made by NewClient.
+// pg_temp is listed last so temporary objects can never shadow catalog ones.
+const operatorSearchPath = "pg_catalog, pg_temp"
 
 // quoteDSNValue quotes a libpq connection-string value: the value is wrapped
 // in single quotes and any backslash or single quote is backslash-escaped.

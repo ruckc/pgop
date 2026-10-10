@@ -106,12 +106,21 @@ func (r *RoleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		return ctrl.Result{}, nil
 	}
 
+	// A reserved name (postgres, pgop_*, pg_*) is never touched. The CRD
+	// rejects it in spec.roleName and for metadata.name; this also covers
+	// objects created before those rules existed.
+	pgName := role.PostgresName()
+	if reason := reservedRoleName(pgName); reason != "" {
+		return r.updateStatus(ctx, role, false, "", &conditionError{reason: ReasonReservedName, err: errors.New(reason)})
+	}
+
 	// Get the referenced cluster
 	cluster, err := r.getCluster(ctx, role)
 	if err != nil {
 		log.Error(err, "Failed to get Cluster")
 		return r.updateStatus(ctx, role, false, "", err)
 	}
+	policy := cluster.Spec.RolePolicy
 
 	// Check if cluster is ready
 	if !cluster.Status.Ready {
@@ -136,6 +145,15 @@ func (r *RoleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		}
 	}
 
+	// Taking over a role that already exists in PostgreSQL (one this Role
+	// has not created) hands its password to the Role writer: refuse a
+	// superuser, or a role that already belongs to roles the policy does not
+	// allow.
+	if err := checkAdoption(ctx, pgClient, role, pgName, policy); err != nil {
+		log.Info("Not reconciling the role", "reason", err.Error())
+		return r.updateStatus(ctx, role, false, "", err)
+	}
+
 	// Resolve the password. NOLOGIN (group) roles get no password and no
 	// credentials Secret.
 	now := time.Now()
@@ -152,23 +170,16 @@ func (r *RoleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		}
 	}
 
-	// Create or update the role. The password (sent as a SCRAM-SHA-256
-	// verifier, never in plaintext) is only sent to an existing role when it
-	// differs from the one last applied.
-	opts := postgres.RoleOptions{
-		Login:                role.Spec.IsLogin(),
-		Superuser:            role.Spec.Superuser,
-		CreateDB:             role.Spec.CreateDB,
-		CreateRole:           role.Spec.CreateRole,
-		Inherit:              role.Spec.IsInherit(),
-		Replication:          role.Spec.Replication,
-		BypassRLS:            role.Spec.BypassRLS,
-		ConnectionLimit:      role.Spec.GetConnectionLimit(),
-		Password:             dp.value,
-		KeepExistingPassword: dp.applied && !dp.force,
-	}
+	// Create or update the role. It is never a superuser, and gets the
+	// privileged attributes (createRole, replication, bypassRLS) only when
+	// the Cluster's rolePolicy allows all those it requests; otherwise it
+	// gets none of them and policyErr reports why. The password (sent as a
+	// SCRAM-SHA-256 verifier, never in plaintext) is only sent to an existing
+	// role when it differs from the one last applied.
+	opts, policyErr := desiredRoleOptions(&role.Spec, policy)
+	opts.Password = dp.value
+	opts.KeepExistingPassword = dp.applied && !dp.force
 
-	pgName := role.PostgresName()
 	if err := pgClient.CreateRole(ctx, pgName, opts); err != nil {
 		log.Error(err, "Failed to create/update role")
 		return r.updateStatus(ctx, role, false, role.Status.SecretName, err)
@@ -199,9 +210,11 @@ func (r *RoleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		role.Status.PasswordRotatedAt = nil
 	}
 
-	// Handle role memberships and parameter privileges
-	if err := reconcileRoleGrants(ctx, pgClient, role, pgName); err != nil {
-		log.Error(err, "Failed to reconcile role grants")
+	// Handle role memberships and parameter privileges. They are reconciled
+	// even when the role's attributes violate the policy, so forbidden
+	// memberships pgop granted earlier are revoked.
+	if err := errors.Join(policyErr, reconcileRoleGrants(ctx, pgClient, role, pgName, policy)); err != nil {
+		log.Error(err, "Failed to reconcile role")
 		return r.updateStatus(ctx, role, false, secretName, err)
 	}
 
@@ -231,10 +244,18 @@ func (r *RoleReconciler) dropPostgresRole(ctx context.Context, cluster *postgres
 		return ctrl.Result{}, err
 	}
 	defer func() { _ = pgClient.Close() }()
-	// Prefer the name recorded in status so we drop what was actually created.
+	// Drop exactly the role recorded in status: the one this Role created or
+	// took over. Without it (pgop refused to take over an existing role, or
+	// never got to create one) nothing is dropped, so deleting a Role can
+	// never drop a role pgop does not manage.
 	pgName := role.Status.RoleName
 	if pgName == "" {
-		pgName = role.PostgresName()
+		log.Info("No PostgreSQL role recorded for this Role, nothing to drop")
+		return ctrl.Result{}, nil
+	}
+	if reservedRoleName(pgName) != "" {
+		log.Info("Not dropping a reserved PostgreSQL role", "role", pgName)
+		return ctrl.Result{}, nil
 	}
 	exists, err := pgClient.RoleExists(ctx, pgName)
 	if err != nil || !exists {
@@ -293,14 +314,34 @@ func revokeSchemaPrivilegesIn(ctx context.Context, c client.Client, cluster *pos
 	return dbClient.RevokeAllSchemaPrivileges(ctx, role)
 }
 
-// reconcileRoleGrants brings the role's memberships (grant, update options,
-// revoke removed ones) and its privileges on configuration parameters
-// (PostgreSQL 15+) to the declared state.
-func reconcileRoleGrants(ctx context.Context, pgClient *postgres.Client, role *postgresv1alpha1.Role, pgName string) error {
-	if err := reconcileMemberships(ctx, pgClient, role, pgName); err != nil {
+// checkAdoption returns a RolePolicyViolation error when pgName exists in
+// PostgreSQL, was not created by this Role (status.roleName differs), and
+// must not be taken over (see adoptionProblem).
+func checkAdoption(ctx context.Context, pg membershipClient, role *postgresv1alpha1.Role, pgName string,
+	policy *postgresv1alpha1.RolePolicySpec) error {
+	if role.Status.RoleName == pgName {
+		return nil
+	}
+	closure, err := pg.MembershipClosure(ctx, pgName)
+	if err != nil {
 		return err
 	}
-	return reconcileParameterGrants(ctx, pgClient, role, pgName)
+	if p := adoptionProblem(pgName, closure, policy); p != "" {
+		return &conditionError{reason: ReasonRolePolicyViolation, err: errors.New(p)}
+	}
+	return nil
+}
+
+// reconcileRoleGrants brings the role's memberships (grant, update options,
+// revoke removed and forbidden ones) and its privileges on configuration
+// parameters (PostgreSQL 15+) to the declared state. A problem with one does
+// not hold up the other.
+func reconcileRoleGrants(ctx context.Context, pgClient *postgres.Client, role *postgresv1alpha1.Role, pgName string,
+	policy *postgresv1alpha1.RolePolicySpec) error {
+	return errors.Join(
+		reconcileMemberships(ctx, pgClient, role, pgName, policy),
+		reconcileParameterGrants(ctx, pgClient, role, pgName),
+	)
 }
 
 // credentialsSecretName returns the name of the Role's credentials Secret.
@@ -517,13 +558,14 @@ func (r *RoleReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.rolesForPasswordSecret)).
 		Watches(&postgresv1alpha1.Cluster{},
 			handler.EnqueueRequestsFromMapFunc(r.rolesForCluster),
-			builder.WithPredicates(clusterConnectionChanged)).
+			builder.WithPredicates(clusterConnectionOrPolicyChanged)).
 		Named("role").
 		Complete(r)
 }
 
 // rolesForCluster maps a Cluster to the Roles in its namespace that reference
-// it, so their credentials Secrets follow port and TLS changes.
+// it, so their credentials Secrets follow port and TLS changes and their
+// attributes and memberships follow spec.rolePolicy.
 func (r *RoleReconciler) rolesForCluster(ctx context.Context, obj client.Object) []reconcile.Request {
 	roles := &postgresv1alpha1.RoleList{}
 	if err := r.List(ctx, roles, client.InNamespace(obj.GetNamespace())); err != nil {

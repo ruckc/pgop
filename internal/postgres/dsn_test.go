@@ -97,6 +97,12 @@ func TestBuildDSNRoundTrip(t *testing.T) {
 	if got.SSLMode != pq.SSLModeDisable {
 		t.Errorf("sslmode = %q, want the default %q", got.SSLMode, pq.SSLModeDisable)
 	}
+	// The search_path startup parameter overrides ALTER DATABASE settings, so
+	// a database owner cannot redirect name lookups of the operator's
+	// superuser sessions.
+	if got.Runtime["search_path"] != "pg_catalog, pg_temp" {
+		t.Errorf("search_path runtime parameter = %q, want %q", got.Runtime["search_path"], "pg_catalog, pg_temp")
+	}
 }
 
 func TestBuildDSNDefaults(t *testing.T) {

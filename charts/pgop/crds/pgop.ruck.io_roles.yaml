@@ -55,8 +55,11 @@ spec:
             description: spec defines the desired state of Role
             properties:
               bypassRLS:
-                description: bypassRLS allows the role to bypass row-level security
-                  policies
+                description: |-
+                  bypassRLS allows the role to bypass row-level security policies. It is
+                  a privileged attribute: the Cluster must list bypassRLS in
+                  spec.rolePolicy.allowedAttributes (reason RolePolicyViolation
+                  otherwise).
                 type: boolean
               clusterRef:
                 description: clusterRef references the PostgreSQL Cluster this role
@@ -81,7 +84,11 @@ spec:
                 description: createDB allows the role to create new databases
                 type: boolean
               createRole:
-                description: createRole allows the role to create other roles
+                description: |-
+                  createRole allows the role to create other roles. It is a privileged
+                  attribute: the Cluster must list createRole in
+                  spec.rolePolicy.allowedAttributes (reason RolePolicyViolation
+                  otherwise).
                 type: boolean
               inherit:
                 default: true
@@ -105,12 +112,26 @@ spec:
                   type: string
                 maxItems: 256
                 type: array
+                x-kubernetes-validations:
+                - message: membership in postgres, pgop_* roles, pg_execute_server_program,
+                    pg_read_server_files or pg_write_server_files is not allowed
+                  rule: self.all(r, !(r in ['postgres', 'pg_execute_server_program',
+                    'pg_read_server_files', 'pg_write_server_files']) && !r.startsWith('pgop_'))
               memberships:
                 description: |-
                   memberships lists PostgreSQL roles this role should be a member of, with
                   per-grant options. Memberships that pgop granted and that are later
                   removed from the spec are revoked (see revokeRemovedMemberships);
                   memberships granted outside pgop are never revoked.
+
+                  Memberships that would give the role more than the Cluster's
+                  spec.rolePolicy allows are refused with reason MembershipNotAllowed
+                  (and revoked if pgop granted them before): postgres, pgop_* roles,
+                  pg_execute_server_program, pg_read_server_files, pg_write_server_files,
+                  predefined pg_* roles not listed in allowedPredefinedRoles, and any
+                  role that is (or is, directly or indirectly, a member of) a superuser,
+                  a forbidden role, or a role with a privileged attribute the policy does
+                  not allow. The other memberships are still applied.
                 items:
                   description: RoleMembership declares that this role is a member
                     of another PostgreSQL role.
@@ -135,6 +156,12 @@ spec:
                       maxLength: 63
                       minLength: 1
                       type: string
+                      x-kubernetes-validations:
+                      - message: membership in postgres, pgop_* roles, pg_execute_server_program,
+                          pg_read_server_files or pg_write_server_files is not allowed
+                        rule: '!(self in [''postgres'', ''pg_execute_server_program'',
+                          ''pg_read_server_files'', ''pg_write_server_files'']) &&
+                          !self.startsWith(''pgop_'')'
                     set:
                       description: |-
                         set sets the grant's SET option: whether the member may SET ROLE to the
@@ -246,7 +273,10 @@ spec:
                   PasswordSecretInvalid otherwise).
                   Security: the operator reads the referenced Secret with its own
                   permissions, so whoever can create or update Roles in a namespace can
-                  read any Secret in it through the credentials Secret.
+                  read the Secrets in it through the credentials Secret. Secrets managed
+                  by pgop (labeled app.kubernetes.io/managed-by=pgop or owned by a pgop
+                  resource, such as the Cluster's superuser credentials) and Cluster TLS
+                  Secrets are refused (reason RolePolicyViolation).
                 properties:
                   key:
                     description: key is the key in the secret to select
@@ -259,7 +289,11 @@ spec:
                 - name
                 type: object
               replication:
-                description: replication allows the role to initiate replication connections
+                description: |-
+                  replication allows the role to initiate replication connections. It is
+                  a privileged attribute: the Cluster must list replication in
+                  spec.rolePolicy.allowedAttributes (reason RolePolicyViolation
+                  otherwise).
                 type: boolean
               revokeRemovedMemberships:
                 default: true
@@ -279,9 +313,9 @@ spec:
                   roleName is the name of the role in PostgreSQL. It defaults to
                   metadata.name when unset, and lets the PostgreSQL name use characters
                   (such as underscores) that Kubernetes object names do not allow.
-                  It must be a lowercase unquoted identifier, must not start with "pg_",
-                  must not be a reserved name (postgres, pgop_operator, pgop_replicator),
-                  and cannot be changed after creation.
+                  It must be a lowercase unquoted identifier, must not start with "pg_"
+                  (reserved by PostgreSQL) or "pgop_" (reserved for the operator's own
+                  roles), must not be "postgres", and cannot be changed after creation.
                 maxLength: 63
                 minLength: 1
                 pattern: ^[a-z_][a-z0-9_]*$
@@ -289,12 +323,9 @@ spec:
                 x-kubernetes-validations:
                 - message: roleName must not start with 'pg_' (reserved by PostgreSQL)
                   rule: '!self.startsWith(''pg_'')'
-                - message: roleName must not be a reserved role name (postgres, pgop_operator,
-                    pgop_replicator)
-                  rule: '!(self in [''postgres'', ''pgop_operator'', ''pgop_replicator''])'
-              superuser:
-                description: superuser grants superuser privileges to the role
-                type: boolean
+                - message: roleName must not be postgres or start with 'pgop_' (reserved
+                    for the operator)
+                  rule: self != 'postgres' && !self.startsWith('pgop_')
             required:
             - clusterRef
             type: object
@@ -451,6 +482,10 @@ spec:
         required:
         - spec
         type: object
+        x-kubernetes-validations:
+        - message: 'a Role named postgres must set spec.roleName: the PostgreSQL role
+            postgres is reserved'
+          rule: has(self.spec.roleName) || self.metadata.name != 'postgres'
     served: true
     storage: true
     subresources:

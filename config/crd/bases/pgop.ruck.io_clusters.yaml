@@ -221,6 +221,87 @@ spec:
                       More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
                     type: object
                 type: object
+              rolePolicy:
+                description: |-
+                  rolePolicy limits what Role and Database resources that reference this
+                  Cluster may obtain in PostgreSQL. Without it (the default), Roles can
+                  only get non-privileged attributes (login, createDB, inherit,
+                  connectionLimit), cannot be members of predefined pg_* roles, and
+                  Databases can only install extensions that the server marks as trusted.
+                  The policy lives on the Cluster on purpose: it can only be widened by
+                  someone allowed to edit the Cluster, not by someone who can only create
+                  Roles or Databases.
+                properties:
+                  allowedAttributes:
+                    description: |-
+                      allowedAttributes lists the privileged attributes Roles may request.
+                      A Role that requests an attribute not listed here is reported with
+                      reason RolePolicyViolation and gets none of the privileged attributes
+                      (an existing role is altered to NOCREATEROLE NOREPLICATION
+                      NOBYPASSRLS). Superuser is never allowed. Note that on PostgreSQL 15
+                      and older, CREATEROLE lets the role grant itself membership in any
+                      non-superuser role, including pg_execute_server_program, so allowing
+                      createRole there is close to allowing superuser.
+                    items:
+                      description: |-
+                        RoleAttribute is a privileged role attribute that a Cluster can allow
+                        Roles to request.
+                      enum:
+                      - createRole
+                      - replication
+                      - bypassRLS
+                      type: string
+                    maxItems: 3
+                    type: array
+                    x-kubernetes-list-type: set
+                  allowedExtensions:
+                    description: |-
+                      allowedExtensions lists extensions that Databases may install although
+                      the server does not mark them as trusted
+                      (pg_available_extension_versions.trusted). Trusted extensions are
+                      always allowed: a role with CREATE on the database could install them
+                      itself. Untrusted extensions (for example file_fdw, dblink, adminpack,
+                      plpython3u, postgis) are installed by the operator as a superuser and
+                      may give access to the server's files, network or code execution; a
+                      Database requesting one that is not listed is reported with reason
+                      ExtensionNotAllowed and the extension is not installed.
+                    items:
+                      maxLength: 63
+                      pattern: ^[A-Za-z0-9_-]+$
+                      type: string
+                    maxItems: 128
+                    type: array
+                    x-kubernetes-list-type: set
+                  allowedPredefinedRoles:
+                    description: |-
+                      allowedPredefinedRoles lists the predefined pg_* roles that Roles may
+                      be members of (Role.spec.memberships / memberOf). Memberships in any
+                      other pg_* role are refused (reason MembershipNotAllowed).
+                      pg_execute_server_program, pg_read_server_files and
+                      pg_write_server_files give file system or shell access on the server
+                      and can never be allowed. Most predefined roles act on every database
+                      of the cluster (for example pg_read_all_data reads every table of
+                      every database), so allow them only when all Roles on the Cluster are
+                      trusted with that.
+                    items:
+                      enum:
+                      - pg_checkpoint
+                      - pg_create_subscription
+                      - pg_maintain
+                      - pg_monitor
+                      - pg_read_all_data
+                      - pg_read_all_settings
+                      - pg_read_all_stats
+                      - pg_signal_autovacuum_worker
+                      - pg_signal_backend
+                      - pg_stat_scan_tables
+                      - pg_use_reserved_connections
+                      - pg_write_all_data
+                      type: string
+                    maxItems: 32
+                    type: array
+                    x-kubernetes-list-type: set
+                type: object
               storage:
                 description: storage defines the persistent storage configuration
                 properties:

@@ -25,6 +25,7 @@ import (
 	"strconv"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -139,6 +140,20 @@ var clusterConnectionChanged = predicate.Funcs{
 		return clusterConnectionFingerprint(oldC) != clusterConnectionFingerprint(newC)
 	},
 }
+
+// clusterConnectionOrPolicyChanged lets Cluster updates through when they
+// change how clients connect or the Cluster's spec.rolePolicy, which decides
+// what Roles and Databases may obtain.
+var clusterConnectionOrPolicyChanged = predicate.Or[client.Object](clusterConnectionChanged, predicate.Funcs{
+	UpdateFunc: func(e event.UpdateEvent) bool {
+		oldC, okOld := e.ObjectOld.(*postgresv1alpha1.Cluster)
+		newC, okNew := e.ObjectNew.(*postgresv1alpha1.Cluster)
+		if !okOld || !okNew {
+			return true
+		}
+		return !equality.Semantic.DeepEqual(oldC.Spec.RolePolicy, newC.Spec.RolePolicy)
+	},
+})
 
 // connectionURI renders a postgresql:// URI. User, password and database are
 // percent-encoded. The CA cannot be embedded: clients using verify-full must

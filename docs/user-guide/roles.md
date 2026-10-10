@@ -7,11 +7,18 @@ A Role resource represents a PostgreSQL role (user) within a cluster.
 The Role controller:
 
 1. Connects to the referenced PostgreSQL cluster
-2. Creates or updates the role with specified permissions
+2. Creates or updates the role with specified permissions (never as a
+   superuser; privileged attributes only as far as the Cluster's
+   [role policy](clusters.md#role-policy) allows)
 3. Auto-generates a password and creates a credentials Secret
-4. Manages role memberships (GRANT, option changes, and REVOKE of memberships it granted)
+4. Manages role memberships (GRANT, option changes, and REVOKE of memberships
+   it granted), refusing memberships the [membership policy](#membership-policy)
+   does not allow
 5. Grants privileges on configuration parameters (`parameterGrants`, PostgreSQL 15+)
 6. Cleans up the role on deletion, revoking its privileges first (see [Deletion](#deletion))
+
+See [Security model](#security-model) for what a Role writer can and cannot
+obtain.
 
 ## Example
 
@@ -37,13 +44,12 @@ spec:
 |-------|------|---------|-------------|
 | `clusterRef.name` | string | **required** | Name of the Cluster resource (same namespace) |
 | `roleName` | string | `metadata.name` | Role name in PostgreSQL (see [PostgreSQL Role Name](#postgresql-role-name)) |
-| `login` | bool | `false` | Can role log in? |
-| `superuser` | bool | `false` | Grant superuser privileges |
+| `login` | bool | `true` | Can role log in? |
 | `createDB` | bool | `false` | Can role create databases? |
-| `createRole` | bool | `false` | Can role create other roles? |
+| `createRole` | bool | `false` | Can role create other roles? **Privileged**: needs the Cluster's `rolePolicy.allowedAttributes` |
 | `inherit` | bool | `true` | Inherit privileges from member roles |
-| `replication` | bool | `false` | Can role initiate replication? |
-| `bypassRLS` | bool | `false` | Bypass row-level security? |
+| `replication` | bool | `false` | Can role initiate replication? **Privileged**: needs the Cluster's `rolePolicy.allowedAttributes` |
+| `bypassRLS` | bool | `false` | Bypass row-level security? **Privileged**: needs the Cluster's `rolePolicy.allowedAttributes` |
 | `connectionLimit` | int | `-1` | Max concurrent connections (-1 = unlimited) |
 | `memberships` | []RoleMembership | - | Roles this role is a member of, with grant options (see [Memberships](#memberships)) |
 | `memberOf` | []string | - | **Deprecated**, use `memberships`. Roles this role is a member of |
@@ -117,7 +123,11 @@ spec:
 
 - `roleName` must match `^[a-z_][a-z0-9_]*$` (lowercase, so it never needs
   quoting), be at most 63 characters, must not start with `pg_` (reserved by
-  PostgreSQL), and must not be `postgres` or `pgop_operator`.
+  PostgreSQL) or `pgop_` (reserved for the operator's own roles, such as
+  `pgop_operator` and `pgop_replicator`), and must not be `postgres`. A Role
+  whose `metadata.name` is `postgres` must set `roleName`. The operator checks
+  the same rules again and reports `Available=False` with reason
+  `ReservedName` without touching PostgreSQL.
 - It is **immutable**: it cannot be added, changed or removed after the Role is
   created. To rename, create a new Role.
 - Kubernetes-side names still use `metadata.name`: the credentials Secret is
@@ -129,6 +139,24 @@ spec:
 !!! warning
     Two Role resources on the same cluster that resolve to the same PostgreSQL
     name are not detected yet; deleting either one drops the shared role.
+
+### Existing roles
+
+If the PostgreSQL role already exists when a Role is first reconciled (it was
+created outside pgop), pgop takes it over: it sets its attributes and
+password and hands the password out in the credentials Secret. pgop refuses
+(`Available=False`, reason `RolePolicyViolation`, nothing changed in
+PostgreSQL) to take over a role that
+
+- is a superuser, or
+- is already a member, directly or through other roles, of a role the
+  [membership policy](#membership-policy) does not allow (for example a
+  role that is a member of a superuser role).
+
+A taken-over role with `CREATEROLE`, `REPLICATION` or `BYPASSRLS` beyond the
+Cluster's policy is altered down. Deleting a Role only ever drops the role
+recorded in `status.roleName` (the one it created or took over), so a Role
+whose takeover was refused never drops the existing role.
 
 ## Memberships
 
@@ -164,6 +192,42 @@ spec:
 - Changing an option updates the existing grant. Setting `admin` back to
   `false` (or omitting it) runs `REVOKE ADMIN OPTION FOR`.
 - Each role may appear only once in `memberships`.
+
+### Membership policy
+
+pgop grants memberships as a superuser, so it checks every target role
+(in `memberships` and in `memberOf`) before granting it. A membership is
+**refused** when the target role
+
+- is `postgres`, any `pgop_*` role, `pg_execute_server_program`,
+  `pg_read_server_files` or `pg_write_server_files` (these are also rejected
+  by the API server);
+- is any other predefined `pg_*` role that the Cluster does not list in
+  [`spec.rolePolicy.allowedPredefinedRoles`](clusters.md#role-policy);
+- is a superuser (`pg_roles.rolsuper`);
+- has `CREATEROLE`, `REPLICATION` or `BYPASSRLS` while the Cluster's
+  `rolePolicy.allowedAttributes` does not allow that attribute; or
+- is itself a member, directly or indirectly, of any role above.
+
+Grant options (`inherit`, `set`) do not change the decision, and membership
+chains are followed whatever their options: options can be changed later,
+outside the Role. The rule is deliberately simple: anything this role could
+become by `SET ROLE` (attributes such as `BYPASSRLS` and `CREATEROLE` apply to
+the current role after `SET ROLE`) must stay within what the Cluster's policy
+allows a Role writer to request directly.
+
+A refused membership is not granted; the other memberships are still applied
+and the Role reports `Available=False` with reason `MembershipNotAllowed`,
+naming each refused role and why. If pgop granted the membership earlier
+(it is in `status.managedMemberships`, for example because the Cluster's
+policy allowed it then), it is **revoked immediately**, whatever
+`revokeRemovedMemberships` says. A forbidden membership granted outside pgop
+is reported but left alone.
+
+The check runs on every reconcile of the Role, and Roles reconcile when their
+Cluster's `rolePolicy` changes. A target role that a DBA changes later (made
+superuser, or granted a forbidden role) is caught at the Role's next
+reconcile, not immediately.
 
 ### Revoking removed memberships
 
@@ -258,8 +322,11 @@ spec:
 
 ## Deletion
 
-When a Role is deleted, pgop drops the PostgreSQL role. PostgreSQL refuses to
-drop a role that still holds privileges, so pgop first revokes:
+When a Role is deleted, pgop drops the PostgreSQL role recorded in
+`status.roleName` (nothing is dropped when no role was recorded, for example
+when pgop refused to take over an [existing role](#existing-roles)).
+PostgreSQL refuses to drop a role that still holds privileges, so pgop first
+revokes:
 
 - the parameter privileges it granted (`status.managedParameterGrants`),
 - every database-level privilege the role holds on any database of the
@@ -307,8 +374,67 @@ spec:
     name: my-cluster
   login: true
   createDB: true
-  createRole: true
+  createRole: true   # needs allowedAttributes: [createRole] on the Cluster
 ```
+
+`createRole` is refused unless the Cluster's
+[`rolePolicy.allowedAttributes`](clusters.md#role-policy) lists it. On
+PostgreSQL 15 and older, `CREATEROLE` lets the role grant itself membership
+in any non-superuser role, including `pg_execute_server_program`, so it is
+close to superuser there; PostgreSQL 16 limits it to roles the role created.
+
+## Security model
+
+pgop runs every statement as a superuser on behalf of whoever can create or
+edit Role, Database and Cluster resources. Kubernetes RBAC on those kinds
+decides who can do what:
+
+| Who | Can | Cannot |
+|-----|-----|--------|
+| **Cluster editors** | Everything pgop offers, including widening `spec.rolePolicy` (privileged attributes, predefined roles, untrusted extensions). Cluster editors are trusted with the whole server. | — |
+| **Role writers** | Create non-superuser roles with `login`, `createDB`, `inherit`, `connectionLimit`, passwords, parameter grants (with a denylist), and memberships in roles that pass the [membership policy](#membership-policy). Read the other Secrets of the namespace via `passwordSecretRef`. | Create superusers (the field no longer exists; roles are always `NOSUPERUSER`). Read pgop's own Secrets (the Cluster's superuser credentials, TLS keys) through `passwordSecretRef`. Get `createRole`, `replication` or `bypassRLS`, or membership in predefined `pg_*` roles, unless the Cluster allows it. Become a member of a superuser, `postgres`, `pgop_*` or the server-file roles, or of any role that leads to them. Take over an existing superuser role or a role that belongs to one. Use the `pgop_` prefix, `pg_` prefix or `postgres` as role names. |
+| **Database writers** | Everything inside *their* database: owner, schemas, grants, settings (user-context parameters only), trusted extensions (see [Databases: security model](databases.md#security-model)). | Install untrusted extensions unless the Cluster lists them. Manage the `postgres`, `template0` or `template1` databases or system schemas (`pg_*`, `information_schema`). Change the operator's `search_path`. |
+
+Because the policy lives on the **Cluster**, granting someone RBAC to create
+Roles (or Databases) no longer makes them superuser-equivalent: widening what
+Roles may get requires RBAC to edit the Cluster. Give Cluster edit rights only
+to people you would give the superuser password.
+
+Known limits of this model: memberships among Roles of the same Cluster are
+not restricted (any Role writer can join any non-privileged role on the
+Cluster, including roles of other Role resources); `passwordSecretRef` reads
+Secrets of the namespace that pgop does not manage; and predefined roles a Cluster allows act on
+every database of the Cluster (for example `pg_read_all_data`).
+
+## Upgrade / breaking changes
+
+This release changes the Role API (v1alpha1, no compatibility shims):
+
+- **`spec.superuser` is removed.** The API server rejects it (or, with lax
+  field validation, drops it). Every role pgop manages is `NOSUPERUSER`; a role
+  that an older pgop made superuser is altered to `NOSUPERUSER` on its next
+  reconcile. Use the Cluster credentials Secret for superuser work.
+- **`createRole`, `replication` and `bypassRLS` need the Cluster's
+  `spec.rolePolicy.allowedAttributes`.** Without it the Role reports
+  `RolePolicyViolation` and the role is altered to `NOCREATEROLE
+  NOREPLICATION NOBYPASSRLS` (none of them, even those that would be
+  allowed). Add the attributes to the Cluster to restore them.
+- **Memberships are checked** (see [Membership policy](#membership-policy)).
+  Membership in a predefined `pg_*` role (such as `pg_monitor` or
+  `pg_read_all_data`) needs the Cluster's `rolePolicy.allowedPredefinedRoles`;
+  memberships in superuser, `postgres`, `pgop_*` and the server-file roles are
+  no longer possible. Forbidden memberships pgop granted before are
+  **revoked** on the next reconcile.
+- **Names starting with `pgop_` are reserved** for `roleName` (previously only
+  `pgop_operator` and `pgop_replicator`), and a Role named `postgres` must set
+  `roleName`.
+- **Existing roles** that are superusers, or members of forbidden roles, are no
+  longer taken over, and deleting a Role drops only the role recorded in
+  `status.roleName`.
+- **`passwordSecretRef` cannot name a Secret pgop manages** (such as
+  `<cluster>-credentials`) or a Cluster's TLS Secret (reason
+  `RolePolicyViolation`); see
+  [who can read a passwordSecretRef Secret](#security-who-can-read-a-passwordsecretref-secret).
 
 ## Password Source
 
@@ -394,25 +520,31 @@ until a rotation is due or requested.
 
 ### Security: who can read a `passwordSecretRef` Secret
 
-The operator reads **any** Secret in the Role's namespace that a Role names in
+The operator reads the Secret in the Role's namespace that a Role names in
 `passwordSecretRef`, and copies the named key into the Role's credentials
 Secret (and the Database credentials Secrets), with the operator's own
 permissions. So **anyone who can create or update Roles in a namespace can
-read every Secret in that namespace**, including ones their own RBAC does not
-let them read, such as `<cluster>-credentials` (the operator's superuser
-password) or other apps' Secrets: they point a Role at the Secret and read the
-resulting credentials Secret (or log in with it).
+read the Secrets of that namespace**, including ones their own RBAC does not
+let them read, such as other apps' Secrets: they point a Role at the Secret and
+read the resulting credentials Secret (or log in with it).
+
+pgop refuses (reason `RolePolicyViolation`) Secrets it manages itself, so the
+operator's own credentials cannot be read this way: Secrets labeled
+`app.kubernetes.io/managed-by: pgop` (such as `<cluster>-credentials` with the
+operator's superuser password, other Roles' credentials, TLS and backup
+Secrets), Secrets owned by a `pgop.ruck.io` resource, and the Secret a Cluster
+of the namespace uses as `spec.tls.secretName` (the server's private key).
+Everything else in the namespace is readable.
 
 Treat the permission to create/update `roles.pgop.ruck.io` as equivalent to
-`get` on all Secrets of the namespace:
+`get` on the other Secrets of the namespace:
 
 - Grant `create`/`update`/`patch` on `roles.pgop.ruck.io` only to subjects that
   may already read the namespace's Secrets (typically namespace admins and the
   CD system). The aggregated `edit` ClusterRole should not be used to hand
   out Role write access to users who must not see the namespace's Secrets.
-- Keep Secrets that such users must not read (including the Cluster's
-  `<cluster>-credentials`) in a namespace where they cannot create Roles; a
-  Role can only reference Secrets in its own namespace.
+- Keep Secrets that such users must not read in a namespace where they
+  cannot create Roles; a Role can only reference Secrets in its own namespace.
 - Audit `passwordSecretRef` values (e.g. with an admission policy that
   restricts which Secret names a Role may reference) where Role authors are
   less trusted than Secret readers.

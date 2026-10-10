@@ -133,12 +133,12 @@ spec:
   clusterRef:
     name: example-cluster   # must exist in the same namespace
   login: true
-  superuser: false
   createDB: false
-  createRole: false
   inherit: true
   connectionLimit: 10
 ```
+
+Roles are never superusers. Privileged attributes (`createRole`, `replication`, `bypassRLS`), memberships in predefined `pg_*` roles and untrusted extensions are only available when the Cluster opts in with `spec.rolePolicy`, so RBAC to create Roles or Databases does not make anyone superuser-equivalent (see [Clusters: role policy](docs/user-guide/clusters.md#role-policy)).
 
 ### Database
 

@@ -76,7 +76,6 @@ var _ = Describe("Role Controller", func() {
 						Name: clusterName,
 					},
 					Login:           new(true),
-					Superuser:       false,
 					CreateDB:        true,
 					ConnectionLimit: new(int32(10)),
 				},
