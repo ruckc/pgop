@@ -37,12 +37,33 @@ const (
 	memOld    = "old"
 )
 
+// testManaged lists the roles the test Cluster's Roles manage; the fake
+// client's default closure gives every role its Role's marker.
+var testManaged = func() managedRoles {
+	m := managedRoles{}
+	for _, name := range []string{"a", "b", grantTestOther, memParent, memLegacy, memGone, memOld,
+		polOps, polDBA, "tenant_b", "wraps_dba", "app_ro", "repl", "app_mon"} {
+		m[name] = ownerMarker(markerKindRole, name)
+	}
+	return m
+}()
+
 // fakeMembershipClient records statements and simulates pg_auth_members.
 type fakeMembershipClient struct {
 	version int
 	current map[string]postgres.MembershipState
-	failOn  string // statement prefix + role, e.g. "grant:b"
-	calls   []string
+	// closures maps a role to its MembershipClosure; a role not listed is
+	// a plain role without memberships.
+	closures map[string][]postgres.ReachableRole
+	failOn   string // statement prefix + role, e.g. "grant:b"
+	calls    []string
+}
+
+func (f *fakeMembershipClient) MembershipClosure(_ context.Context, name string) ([]postgres.ReachableRole, error) {
+	if c, ok := f.closures[name]; ok {
+		return c, nil
+	}
+	return []postgres.ReachableRole{{Name: name, Comment: ownerMarker(markerKindRole, name)}}, nil
 }
 
 func (f *fakeMembershipClient) fail(op, role string) error {
@@ -171,7 +192,7 @@ var _ = Describe("Role memberships", func() {
 		It("is a no-op without memberships", func() {
 			f := &fakeMembershipClient{version: 180000}
 			role := newRole(postgresv1alpha1.RoleSpec{})
-			Expect(reconcileMemberships(ctx, f, role, "app")).To(Succeed())
+			Expect(reconcileMemberships(ctx, f, role, "app", nil, testManaged)).To(Succeed())
 			Expect(f.calls).To(BeEmpty())
 			Expect(role.Status.ManagedMemberships).To(BeNil())
 		})
@@ -179,15 +200,15 @@ var _ = Describe("Role memberships", func() {
 		It("grants, revokes and records the desired set", func() {
 			f := &fakeMembershipClient{version: 180000, current: map[string]st{memGone: {}, "manual": {}}}
 			role := newRole(postgresv1alpha1.RoleSpec{Memberships: []rm{{Role: "a"}}}, memGone)
-			Expect(reconcileMemberships(ctx, f, role, "app")).To(Succeed())
-			Expect(f.calls).To(Equal([]string{"grant a to app", "revoke gone from app"}))
+			Expect(reconcileMemberships(ctx, f, role, "app", nil, testManaged)).To(Succeed())
+			Expect(f.calls).To(Equal([]string{polGrantA, "revoke gone from app"}))
 			Expect(role.Status.ManagedMemberships).To(Equal([]string{"a"}))
 		})
 
 		It("stops tracking removed memberships without revoking when opted out", func() {
 			f := &fakeMembershipClient{version: 180000, current: map[string]st{memGone: {}}}
 			role := newRole(postgresv1alpha1.RoleSpec{RevokeRemovedMemberships: new(false)}, memGone)
-			Expect(reconcileMemberships(ctx, f, role, "app")).To(Succeed())
+			Expect(reconcileMemberships(ctx, f, role, "app", nil, testManaged)).To(Succeed())
 			Expect(f.calls).To(BeEmpty())
 			Expect(role.Status.ManagedMemberships).To(BeNil())
 		})
@@ -195,30 +216,115 @@ var _ = Describe("Role memberships", func() {
 		It("keeps pending revokes and records successful grants on failure", func() {
 			f := &fakeMembershipClient{version: 180000, current: map[string]st{memGone: {}}, failOn: "revoke:gone"}
 			role := newRole(postgresv1alpha1.RoleSpec{Memberships: []rm{{Role: "a"}}}, memGone)
-			Expect(reconcileMemberships(ctx, f, role, "app")).NotTo(Succeed())
+			Expect(reconcileMemberships(ctx, f, role, "app", nil, testManaged)).NotTo(Succeed())
 			Expect(role.Status.ManagedMemberships).To(Equal([]string{"a", memGone}))
 		})
 
 		It("does not track a grant that failed", func() {
 			f := &fakeMembershipClient{version: 180000, failOn: "grant:b"}
 			role := newRole(postgresv1alpha1.RoleSpec{Memberships: []rm{{Role: "a"}, {Role: "b"}}})
-			Expect(reconcileMemberships(ctx, f, role, "app")).NotTo(Succeed())
+			Expect(reconcileMemberships(ctx, f, role, "app", nil, testManaged)).NotTo(Succeed())
 			Expect(role.Status.ManagedMemberships).To(Equal([]string{"a"}))
 		})
 
 		It("fails clearly when inherit/set are used before PostgreSQL 16", func() {
 			f := &fakeMembershipClient{version: 150004}
 			role := newRole(postgresv1alpha1.RoleSpec{Memberships: []rm{{Role: "a", Inherit: new(false)}}})
-			err := reconcileMemberships(ctx, f, role, "app")
+			err := reconcileMemberships(ctx, f, role, "app", nil, testManaged)
 			Expect(err).To(MatchError(ContainSubstring("require PostgreSQL 16 or later")))
 			Expect(f.calls).To(BeEmpty())
+		})
+
+		It("refuses forbidden memberships, applies the others and revokes forbidden managed ones", func() {
+			f := &fakeMembershipClient{
+				version: 180000,
+				current: map[string]st{polMonitor: {}, polOps: {}},
+				closures: map[string][]postgres.ReachableRole{
+					polOps:         {{Name: polOps, Comment: ownerMarker(markerKindRole, polOps)}, {Name: polDBA, Via: polDBA, Superuser: true}},
+					grantTestAdmin: {{Name: grantTestAdmin, Superuser: true}},
+				},
+			}
+			role := newRole(postgresv1alpha1.RoleSpec{
+				MemberOf:    []string{"a", polMonitor, polOps, grantTestAdmin}, //nolint:staticcheck // deprecated field under test
+				Memberships: []rm{{Role: polExecProgram}, {Role: "pgop_operator"}},
+			}, polMonitor, polOps)
+			err := reconcileMemberships(ctx, f, role, "app", nil, testManaged)
+			ce, ok := errors.AsType[*conditionError](err)
+			Expect(ok).To(BeTrue())
+			Expect(ce.reason).To(Equal(ReasonMembershipNotAllowed))
+			Expect(err.Error()).To(SatisfyAll(
+				ContainSubstring("pg_execute_server_program gives access to the server's files"),
+				ContainSubstring("pgop_operator is reserved"),
+				ContainSubstring("pg_monitor is a predefined role"),
+				ContainSubstring("ops is a member of dba, which is a superuser"),
+				ContainSubstring("admin is a superuser"),
+				ContainSubstring("revoked the membership(s) pgop had granted in pg_monitor, ops"),
+			))
+			Expect(f.calls).To(Equal([]string{polGrantA, "revoke ops from app", "revoke pg_monitor from app"}))
+			Expect(role.Status.ManagedMemberships).To(Equal([]string{"a"}))
+		})
+
+		It("revokes a forbidden managed membership even when revokeRemovedMemberships is false", func() {
+			f := &fakeMembershipClient{version: 180000, current: map[string]st{polReadAllData: {}}}
+			role := newRole(postgresv1alpha1.RoleSpec{RevokeRemovedMemberships: new(false)}, polReadAllData)
+			Expect(reconcileMemberships(ctx, f, role, "app", nil, testManaged)).To(Succeed())
+			Expect(f.calls).To(Equal([]string{"revoke pg_read_all_data from app"}))
+			Expect(role.Status.ManagedMemberships).To(BeNil())
+		})
+
+		It("grants predefined roles the Cluster policy allows", func() {
+			f := &fakeMembershipClient{version: 180000}
+			policy := &postgresv1alpha1.RolePolicySpec{AllowedPredefinedRoles: []string{polMonitor}}
+			role := newRole(postgresv1alpha1.RoleSpec{Memberships: []rm{{Role: polMonitor}}})
+			Expect(reconcileMemberships(ctx, f, role, "app", policy, testManaged)).To(Succeed())
+			Expect(f.calls).To(Equal([]string{"grant pg_monitor to app"}))
+			Expect(role.Status.ManagedMemberships).To(Equal([]string{polMonitor}))
+		})
+
+		It("does not adopt an existing forbidden membership granted outside pgop", func() {
+			f := &fakeMembershipClient{version: 180000, current: map[string]st{"pg_write_all_data": {}}}
+			role := newRole(postgresv1alpha1.RoleSpec{Memberships: []rm{{Role: "pg_write_all_data"}}})
+			err := reconcileMemberships(ctx, f, role, "app", nil, testManaged)
+			Expect(err).To(MatchError(ContainSubstring("pg_write_all_data is a predefined role")))
+			Expect(f.calls).To(BeEmpty())
+			Expect(role.Status.ManagedMemberships).To(BeNil())
+		})
+
+		It("refuses roles no Role of the Cluster manages unless the policy lists them, and revokes them", func() {
+			f := &fakeMembershipClient{
+				version: 180000,
+				current: map[string]st{polAnalytics: {}},
+				closures: map[string][]postgres.ReachableRole{
+					polAnalytics:    {{Name: polAnalytics}},
+					polOtherCluster: {{Name: polOtherCluster, Comment: ownerMarker(markerKindRole, "role-of-another-cluster")}},
+					polWrapsDBA:     {{Name: polWrapsDBA, Comment: ownerMarker(markerKindRole, polWrapsDBA)}, {Name: polAnalytics, Via: polAnalytics}},
+				},
+			}
+			role := newRole(postgresv1alpha1.RoleSpec{Memberships: []rm{
+				{Role: polAnalytics}, {Role: polOtherCluster}, {Role: polWrapsDBA}, {Role: "tenant_b"},
+			}}, polAnalytics)
+			err := reconcileMemberships(ctx, f, role, "app", nil, testManaged)
+			Expect(err).To(MatchError(SatisfyAll(
+				ContainSubstring("analytics_ro is not managed by a Role of this Cluster"),
+				ContainSubstring("other_cluster is not managed by a Role of this Cluster"),
+				ContainSubstring("wraps_dba is a member of analytics_ro, which is not managed"),
+			)))
+			Expect(f.calls).To(Equal([]string{"grant tenant_b to app", "revoke analytics_ro from app"}))
+
+			By("allowing it through allowedExistingRoles")
+			f.calls = nil
+			policy := &postgresv1alpha1.RolePolicySpec{AllowedExistingRoles: []string{polAnalytics}}
+			role.Spec.Memberships = []rm{{Role: polAnalytics}, {Role: polWrapsDBA}}
+			delete(f.current, polAnalytics)
+			Expect(reconcileMemberships(ctx, f, role, "app", policy, testManaged)).To(Succeed())
+			Expect(f.calls).To(Equal([]string{"grant analytics_ro to app", "grant wraps_dba to app"}))
 		})
 
 		It("allows plain and admin memberships before PostgreSQL 16", func() {
 			f := &fakeMembershipClient{version: 150004}
 			role := newRole(postgresv1alpha1.RoleSpec{MemberOf: []string{"a"}, Memberships: []rm{{Role: "b", Admin: true}}}) //nolint:staticcheck // deprecated field under test
-			Expect(reconcileMemberships(ctx, f, role, "app")).To(Succeed())
-			Expect(f.calls).To(Equal([]string{"grant b to app", "grant a to app"}))
+			Expect(reconcileMemberships(ctx, f, role, "app", nil, testManaged)).To(Succeed())
+			Expect(f.calls).To(Equal([]string{"grant b to app", polGrantA}))
 		})
 	})
 })

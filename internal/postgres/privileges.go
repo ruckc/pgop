@@ -293,7 +293,7 @@ func (c *Client) RevokeParameterPrivileges(ctx context.Context, parameter, role 
 // identifier, so a list must be passed as separate arguments.
 // (session_preload_libraries and local_preload_libraries are list
 // parameters too, but they are denied by DeniedParameter.)
-var listQuoteParameters = []string{paramSearchPath, "temp_tablespaces"}
+var listQuoteParameters = []string{paramSearchPath, settingTempTablespaces}
 
 // errUnterminatedQuote reports a list element with an unterminated quote.
 var errUnterminatedQuote = errors.New("unterminated quoted identifier")
@@ -433,12 +433,13 @@ func (c *Client) ResetDatabaseParameter(ctx context.Context, database, parameter
 // identity (role, session_authorization), load code into sessions
 // (*_preload_libraries, dynamic_library_path, jit_provider) or bypass
 // triggers, foreign keys and replication safeguards
-// (session_replication_role).
+// (session_replication_role) or large-object permission checks
+// (lo_compat_privileges).
 var deniedParameters = []string{
-	"role", "session_authorization",
+	settingRole, "session_authorization",
 	"session_preload_libraries", "local_preload_libraries", "shared_preload_libraries",
 	"dynamic_library_path", "jit_provider",
-	"session_replication_role",
+	"session_replication_role", "lo_compat_privileges",
 }
 
 // deniedParameterPrefixes are custom parameter namespaces that pgop never

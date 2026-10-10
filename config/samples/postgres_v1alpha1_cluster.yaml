@@ -22,3 +22,11 @@ spec:
   parameters:
     shared_preload_libraries: pg_stat_statements
     work_mem: 8MB
+  # What Roles and Databases on this Cluster may obtain. Absent (the default):
+  # no createRole/replication/bypassRLS, no predefined pg_* role memberships,
+  # and only extensions the server marks as trusted. Only whoever can edit
+  # the Cluster can widen it.
+  # rolePolicy:
+  #   allowedAttributes: [bypassRLS]
+  #   allowedPredefinedRoles: [pg_monitor]
+  #   allowedExtensions: [postgis]

@@ -120,6 +120,38 @@ const (
 	// ReasonRoleDropBlocked: the role cannot be dropped because objects or
 	// privileges that pgop does not manage still depend on it.
 	ReasonRoleDropBlocked = "RoleDropBlocked"
+	// ReasonRolePolicyViolation: the Role requests something the Cluster's
+	// spec.rolePolicy does not allow (a privileged attribute), or names an
+	// existing PostgreSQL role pgop must not take over.
+	ReasonRolePolicyViolation = "RolePolicyViolation"
+	// ReasonMembershipNotAllowed: Role.spec.memberships/memberOf names a role
+	// whose membership the policy does not allow. The other memberships are
+	// still applied; a forbidden membership pgop granted earlier is revoked.
+	ReasonMembershipNotAllowed = "MembershipNotAllowed"
+	// ReasonReservedName: the Role or Database maps to a PostgreSQL name
+	// reserved for PostgreSQL or the operator. Nothing is done in PostgreSQL.
+	ReasonReservedName = "ReservedName"
+	// ReasonExtensionNotAllowed: Database.spec.extensions names an extension
+	// that is neither trusted nor listed in the Cluster's
+	// spec.rolePolicy.allowedExtensions. It is not installed.
+	ReasonExtensionNotAllowed = "ExtensionNotAllowed"
+	// ReasonSchemaNotAllowed: Database.spec.schemas names a system schema.
+	ReasonSchemaNotAllowed = "SchemaNotAllowed"
+	// ReasonRoleNotManaged: the PostgreSQL role exists but does not carry this
+	// Role's ownership marker (COMMENT ON ROLE); pgop leaves it alone.
+	ReasonRoleNotManaged = "RoleNotManaged"
+	// ReasonDuplicateRoleName: an older Role of the same Cluster resolves to
+	// the same PostgreSQL role name; this Role is not reconciled.
+	ReasonDuplicateRoleName = "DuplicateRoleName"
+	// ReasonDatabaseNotManaged: the PostgreSQL database exists but does not
+	// carry this Database's ownership marker; pgop leaves it alone.
+	ReasonDatabaseNotManaged = "DatabaseNotManaged"
+	// ReasonDatabaseNotConnectable: the database does not allow connections
+	// (ALTER DATABASE ... WITH ALLOW_CONNECTIONS false).
+	ReasonDatabaseNotConnectable = "DatabaseNotConnectable"
+	// ReasonDuplicateDatabaseName: an older Database of the same Cluster
+	// resolves to the same PostgreSQL database name.
+	ReasonDuplicateDatabaseName = "DuplicateDatabaseName"
 
 	DefaultPostgresImage    = "postgres:18"
 	DefaultOperatorUsername = "pgop_operator"

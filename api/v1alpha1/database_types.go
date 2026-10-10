@@ -21,6 +21,7 @@ import (
 )
 
 // DatabaseSpec defines the desired state of Database
+// +kubebuilder:validation:XValidation:rule="self.clusterRef.name == oldSelf.clusterRef.name",message="clusterRef is immutable; create a new Database for another Cluster"
 // +kubebuilder:validation:XValidation:rule="has(oldSelf.databaseName) == has(self.databaseName) && (!has(self.databaseName) || self.databaseName == oldSelf.databaseName)",message="databaseName is immutable"
 type DatabaseSpec struct {
 	// clusterRef references the PostgreSQL Cluster this database belongs to
@@ -47,8 +48,14 @@ type DatabaseSpec struct {
 	// +optional
 	Owner string `json:"owner,omitempty"`
 
-	// extensions lists PostgreSQL extensions to install in this database
+	// extensions lists PostgreSQL extensions to install in this database.
+	// The operator installs them as a superuser, so only extensions that the
+	// server marks as trusted (pg_available_extension_versions.trusted) or
+	// that the Cluster lists in spec.rolePolicy.allowedExtensions are
+	// installed; others are reported with reason ExtensionNotAllowed.
+	// Extensions are never dropped when removed from the list.
 	// +optional
+	// +kubebuilder:validation:MaxItems=64
 	Extensions []ExtensionSpec `json:"extensions,omitempty"`
 
 	// schemas lists schemas to create in this database
@@ -83,7 +90,7 @@ type DatabaseSpec struct {
 	// +kubebuilder:validation:MaxProperties=256
 	// +kubebuilder:validation:XValidation:rule="self.all(k, size(k) <= 127 && k.matches('^[A-Za-z_][A-Za-z0-9_]*(\\\\.[A-Za-z_][A-Za-z0-9_]*)*$'))",message="settings keys must be parameter names: identifiers ([A-Za-z_][A-Za-z0-9_]*) optionally separated by dots, at most 127 characters"
 	// +kubebuilder:validation:XValidation:rule="self.all(k, size(self[k]) <= 4096)",message="settings values must be at most 4096 characters"
-	// +kubebuilder:validation:XValidation:rule="!self.exists(k, k.lowerAscii() in ['role', 'session_authorization', 'session_preload_libraries', 'local_preload_libraries', 'shared_preload_libraries', 'dynamic_library_path', 'jit_provider', 'session_replication_role'] || k.lowerAscii().startsWith('pgaudit.') || k.lowerAscii().startsWith('set_user.') || k.lowerAscii().startsWith('anon.') || k.lowerAscii().startsWith('sepgsql.'))",message="settings must not include role, session_authorization, *_preload_libraries, dynamic_library_path, jit_provider, session_replication_role or pgaudit.*, set_user.*, anon.*, sepgsql.* parameters"
+	// +kubebuilder:validation:XValidation:rule="!self.exists(k, k.lowerAscii() in ['role', 'session_authorization', 'session_preload_libraries', 'local_preload_libraries', 'shared_preload_libraries', 'dynamic_library_path', 'jit_provider', 'session_replication_role', 'lo_compat_privileges'] || k.lowerAscii().startsWith('pgaudit.') || k.lowerAscii().startsWith('set_user.') || k.lowerAscii().startsWith('anon.') || k.lowerAscii().startsWith('sepgsql.'))",message="settings must not include role, session_authorization, *_preload_libraries, dynamic_library_path, jit_provider, session_replication_role, lo_compat_privileges or pgaudit.*, set_user.*, anon.*, sepgsql.* parameters"
 	Settings map[string]string `json:"settings,omitempty"`
 }
 
@@ -131,23 +138,35 @@ type ManagedDatabaseGrant struct {
 type ExtensionSpec struct {
 	// name is the name of the PostgreSQL extension
 	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[A-Za-z0-9_-]+$`
 	Name string `json:"name"`
 
-	// schema is the schema to install the extension into.
-	// If not specified, the extension is installed into the default schema.
+	// schema is the schema to install the extension into. If not specified,
+	// the extension is installed into the schema named by its control file,
+	// or else into public.
 	// +optional
+	// +kubebuilder:validation:MaxLength=63
 	Schema string `json:"schema,omitempty"`
 
 	// version is the version of the extension to install.
-	// If not specified, the latest available version is installed.
+	// If not specified, the default version is installed.
 	// +optional
+	// +kubebuilder:validation:MaxLength=64
 	Version string `json:"version,omitempty"`
 }
 
 // SchemaSpec defines a schema to create in the database
 type SchemaSpec struct {
-	// name is the name of the schema
+	// name is the name of the schema. System schemas (pg_catalog,
+	// information_schema and other names starting with pg_) are not allowed:
+	// owning or creating objects in them would affect every session in the
+	// database, including the operator's superuser sessions.
 	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:XValidation:rule="!self.startsWith('pg_') && self != 'information_schema'",message="schema name must not be a system schema (pg_* or information_schema)"
 	Name string `json:"name"`
 
 	// owner is the role that owns this schema.
@@ -189,6 +208,12 @@ type DatabaseStatus struct {
 	// +optional
 	DatabaseName string `json:"databaseName,omitempty"`
 
+	// clusterUID is the UID of the Cluster on which databaseName was created
+	// or adopted. pgop only treats databaseName as this Database's own when
+	// it matches the UID of the Cluster the Database references.
+	// +optional
+	ClusterUID string `json:"clusterUID,omitempty"`
+
 	// installedExtensions lists extensions that have been successfully installed
 	// +optional
 	InstalledExtensions []string `json:"installedExtensions,omitempty"`
@@ -220,6 +245,7 @@ type DatabaseStatus struct {
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
+// +kubebuilder:validation:XValidation:rule="has(self.spec.databaseName) || !(self.metadata.name in ['postgres', 'template0', 'template1'])",message="a Database named postgres, template0 or template1 must set spec.databaseName: those PostgreSQL databases are reserved"
 // +kubebuilder:printcolumn:name="Cluster",type="string",JSONPath=".spec.clusterRef.name"
 // +kubebuilder:printcolumn:name="PGName",type="string",JSONPath=".status.databaseName"
 // +kubebuilder:printcolumn:name="Owner",type="string",JSONPath=".spec.owner"

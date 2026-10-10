@@ -19,6 +19,7 @@ package postgres
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
 	"net"
@@ -90,6 +91,39 @@ func (f fixedAddressDialer) DialContext(ctx context.Context, network, _ string) 
 	return f.d.DialContext(ctx, network, f.address)
 }
 
+// versionedSessionPins resets, on a new connection, the session settings
+// that can break the operator's sessions when a database owner sets them with
+// ALTER DATABASE ... SET, but that do not exist in every supported
+// PostgreSQL version (PostgreSQL 14 is the oldest supported; an unknown
+// startup parameter fails the connection): transaction_timeout (17+). The
+// query only uses catalog objects; the startup parameters already pinned
+// search_path.
+const versionedSessionPins = `SELECT pg_catalog.set_config(s.name, '0', false)
+FROM pg_catalog.pg_settings s
+WHERE s.name = 'transaction_timeout'`
+
+// pinningConnector runs versionedSessionPins on every new connection.
+type pinningConnector struct {
+	driver.Connector
+}
+
+func (c pinningConnector) Connect(ctx context.Context) (driver.Conn, error) {
+	conn, err := c.Connector.Connect(ctx)
+	if err != nil {
+		return nil, err
+	}
+	ex, ok := conn.(driver.ExecerContext)
+	if !ok {
+		_ = conn.Close()
+		return nil, errors.New("the PostgreSQL driver does not support ExecContext")
+	}
+	if _, err := ex.ExecContext(ctx, versionedSessionPins, nil); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("failed to pin session settings: %w", err)
+	}
+	return conn, nil
+}
+
 // NewClient creates a new PostgreSQL client connection
 func NewClient(cfg ConnectionConfig) (*Client, error) {
 	connStr, err := buildDSN(cfg)
@@ -97,17 +131,14 @@ func NewClient(cfg ConnectionConfig) (*Client, error) {
 		return nil, err
 	}
 
-	var db *sql.DB
-	if cfg.DialAddress != "" {
-		connector, err := pq.NewConnector(connStr)
-		if err != nil {
-			return nil, fmt.Errorf("failed to open connection: %w", err)
-		}
-		connector.Dialer(fixedAddressDialer{address: cfg.DialAddress, d: net.Dialer{Timeout: connectTimeout}})
-		db = sql.OpenDB(connector)
-	} else if db, err = sql.Open("postgres", connStr); err != nil {
+	connector, err := pq.NewConnector(connStr)
+	if err != nil {
 		return nil, fmt.Errorf("failed to open connection: %w", err)
 	}
+	if cfg.DialAddress != "" {
+		connector.Dialer(fixedAddressDialer{address: cfg.DialAddress, d: net.Dialer{Timeout: connectTimeout}})
+	}
+	db := sql.OpenDB(pinningConnector{connector})
 
 	if err := db.Ping(); err != nil {
 		_ = db.Close()
@@ -213,10 +244,11 @@ func (c *Client) Settings(ctx context.Context) ([]Setting, error) {
 	return out, nil
 }
 
-// RoleOptions defines PostgreSQL role attributes
+// RoleOptions defines PostgreSQL role attributes. Roles managed by pgop are
+// never superusers: the generated statement always says NOSUPERUSER, so an
+// existing superuser role is demoted.
 type RoleOptions struct {
 	Login           bool
-	Superuser       bool
 	CreateDB        bool
 	CreateRole      bool
 	Inherit         bool
@@ -231,6 +263,26 @@ type RoleOptions struct {
 	// otherwise show up in server logs with log_statement=ddl). A newly
 	// created role always gets Password.
 	KeepExistingPassword bool
+	// Comment, when set, is stored with COMMENT ON ROLE in the same
+	// transaction as the CREATE/ALTER ROLE (pgop's ownership marker).
+	Comment string
+	// CreateOnly makes CreateRole only ever run CREATE ROLE: when the role
+	// exists (for example created by someone else after the caller checked),
+	// it fails with ErrObjectExists instead of altering it.
+	CreateOnly bool
+}
+
+// ErrObjectExists reports that CREATE ROLE / CREATE DATABASE found the object
+// already there although the caller asked for a create only.
+var ErrObjectExists = errors.New("the object already exists")
+
+// duplicateObjectError wraps err in ErrObjectExists when it is PostgreSQL's
+// duplicate_object (42710, roles) or duplicate_database (42P04) error.
+func duplicateObjectError(what string, err error) error {
+	if pqErr, ok := errors.AsType[*pq.Error](err); ok && (pqErr.Code == "42710" || pqErr.Code == "42P04") {
+		return fmt.Errorf("%s: %w", what, ErrObjectExists)
+	}
+	return nil
 }
 
 // CreateRole creates a new PostgreSQL role with the given options, or updates
@@ -240,9 +292,12 @@ type RoleOptions struct {
 func (c *Client) CreateRole(ctx context.Context, name string, opts RoleOptions) error {
 	// Check if role exists
 	var exists bool
-	err := c.db.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname = $1)", name).Scan(&exists)
-	if err != nil {
-		return fmt.Errorf("failed to check role existence: %w", err)
+	var err error
+	if !opts.CreateOnly {
+		err = c.db.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname = $1)", name).Scan(&exists)
+		if err != nil {
+			return fmt.Errorf("failed to check role existence: %w", err)
+		}
 	}
 
 	if exists && opts.KeepExistingPassword {
@@ -255,10 +310,92 @@ func (c *Client) CreateRole(ctx context.Context, name string, opts RoleOptions) 
 		}
 	}
 
-	if _, err = c.db.ExecContext(ctx, c.buildRoleQuery(name, exists, opts)); err != nil {
+	query := c.buildRoleQuery(name, exists, opts)
+	if opts.Comment == "" {
+		if _, err = c.db.ExecContext(ctx, query); err != nil {
+			if dup := duplicateObjectError(fmt.Sprintf("role %q", name), err); dup != nil {
+				return dup
+			}
+			return redactedError(fmt.Sprintf("failed to create/alter role %q", name), err, plaintext, opts.Password)
+		}
+		return nil
+	}
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create/alter role %q: %w", name, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err = tx.ExecContext(ctx, query); err != nil {
+		if dup := duplicateObjectError(fmt.Sprintf("role %q", name), err); dup != nil {
+			return dup
+		}
 		return redactedError(fmt.Sprintf("failed to create/alter role %q", name), err, plaintext, opts.Password)
 	}
+	if _, err = tx.ExecContext(ctx, buildCommentQuery("ROLE", name, opts.Comment)); err != nil {
+		return fmt.Errorf("failed to comment on role %q: %w", name, err)
+	}
+	if err = tx.Commit(); err != nil {
+		return redactedError(fmt.Sprintf("failed to create/alter role %q", name), err, plaintext, opts.Password)
+	}
+	return nil
+}
 
+// buildCommentQuery builds COMMENT ON <kind> <name> IS '<comment>' for a
+// shared object (ROLE or DATABASE).
+func buildCommentQuery(kind, name, comment string) string {
+	return fmt.Sprintf("COMMENT ON %s %s IS %s", kind, quoteIdent(name), quoteLiteral(comment))
+}
+
+// RoleComment reports whether the role exists and returns its comment
+// (COMMENT ON ROLE), "" when it has none.
+func (c *Client) RoleComment(ctx context.Context, name string) (exists bool, comment string, err error) {
+	err = c.db.QueryRowContext(ctx,
+		"SELECT COALESCE(pg_catalog.shobj_description(oid, 'pg_authid'), '') FROM pg_catalog.pg_roles WHERE rolname = $1",
+		name).Scan(&comment)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, "", nil
+	}
+	if err != nil {
+		return false, "", fmt.Errorf("failed to look up role %q: %w", name, err)
+	}
+	return true, comment, nil
+}
+
+// DatabaseComment reports whether the database exists and returns its
+// comment (COMMENT ON DATABASE), "" when it has none.
+func (c *Client) DatabaseComment(ctx context.Context, name string) (exists bool, comment string, err error) {
+	err = c.db.QueryRowContext(ctx,
+		"SELECT COALESCE(pg_catalog.shobj_description(oid, 'pg_database'), '') FROM pg_catalog.pg_database WHERE datname = $1",
+		name).Scan(&comment)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, "", nil
+	}
+	if err != nil {
+		return false, "", fmt.Errorf("failed to look up database %q: %w", name, err)
+	}
+	return true, comment, nil
+}
+
+// DatabaseAllowsConnections reports whether the database accepts
+// connections (pg_database.datallowconn); false when it does not exist.
+func (c *Client) DatabaseAllowsConnections(ctx context.Context, name string) (bool, error) {
+	var allow bool
+	err := c.db.QueryRowContext(ctx, `SELECT datallowconn FROM pg_catalog.pg_database WHERE datname = $1`, name).Scan(&allow)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("failed to look up database %q: %w", name, err)
+	}
+	return allow, nil
+}
+
+// CommentOnDatabase sets the comment of a database. Database comments are
+// shared objects, so this works from a connection to any database.
+func (c *Client) CommentOnDatabase(ctx context.Context, name, comment string) error {
+	if _, err := c.db.ExecContext(ctx, buildCommentQuery("DATABASE", name, comment)); err != nil {
+		return fmt.Errorf("failed to comment on database %q: %w", name, err)
+	}
 	return nil
 }
 
@@ -321,11 +458,7 @@ func (c *Client) buildRoleOptions(opts RoleOptions) []string {
 		parts = append(parts, "NOLOGIN")
 	}
 
-	if opts.Superuser {
-		parts = append(parts, "SUPERUSER")
-	} else {
-		parts = append(parts, "NOSUPERUSER")
-	}
+	parts = append(parts, "NOSUPERUSER")
 
 	if opts.CreateDB {
 		parts = append(parts, "CREATEDB")
@@ -387,6 +520,59 @@ func (c *Client) RoleExists(ctx context.Context, name string) (bool, error) {
 		return false, fmt.Errorf("failed to check role existence: %w", err)
 	}
 	return exists, nil
+}
+
+// ReachableRole is a role that another role reaches through role
+// memberships, with its privileged attributes.
+type ReachableRole struct {
+	// Name is the role's name.
+	Name string
+	// Via is the direct membership through which the role is reached, or ""
+	// for the starting role itself.
+	Via string
+	// Comment is the role's comment (COMMENT ON ROLE), "" when unset. pgop
+	// stores its ownership marker there.
+	Comment string
+	// Superuser, CreateRole, Replication and BypassRLS are the role's
+	// attributes.
+	Superuser   bool
+	CreateRole  bool
+	Replication bool
+	BypassRLS   bool
+}
+
+// MembershipClosure returns the role name itself (Via "") followed by every
+// role it is a member of, directly or indirectly, whatever the grant
+// options. It returns nil when the role does not exist.
+func (c *Client) MembershipClosure(ctx context.Context, name string) ([]ReachableRole, error) {
+	const query = `WITH RECURSIVE reach(oid, via) AS (
+    SELECT oid, NULL::name FROM pg_catalog.pg_roles WHERE rolname = $1
+  UNION
+    SELECT m.roleid, COALESCE(reach.via, r.rolname)
+    FROM reach
+    JOIN pg_catalog.pg_auth_members m ON m.member = reach.oid
+    JOIN pg_catalog.pg_roles r ON r.oid = m.roleid
+)
+SELECT r.rolname, COALESCE(reach.via, ''), COALESCE(pg_catalog.shobj_description(r.oid, 'pg_authid'), ''), r.rolsuper, r.rolcreaterole, r.rolreplication, r.rolbypassrls
+FROM reach JOIN pg_catalog.pg_roles r ON r.oid = reach.oid
+ORDER BY reach.via NULLS FIRST, r.rolname`
+	rows, err := c.db.QueryContext(ctx, query, name)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list the roles %q is a member of: %w", name, err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []ReachableRole
+	for rows.Next() {
+		var r ReachableRole
+		if err := rows.Scan(&r.Name, &r.Via, &r.Comment, &r.Superuser, &r.CreateRole, &r.Replication, &r.BypassRLS); err != nil {
+			return nil, fmt.Errorf("failed to scan role: %w", err)
+		}
+		out = append(out, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to list the roles %q is a member of: %w", name, err)
+	}
+	return out, nil
 }
 
 // MinMembershipOptionsVersion is the first server_version_num that supports
@@ -525,37 +711,38 @@ WHERE u.rolname = $1`
 	return out, nil
 }
 
-// CreateDatabase creates a new database
-func (c *Client) CreateDatabase(ctx context.Context, name, owner string) error {
-	// Check if database exists
-	var exists bool
-	err := c.db.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)", name).Scan(&exists)
-	if err != nil {
-		return fmt.Errorf("failed to check database existence: %w", err)
-	}
-
-	if exists {
-		// Update owner if needed
-		if owner != "" {
-			query := fmt.Sprintf("ALTER DATABASE %s OWNER TO %s", quoteIdent(name), quoteIdent(owner))
-			_, err = c.db.ExecContext(ctx, query)
-			if err != nil {
-				return fmt.Errorf("failed to alter database owner: %w", err)
-			}
+// CreateDatabase creates a new database, or, unless createOnly is set, sets
+// the owner of an existing one. With createOnly it only ever runs CREATE
+// DATABASE and fails with ErrObjectExists when the database exists (for
+// example created by someone else after the caller checked).
+func (c *Client) CreateDatabase(ctx context.Context, name, owner string, createOnly bool) error {
+	if !createOnly {
+		var exists bool
+		err := c.db.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)", name).Scan(&exists)
+		if err != nil {
+			return fmt.Errorf("failed to check database existence: %w", err)
 		}
-		return nil
+		if exists {
+			if owner != "" {
+				query := fmt.Sprintf("ALTER DATABASE %s OWNER TO %s", quoteIdent(name), quoteIdent(owner))
+				if _, err := c.db.ExecContext(ctx, query); err != nil {
+					return fmt.Errorf("failed to alter database owner: %w", err)
+				}
+			}
+			return nil
+		}
 	}
 
 	query := fmt.Sprintf("CREATE DATABASE %s", quoteIdent(name))
 	if owner != "" {
 		query += fmt.Sprintf(" OWNER %s", quoteIdent(owner))
 	}
-
-	_, err = c.db.ExecContext(ctx, query)
-	if err != nil {
+	if _, err := c.db.ExecContext(ctx, query); err != nil {
+		if dup := duplicateObjectError(fmt.Sprintf("database %q", name), err); dup != nil {
+			return dup
+		}
 		return fmt.Errorf("failed to create database: %w", err)
 	}
-
 	return nil
 }
 
@@ -579,9 +766,27 @@ func (c *Client) DatabaseExists(ctx context.Context, name string) (bool, error) 
 	return exists, nil
 }
 
-// CreateExtension creates a PostgreSQL extension in a database
-// Note: This must be called on a connection to the target database
-func (c *Client) CreateExtension(ctx context.Context, name, schema, version string) error {
+// ExtensionTrusted reports whether the given version of an extension (its
+// default version when version is empty) is marked trusted in
+// pg_available_extension_versions, and whether that version is available on
+// the server at all. Requires PostgreSQL 13 or later.
+func (c *Client) ExtensionTrusted(ctx context.Context, name, version string) (trusted, available bool, err error) {
+	const query = `SELECT v.trusted
+FROM pg_catalog.pg_available_extension_versions v
+JOIN pg_catalog.pg_available_extensions e ON e.name = v.name
+WHERE v.name = $1 AND v.version = COALESCE(NULLIF($2, ''), e.default_version)`
+	err = c.db.QueryRowContext(ctx, query, name, version).Scan(&trusted)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, false, nil
+	}
+	if err != nil {
+		return false, false, fmt.Errorf("failed to look up extension %q: %w", name, err)
+	}
+	return trusted, true, nil
+}
+
+// buildCreateExtensionQuery builds CREATE EXTENSION IF NOT EXISTS.
+func buildCreateExtensionQuery(name, schema, version string) string {
 	query := fmt.Sprintf("CREATE EXTENSION IF NOT EXISTS %s", quoteIdent(name))
 	if schema != "" {
 		query += fmt.Sprintf(" SCHEMA %s", quoteIdent(schema))
@@ -589,9 +794,37 @@ func (c *Client) CreateExtension(ctx context.Context, name, schema, version stri
 	if version != "" {
 		query += " VERSION " + quoteLiteral(version)
 	}
+	return query
+}
 
-	_, err := c.db.ExecContext(ctx, query)
+// CreateExtension creates a PostgreSQL extension in a database
+// Note: This must be called on a connection to the target database
+//
+// Operator sessions run with search_path pinned to pg_catalog (see
+// buildDSN), which would make pg_catalog the default schema for the new
+// extension. Without an explicit schema the statement therefore runs with
+// search_path set to public for its transaction only, which is where the
+// extension went with PostgreSQL's default search_path.
+func (c *Client) CreateExtension(ctx context.Context, name, schema, version string) error {
+	query := buildCreateExtensionQuery(name, schema, version)
+	if schema != "" {
+		if _, err := c.db.ExecContext(ctx, query); err != nil {
+			return fmt.Errorf("failed to create extension: %w", err)
+		}
+		return nil
+	}
+	tx, err := c.db.BeginTx(ctx, nil)
 	if err != nil {
+		return fmt.Errorf("failed to create extension: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, "SET LOCAL search_path TO public"); err != nil {
+		return fmt.Errorf("failed to create extension: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, query); err != nil {
+		return fmt.Errorf("failed to create extension: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("failed to create extension: %w", err)
 	}
 	return nil

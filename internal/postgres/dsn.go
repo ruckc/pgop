@@ -58,20 +58,75 @@ func buildDSN(cfg ConnectionConfig) (string, error) {
 		return "", fmt.Errorf("unsupported sslmode %q", cfg.SSLMode)
 	}
 
-	pairs := []struct{ k, v string }{
+	pairs := make([]struct{ k, v string }, 0, 6+len(operatorSessionSettings))
+	pairs = append(pairs, []struct{ k, v string }{
 		{"host", cfg.Host},
 		{"port", strconv.Itoa(int(cfg.Port))},
 		{"user", cfg.User},
 		{"password", cfg.Password},
 		{"dbname", cfg.Database},
 		{"sslmode", sslMode},
-	}
+	}...)
+	// Pin the session settings of every operator session (see
+	// operatorSessionSettings). Startup parameters take precedence over
+	// ALTER DATABASE / ALTER ROLE ... SET.
+	pairs = append(pairs, operatorSessionSettings...)
 	parts := make([]string, 0, len(pairs))
 	for _, p := range pairs {
 		parts = append(parts, p.k+"="+quoteDSNValue(p.v))
 	}
 	return strings.Join(parts, " "), nil
 }
+
+// operatorSearchPath is the search_path of every connection made by NewClient.
+// pg_temp is listed last so temporary objects can never shadow catalog ones.
+const operatorSearchPath = "pg_catalog, pg_temp"
+
+// operatorSessionSettings are sent as startup parameters on every
+// connection made by NewClient. The operator connects as a superuser to
+// databases whose owners (Database writers, or anyone with the owner's
+// credentials) can set per-database defaults with ALTER DATABASE ... SET.
+// Without these pins they could:
+//   - search_path: point name resolution at a schema they can write to and
+//     shadow functions and operators used by the operator's queries, running
+//     code as a superuser;
+//   - role: run the operator's session as their own role
+//     (ALTER DATABASE ... SET role = 'owner' is accepted for the owner);
+//   - statement_timeout, lock_timeout, idle_in_transaction_session_timeout,
+//     idle_session_timeout, default_transaction_read_only,
+//     check_function_bodies, row_security, default_tablespace,
+//     temp_tablespaces: make the operator's statements fail, or behave
+//     differently, in their database;
+//   - exit_on_error (superuser context, so only with a parameterGrants
+//     grant): end the operator's session on any error.
+//
+// They all exist in every supported PostgreSQL version (14 and later);
+// settings that only exist in newer versions are pinned after connecting
+// (versionedSessionPins).
+var operatorSessionSettings = []struct{ k, v string }{
+	{settingSearchPath, operatorSearchPath},
+	{settingRole, roleNone},
+	{settingStatementTimeout, "0"},
+	{"lock_timeout", "0"},
+	{"idle_in_transaction_session_timeout", "0"},
+	{"idle_session_timeout", "0"},
+	{"exit_on_error", settingOff},
+	{"default_transaction_read_only", settingOff},
+	{"check_function_bodies", "on"},
+	{"row_security", "on"},
+	{"default_tablespace", ""},
+	{settingTempTablespaces, ""},
+}
+
+// Names and values of session settings used in more than one place.
+const (
+	settingSearchPath       = "search_path"
+	settingRole             = "role"
+	settingStatementTimeout = "statement_timeout"
+	settingTempTablespaces  = "temp_tablespaces"
+	roleNone                = "none"
+	settingOff              = "off"
+)
 
 // quoteDSNValue quotes a libpq connection-string value: the value is wrapped
 // in single quotes and any backslash or single quote is backslash-escaped.

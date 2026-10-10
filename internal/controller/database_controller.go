@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -40,6 +41,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	postgresv1alpha1 "github.com/ruckc/pgop/api/v1alpha1"
+	"github.com/ruckc/pgop/internal/postgres"
 )
 
 const (
@@ -80,18 +82,7 @@ func (r *DatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 				return ctrl.Result{}, err
 			}
 			if err == nil {
-				adminClient, err := newOperatorClient(ctx, r.Client, cluster, defaultDatabaseName)
-				if err != nil {
-					log.Error(err, "Failed to create PostgreSQL admin client during deletion")
-					return ctrl.Result{}, err
-				}
-				defer func() { _ = adminClient.Close() }()
-				// Prefer the name recorded in status so we drop what was actually created.
-				pgName := database.Status.DatabaseName
-				if pgName == "" {
-					pgName = database.PostgresName()
-				}
-				if err := adminClient.DropDatabase(ctx, pgName); err != nil {
+				if err := r.dropPostgresDatabase(ctx, cluster, database); err != nil {
 					log.Error(err, "Failed to drop database")
 					return ctrl.Result{}, err
 				}
@@ -106,6 +97,15 @@ func (r *DatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 			}
 		}
 		return ctrl.Result{}, nil
+	}
+
+	// The maintenance and template databases are never managed (owning
+	// template1 would let the owner plant objects in every future database),
+	// and of two Databases of a Cluster that resolve to the same PostgreSQL
+	// name only the older one is reconciled.
+	pgName := database.PostgresName()
+	if err := r.checkDatabaseName(ctx, database, pgName); err != nil {
+		return r.updateStatus(ctx, database, false, nil, nil, err)
 	}
 
 	// Get the referenced cluster
@@ -150,14 +150,20 @@ func (r *DatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		}
 	}
 
-	// Create the database
-	pgName := database.PostgresName()
-	if err := adminClient.CreateDatabase(ctx, pgName, ownerPGName); err != nil {
+	// Create the database, or update the owner of one this Database owns
+	// (it carries the Database's signed ownership marker).
+	signer, err := loadMarkerSigner(ctx, r.Client, cluster)
+	if err != nil {
+		return r.updateStatus(ctx, database, false, nil, nil, err)
+	}
+	recorded, err := r.databaseRecorded(ctx, database, cluster, pgName)
+	if err != nil {
+		return r.updateStatus(ctx, database, false, nil, nil, err)
+	}
+	if err := ensureDatabase(ctx, adminClient, database, cluster, signer, pgName, ownerPGName, recorded); err != nil {
 		log.Error(err, "Failed to create database")
 		return r.updateStatus(ctx, database, false, nil, nil, err)
 	}
-	// Record the PostgreSQL name that now exists so deletion drops exactly it.
-	database.Status.DatabaseName = pgName
 
 	// Settings and database grants. A problem with them (a grantee that does
 	// not exist yet, a setting that is not allowed) does not hold up the
@@ -168,7 +174,16 @@ func (r *DatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		log.Error(accessErr, "Failed to reconcile database settings or grants")
 	}
 
-	// Get a connection to the new database to install extensions and create schemas
+	// Get a connection to the new database to install extensions and create
+	// schemas. Its owner can turn connections off, for superusers too.
+	if allow, err := adminClient.DatabaseAllowsConnections(ctx, pgName); err != nil || !allow {
+		if err == nil {
+			err = &conditionError{reason: ReasonDatabaseNotConnectable, err: fmt.Errorf(
+				"the database %s does not allow connections (ALTER DATABASE %s WITH ALLOW_CONNECTIONS true); "+
+					"its extensions and schemas cannot be reconciled", pgName, pgName)}
+		}
+		return r.updateStatus(ctx, database, false, nil, nil, errors.Join(err, accessErr))
+	}
 	dbClient, err := newOperatorClient(ctx, r.Client, cluster, pgName)
 	if err != nil {
 		log.Error(err, "Failed to create PostgreSQL database client")
@@ -176,33 +191,21 @@ func (r *DatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	}
 	defer func() { _ = dbClient.Close() }()
 
-	// Install extensions
-	installedExtensions := make([]string, 0, len(database.Spec.Extensions))
-	for _, ext := range database.Spec.Extensions {
-		if err := dbClient.CreateExtension(ctx, ext.Name, ext.Schema, ext.Version); err != nil {
-			log.Error(err, "Failed to create extension", "extension", ext.Name)
-			return r.updateStatus(ctx, database, false, installedExtensions, nil, err)
-		}
-		installedExtensions = append(installedExtensions, ext.Name)
+	// Install extensions (only trusted ones and those the Cluster's
+	// rolePolicy allows), then create the schemas and apply their grants.
+	// Refused extensions and schemas are reported once the rest is done.
+	installedExtensions, refusedErr, err := installExtensions(ctx, dbClient, cluster.Spec.RolePolicy, database)
+	if err != nil {
+		log.Error(err, "Failed to create extension")
+		return r.updateStatus(ctx, database, false, installedExtensions, nil, err)
 	}
-
-	// Create schemas and apply grants
-	createdSchemas := make([]string, 0, len(database.Spec.Schemas))
-	for _, schema := range database.Spec.Schemas {
-		if err := dbClient.CreateSchema(ctx, schema.Name, schema.Owner); err != nil {
-			log.Error(err, "Failed to create schema", "schema", schema.Name)
-			return r.updateStatus(ctx, database, false, installedExtensions, createdSchemas, err)
-		}
-		createdSchemas = append(createdSchemas, schema.Name)
-
-		// Apply grants
-		for _, grant := range schema.Grants {
-			if err := dbClient.GrantSchemaPrivileges(ctx, schema.Name, grant.Role, grant.Privileges, grant.WithGrantOption); err != nil {
-				log.Error(err, "Failed to grant privileges", "schema", schema.Name, "role", grant.Role)
-				return r.updateStatus(ctx, database, false, installedExtensions, createdSchemas, err)
-			}
-		}
+	accessErr = errors.Join(refusedErr, accessErr)
+	createdSchemas, refusedErr, err := reconcileSchemas(ctx, dbClient, database)
+	if err != nil {
+		log.Error(err, "Failed to reconcile schemas")
+		return r.updateStatus(ctx, database, false, installedExtensions, createdSchemas, err)
 	}
+	accessErr = errors.Join(refusedErr, accessErr)
 
 	if err := r.reconcileCredentialsSecret(ctx, database, ownerRole, cluster); err != nil {
 		log.Error(err, "Failed to reconcile database credentials secret")
@@ -215,6 +218,220 @@ func (r *DatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 
 	log.Info("Database reconciled successfully")
 	return r.updateStatus(ctx, database, true, installedExtensions, createdSchemas, nil)
+}
+
+// installExtensions installs the Database's extensions that the policy
+// allows. It returns the installed extensions, an ExtensionNotAllowed error
+// listing the refused ones (nil when none) and the error that stopped it.
+func installExtensions(ctx context.Context, pg *postgres.Client, policy *postgresv1alpha1.RolePolicySpec,
+	database *postgresv1alpha1.Database) (installed []string, refusedErr, err error) {
+	installed = make([]string, 0, len(database.Spec.Extensions))
+	var refused []string
+	for _, ext := range database.Spec.Extensions {
+		allowed, err := extensionAllowed(ctx, pg, policy, ext)
+		if err != nil {
+			return installed, nil, err
+		}
+		if !allowed {
+			refused = append(refused, ext.Name)
+			continue
+		}
+		if err := pg.CreateExtension(ctx, ext.Name, ext.Schema, ext.Version); err != nil {
+			return installed, nil, fmt.Errorf("extension %q: %w", ext.Name, err)
+		}
+		installed = append(installed, ext.Name)
+	}
+	if len(refused) > 0 {
+		refusedErr = &conditionError{reason: ReasonExtensionNotAllowed, err: fmt.Errorf(
+			"extensions not installed: %s: not marked trusted by the server (or not available) and not listed in "+
+				"the Cluster's spec.rolePolicy.allowedExtensions", strings.Join(refused, ", "))}
+	}
+	return installed, refusedErr, nil
+}
+
+// reconcileSchemas creates the Database's schemas and applies their grants.
+// System schemas are refused. It returns the created schemas, a
+// SchemaNotAllowed error listing the refused ones (nil when none) and the
+// error that stopped it.
+func reconcileSchemas(ctx context.Context, pg *postgres.Client, database *postgresv1alpha1.Database) (created []string, refusedErr, err error) {
+	created = make([]string, 0, len(database.Spec.Schemas))
+	var refused []string
+	for _, schema := range database.Spec.Schemas {
+		if systemSchemaName(schema.Name) {
+			refused = append(refused, schema.Name)
+			continue
+		}
+		if err := pg.CreateSchema(ctx, schema.Name, schema.Owner); err != nil {
+			return created, nil, fmt.Errorf("schema %q: %w", schema.Name, err)
+		}
+		created = append(created, schema.Name)
+		for _, grant := range schema.Grants {
+			if err := pg.GrantSchemaPrivileges(ctx, schema.Name, grant.Role, grant.Privileges, grant.WithGrantOption); err != nil {
+				return created, nil, fmt.Errorf("schema %q, role %q: %w", schema.Name, grant.Role, err)
+			}
+		}
+	}
+	if len(refused) > 0 {
+		refusedErr = &conditionError{reason: ReasonSchemaNotAllowed, err: fmt.Errorf(
+			"system schemas cannot be managed: %s", strings.Join(refused, ", "))}
+	}
+	return created, refusedErr, nil
+}
+
+// databaseOwnershipClient is the subset of *postgres.Client used to create a
+// database and keep track of who owns it.
+type databaseOwnershipClient interface {
+	DatabaseComment(ctx context.Context, name string) (exists bool, comment string, err error)
+	CommentOnDatabase(ctx context.Context, name, comment string) error
+	CreateDatabase(ctx context.Context, name, owner string, createOnly bool) error
+}
+
+// ensureDatabase creates the PostgreSQL database pgName with the Database's
+// signed ownership marker, or updates the owner of a database the Database
+// owns (see decideOwnership): one recorded in status.databaseName, or one a
+// Cluster editor allowlisted in rolePolicy.adoptableDatabases. Any other
+// existing database is left alone (reason DatabaseNotManaged). It records
+// pgName in status.databaseName once the database exists.
+func ensureDatabase(ctx context.Context, pg databaseOwnershipClient, database *postgresv1alpha1.Database,
+	cluster *postgresv1alpha1.Cluster, signer markerSigner, pgName, owner string, recorded bool) error {
+	marker := signer.marker(markerKindDatabase, database.Name)
+	exists, comment, err := pg.DatabaseComment(ctx, pgName)
+	if err != nil {
+		return err
+	}
+	decision := decideOwnership(signer, markerKindDatabase, database.Name, exists, comment, recorded,
+		cluster.Spec.RolePolicy.AllowsAdoptingDatabase(pgName))
+	if decision == notOwned {
+		return &conditionError{reason: ReasonDatabaseNotManaged, err: errors.New(notManagedMessage("database", pgName, recorded))}
+	}
+	// A database pgop decided to create is only ever created: if someone
+	// created it in the meantime, pgop does not change its owner.
+	if err := pg.CreateDatabase(ctx, pgName, owner, decision == ownedAbsent); err != nil {
+		if errors.Is(err, postgres.ErrObjectExists) {
+			return &conditionError{reason: ReasonDatabaseNotManaged, err: fmt.Errorf(
+				"the PostgreSQL database %s was created by someone else while pgop was creating it; "+
+					"pgop does not take it over: %w", pgName, err)}
+		}
+		return err
+	}
+	// Record the name (and Cluster) now, so a failed COMMENT is retried as
+	// a recorded database and deletion still finds it.
+	database.Status.DatabaseName = pgName
+	database.Status.ClusterUID = string(cluster.UID)
+	if comment != marker {
+		return pg.CommentOnDatabase(ctx, pgName, marker)
+	}
+	return nil
+}
+
+// databaseRecorded reports whether database's status records pgName as
+// created or adopted on cluster, the Cluster it references now (see
+// roleRecorded). A status written before clusterUID existed counts only when
+// the Database's credentials Secret exists, is controlled by the Database and
+// points at this Cluster's host.
+func (r *DatabaseReconciler) databaseRecorded(ctx context.Context, database *postgresv1alpha1.Database,
+	cluster *postgresv1alpha1.Cluster, pgName string) (bool, error) {
+	if pgName == "" || database.Status.DatabaseName != pgName {
+		return false, nil
+	}
+	if database.Status.ClusterUID != "" {
+		return database.Status.ClusterUID == string(cluster.UID), nil
+	}
+	if database.Spec.Owner == "" {
+		return false, nil
+	}
+	secret := &corev1.Secret{}
+	err := r.Get(ctx, types.NamespacedName{Name: database.Name + "-" + database.Spec.Owner + "-credentials",
+		Namespace: database.Namespace}, secret)
+	if apierrors.IsNotFound(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return metav1.IsControlledBy(secret, database) && string(secret.Data[SecretKeyHost]) == clusterHost(cluster), nil
+}
+
+// checkDatabaseName returns a ReservedName error for a reserved PostgreSQL
+// database name and a DuplicateDatabaseName error when an older Database of
+// the same Cluster resolves to the same PostgreSQL name.
+func (r *DatabaseReconciler) checkDatabaseName(ctx context.Context, database *postgresv1alpha1.Database, pgName string) error {
+	if reason := reservedDatabaseName(pgName); reason != "" {
+		return &conditionError{reason: ReasonReservedName, err: errors.New(reason)}
+	}
+	databases := &postgresv1alpha1.DatabaseList{}
+	if err := r.List(ctx, databases, client.InNamespace(database.Namespace)); err != nil {
+		return fmt.Errorf("failed to list Databases: %w", err)
+	}
+	for i := range databases.Items {
+		other := &databases.Items[i]
+		if other.UID != database.UID && other.Spec.ClusterRef.Name == database.Spec.ClusterRef.Name &&
+			other.PostgresName() == pgName && createdBefore(other, database) {
+			return &conditionError{reason: ReasonDuplicateDatabaseName, err: fmt.Errorf(
+				"the Database %q already manages the PostgreSQL database %s on Cluster %q; pick another databaseName",
+				other.Name, pgName, database.Spec.ClusterRef.Name)}
+		}
+	}
+	return nil
+}
+
+// dropPostgresDatabase drops the Database's PostgreSQL database during
+// deletion: exactly the one recorded in status.databaseName, and only when it
+// carries this Database's ownership marker (or no comment, for a database an
+// earlier pgop created). Nothing is dropped for a reserved name, for a
+// Database that lost a name collision, or for a database someone else owns.
+func (r *DatabaseReconciler) dropPostgresDatabase(ctx context.Context, cluster *postgresv1alpha1.Cluster, database *postgresv1alpha1.Database) error {
+	log := logf.FromContext(ctx)
+	pgName := database.Status.DatabaseName
+	recorded, err := r.databaseRecorded(ctx, database, cluster, pgName)
+	if err != nil {
+		return err
+	}
+	if pgName == "" || !recorded {
+		log.Info("No PostgreSQL database recorded for this Database on this Cluster, nothing to drop")
+		return nil
+	}
+	if err := r.checkDatabaseName(ctx, database, pgName); err != nil {
+		log.Info("Not dropping the database", "reason", err.Error())
+		return nil
+	}
+	adminClient, err := newOperatorClient(ctx, r.Client, cluster, defaultDatabaseName)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = adminClient.Close() }()
+	exists, comment, err := adminClient.DatabaseComment(ctx, pgName)
+	if err != nil || !exists {
+		return err
+	}
+	signer, err := loadMarkerSigner(ctx, r.Client, cluster)
+	if err != nil {
+		log.Info("Ownership-marker key not available; only unmarked databases can be dropped", "reason", err.Error())
+	}
+	if o := decideOwnership(signer, markerKindDatabase, database.Name, true, comment, true, false); o != owned && o != ownedRemark {
+		log.Info("Not dropping a database this Database does not own", "database", pgName)
+		return nil
+	}
+	return adminClient.DropDatabase(ctx, pgName)
+}
+
+// extensionClient is the subset of *postgres.Client used to check the
+// extension policy.
+type extensionClient interface {
+	ExtensionTrusted(ctx context.Context, name, version string) (trusted, available bool, err error)
+}
+
+// extensionAllowed reports whether pgop may install ext under policy: the
+// Cluster lists it in spec.rolePolicy.allowedExtensions, or the server marks
+// the requested version (its default version when unset) as trusted, so a
+// non-superuser with CREATE on the database could install it as well.
+func extensionAllowed(ctx context.Context, pg extensionClient, policy *postgresv1alpha1.RolePolicySpec,
+	ext postgresv1alpha1.ExtensionSpec) (bool, error) {
+	if policy.AllowsExtension(ext.Name) {
+		return true, nil
+	}
+	trusted, _, err := pg.ExtensionTrusted(ctx, ext.Name, ext.Version)
+	return trusted, err
 }
 
 // reconcileSettingsAndGrants applies the per-database settings (ALTER
@@ -430,7 +647,7 @@ func (r *DatabaseReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			builder.WithPredicates(predicate.NewPredicateFuncs(isRoleCredentialsSecret))).
 		Watches(&postgresv1alpha1.Cluster{},
 			handler.EnqueueRequestsFromMapFunc(r.databasesForCluster),
-			builder.WithPredicates(clusterConnectionChanged)).
+			builder.WithPredicates(clusterConnectionOrPolicyChanged)).
 		Named("database").
 		Complete(r)
 }

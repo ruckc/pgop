@@ -343,6 +343,49 @@ var _ = Describe("Role password Secrets", func() {
 			Expect(pw).To(Equal(`it's a \ "päss"`))
 		})
 
+		It("refuses Secrets managed by pgop or used as a Cluster TLS Secret", func() {
+			role := newRole("ref-protected-" + suffix)
+			data := map[string][]byte{testPasswordKey: []byte(testRefPassword)}
+
+			By("a Secret labeled as managed by pgop (such as <cluster>-credentials)")
+			createSecret("pw-labeled-"+suffix, data)
+			s := getSecret("pw-labeled-" + suffix)
+			s.Labels = map[string]string{LabelAppManagedBy: LabelValuePgop}
+			Expect(k8sClient.Update(ctx, s)).To(Succeed())
+			role.Spec.PasswordSecretRef = &postgresv1alpha1.SecretKeySelector{Name: "pw-labeled-" + suffix, Key: testPasswordKey}
+			_, err := rr().readPasswordSecretRef(ctx, role)
+			ce, ok := errors.AsType[*conditionError](err)
+			Expect(ok).To(BeTrue())
+			Expect(ce.reason).To(Equal(ReasonRolePolicyViolation))
+			Expect(err.Error()).To(ContainSubstring("managed by pgop"))
+
+			By("a Secret owned by a pgop resource")
+			createSecret("pw-owned-"+suffix, data)
+			s = getSecret("pw-owned-" + suffix)
+			s.OwnerReferences = []metav1.OwnerReference{{
+				APIVersion: postgresv1alpha1.GroupVersion.String(), Kind: "Role", Name: "owner-role", UID: "1234",
+			}}
+			Expect(k8sClient.Update(ctx, s)).To(Succeed())
+			role.Spec.PasswordSecretRef.Name = "pw-owned-" + suffix
+			_, err = rr().readPasswordSecretRef(ctx, role)
+			Expect(err).To(MatchError(ContainSubstring(`owned by the Role "owner-role"`)))
+
+			By("a Secret a Cluster uses as its TLS Secret")
+			createSecret("pw-tls-"+suffix, data)
+			cluster := &postgresv1alpha1.Cluster{
+				ObjectMeta: metav1.ObjectMeta{Name: "pw-tls-cluster-" + suffix, Namespace: role.Namespace},
+				Spec: postgresv1alpha1.ClusterSpec{
+					Image: DefaultPostgresImage,
+					TLS:   &postgresv1alpha1.ClusterTLSSpec{SecretName: "pw-tls-" + suffix},
+				},
+			}
+			Expect(k8sClient.Create(ctx, cluster)).To(Succeed())
+			DeferCleanup(func() { _ = k8sClient.Delete(ctx, cluster) })
+			role.Spec.PasswordSecretRef.Name = "pw-tls-" + suffix
+			_, err = rr().readPasswordSecretRef(ctx, role)
+			Expect(err).To(MatchError(ContainSubstring("TLS Secret of Cluster")))
+		})
+
 		It("sets the Available reason to PasswordSecretNotFound", func() {
 			role := newRole("ref-status-" + suffix)
 			role.Spec.PasswordSecretRef = &postgresv1alpha1.SecretKeySelector{Name: "missing-" + suffix, Key: testPasswordKey}

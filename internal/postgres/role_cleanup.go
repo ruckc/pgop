@@ -66,19 +66,40 @@ WHERE a.grantee = (SELECT oid FROM pg_roles WHERE rolname = $1)`, role)
 	return nil
 }
 
-// DatabasesWithSchemaPrivileges returns the connectable databases in which
-// role holds privileges on schemas (recorded in pg_shdepend).
-func (c *Client) DatabasesWithSchemaPrivileges(ctx context.Context, role string) ([]string, error) {
-	dbs, err := c.listStrings(ctx, `SELECT DISTINCT d.datname FROM pg_shdepend s
-JOIN pg_database d ON d.oid = s.dbid
-WHERE s.deptype = 'a' AND s.classid = 'pg_namespace'::regclass
-  AND s.refclassid = 'pg_authid'::regclass
-  AND s.refobjid = (SELECT oid FROM pg_roles WHERE rolname = $1)
-  AND d.datallowconn`, role)
+// DatabaseRef is a database and whether it accepts connections
+// (pg_database.datallowconn).
+type DatabaseRef struct {
+	Name       string
+	AllowConns bool
+}
+
+// DatabasesWithSchemaPrivileges returns the databases in which role holds
+// privileges on schemas (recorded in pg_shdepend), with whether each one
+// accepts connections: a database owner can turn connections off
+// (ALTER DATABASE ... WITH ALLOW_CONNECTIONS false), for superusers too.
+func (c *Client) DatabasesWithSchemaPrivileges(ctx context.Context, role string) ([]DatabaseRef, error) {
+	rows, err := c.db.QueryContext(ctx, `SELECT DISTINCT d.datname, d.datallowconn FROM pg_catalog.pg_shdepend s
+JOIN pg_catalog.pg_database d ON d.oid = s.dbid
+WHERE s.deptype = 'a' AND s.classid = 'pg_catalog.pg_namespace'::pg_catalog.regclass
+  AND s.refclassid = 'pg_catalog.pg_authid'::pg_catalog.regclass
+  AND s.refobjid = (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = $1)
+ORDER BY d.datname`, role)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list schema privileges of %q: %w", role, err)
 	}
-	return dbs, nil
+	defer func() { _ = rows.Close() }()
+	var out []DatabaseRef
+	for rows.Next() {
+		var d DatabaseRef
+		if err := rows.Scan(&d.Name, &d.AllowConns); err != nil {
+			return nil, fmt.Errorf("failed to scan database: %w", err)
+		}
+		out = append(out, d)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to list schema privileges of %q: %w", role, err)
+	}
+	return out, nil
 }
 
 // RevokeAllSchemaPrivileges revokes every schema privilege role holds in the

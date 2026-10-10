@@ -10,9 +10,13 @@ The Database controller:
 2. Creates the database with the specified owner
 3. Applies per-database settings (`ALTER DATABASE ... SET`) and resets removed ones
 4. Applies database-level grants (`GRANT ... ON DATABASE`) and revokes removed ones
-5. Installs requested extensions
+5. Installs requested extensions (trusted ones, or those the Cluster's
+   [role policy](clusters.md#role-policy) allows)
 6. Creates schemas with ownership and applies schema grants
 7. Drops the database on deletion
+
+See [Security model](#security-model) for what a Database writer can and
+cannot do.
 
 ## Example
 
@@ -35,7 +39,7 @@ spec:
   extensions:
     - name: uuid-ossp
     - name: pg_trgm
-    - name: postgis
+    - name: postgis            # untrusted: needs the Cluster's rolePolicy.allowedExtensions
       schema: public
   schemas:
     - name: app
@@ -64,14 +68,15 @@ spec:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `name` | string | **required** | Extension name |
-| `schema` | string | - | Schema to install extension in |
+| `name` | string | **required** | Extension name (`[A-Za-z0-9_-]`, at most 63 characters) |
+| `schema` | string | control file schema, else `public` | Schema to install extension in |
+| `version` | string | default version | Extension version to install |
 
 ### SchemaSpec
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `name` | string | **required** | Schema name |
+| `name` | string | **required** | Schema name (not `pg_*` or `information_schema`) |
 | `owner` | string | - | PostgreSQL role name that owns the schema |
 | `grants` | []GrantSpec | - | Privileges to grant |
 
@@ -159,7 +164,9 @@ spec:
 ```
 
 - `databaseName` must match `^[a-z_][a-z0-9_]*$`, be at most 63 characters, and
-  must not be `postgres`, `template0` or `template1`.
+  must not be `postgres`, `template0` or `template1`. A Database whose
+  `metadata.name` is one of those must set `databaseName`; the operator never
+  manages or drops these databases (reason `ReservedName`).
 - It is **immutable** after creation.
 - `owner` is always a **Role resource name**; the operator resolves it to that
   Role's PostgreSQL name (`spec.roleName`, or its `metadata.name`). In contrast,
@@ -285,7 +292,7 @@ restricts what a Database author can set:
   the operator's included), `session_preload_libraries`,
   `local_preload_libraries`, `shared_preload_libraries`,
   `dynamic_library_path`, `jit_provider` (code loading),
-  `session_replication_role` (disables triggers and foreign keys), and the
+  `session_replication_role` (disables triggers and foreign keys), `lo_compat_privileges` (disables large-object permission checks), and the
   `pgaudit.*`, `set_user.*`, `anon.*` and `sepgsql.*` namespaces (security
   extensions, which may not be loaded yet when the setting is checked). The
   API server rejects these names directly.
@@ -295,13 +302,29 @@ restricts what a Database author can set:
   reset.
 
 !!! warning "Remaining risk"
-    User-context parameters still affect every session in the database,
-    including the operator's own connection used for extensions and schemas
-    (for example `default_transaction_read_only=on` makes `CREATE EXTENSION`
-    fail). Custom placeholder parameters are accepted without a context check;
+    User-context parameters still affect every other session in the
+    database (the operator's own sessions are pinned, see below). Custom
+    placeholder parameters are accepted without a context check;
     if an extension that defines them is loaded later, their value applies
     with that extension's rules. Restrict who may create or edit Database
     resources accordingly.
+
+The operator's own sessions pin their settings, so neither `spec.settings`
+nor an `ALTER DATABASE ... SET` / `ALTER ROLE ... IN DATABASE ... SET` run by
+the database owner can subvert them. Sent as connection parameters (which take
+precedence over those per-database and per-role defaults):
+`search_path = pg_catalog, pg_temp` (otherwise unqualified functions and
+operators in the operator's superuser queries could resolve to objects in a
+schema the owner controls), `role = none` (the owner can otherwise make every
+new session in their database start as their own role), `statement_timeout`,
+`lock_timeout`, `idle_in_transaction_session_timeout`, `idle_session_timeout`
+(all `0`), `default_transaction_read_only = off`, `check_function_bodies = on`,
+`row_security = on`, `default_tablespace` and `temp_tablespaces` (empty), and
+`exit_on_error = off` (a superuser parameter an owner could only set with a
+`parameterGrants` grant). On connecting, `transaction_timeout`
+(PostgreSQL 17+, so it cannot be a startup parameter on older servers) is
+reset to `0` as well. Logging parameters are not pinned (see
+[Roles: parameter grants](roles.md#parameter-grants)).
 
 ## Ordering & Dependencies
 
@@ -341,6 +364,34 @@ extensions:
   - name: timescaledb
 ```
 
+### Extension policy
+
+The operator installs extensions as a superuser. To keep that from being a
+way around the server's own rules, an extension is only installed when
+
+- the server marks the requested version (the default version when
+  `version` is unset) as **trusted** (`pg_available_extension_versions.trusted`;
+  for example `pg_trgm`, `pgcrypto`, `uuid-ossp`, `citext`, `hstore`,
+  `btree_gist`, `tablefunc`), or
+- the Cluster lists it in
+  [`spec.rolePolicy.allowedExtensions`](clusters.md#role-policy).
+
+Trusted extensions are those PostgreSQL lets any role with `CREATE` on the
+database install, so pgop installing them gives the Database writer nothing
+extra. Untrusted extensions, such as `file_fdw`, `dblink`, `adminpack`,
+`plpython3u`, `postgis` or anything added to a custom image, can give access to
+the server's files, network or code execution, or were simply not reviewed for
+that; a cluster administrator has to allow them.
+
+A refused extension is not installed; the other extensions and the schemas are
+still reconciled and the Database reports `Available=False` with reason
+`ExtensionNotAllowed`. An extension already installed in the database is never
+dropped (also not when it is removed from the list or no longer allowed).
+
+Without `schema`, the extension goes to the schema its control file names, or
+else `public` (the operator no longer uses the database's `search_path` for
+this).
+
 !!! warning "Extensions must exist in the image"
     The operator runs `CREATE EXTENSION IF NOT EXISTS`, which only succeeds if
     the extension's files are already present in the running image. It does
@@ -348,6 +399,84 @@ extensions:
     include PostGIS or TimescaleDB — to use `postgis` set the Cluster's
     `spec.image` to a PostGIS-capable image (e.g. `postgis/postgis:18-3.5`), and
     similarly use a TimescaleDB image for `timescaledb`.
+
+## Security model
+
+A Database writer is trusted with the contents of **their** database, not with
+the server:
+
+- they choose the owner (a Role resource), schema owners and grants, and
+  receive the owner's credentials in the connection Secret;
+- settings are limited to user-context parameters minus a denylist (see
+  [Which parameters may be set](#which-parameters-may-be-set));
+- extensions are limited to trusted ones unless the Cluster allows more (see
+  [Extension policy](#extension-policy));
+- system schemas (`pg_catalog`, `pg_toast`, other `pg_*` names and
+  `information_schema`) cannot be created, owned or granted on (reason
+  `SchemaNotAllowed`): `CREATE` on `pg_catalog` would let the grantee shadow
+  built-in functions for every session in the database, superusers included;
+- the `postgres`, `template0` and `template1` databases cannot be managed
+  (owning `template1` would put objects into every future database);
+- the operator's sessions pin `search_path` (see above).
+
+The policy for untrusted extensions lives on the Cluster, so allowing them
+needs RBAC to edit the Cluster, separately from RBAC to create Databases. See
+[Roles: security model](roles.md#security-model) for the overall picture.
+
+Known gap: `schemas[].owner` and `grants[].role` accept any PostgreSQL role
+name on the Cluster (giving ownership or privileges away is not an
+escalation for the writer).
+
+### Ownership of the PostgreSQL database
+
+As for [roles](roles.md#ownership-of-the-postgresql-role), pgop only changes
+the owner, settings, grants, extensions and schemas of, or drops, a database
+this Database owns: one its `status.databaseName` records on the referenced
+Cluster (`status.clusterUID` matches the Cluster's UID; `clusterRef` is
+immutable), one pgop creates in this reconcile (a plain `CREATE DATABASE`; one
+created by someone else in the meantime is reported, not altered), or an
+existing one a **Cluster editor** listed in the
+Cluster's [`spec.rolePolicy.adoptableDatabases`](clusters.md#role-policy)
+(then taken over and recorded). Any other existing database (created by a
+DBA, a restore tool, another Database, or a role with `CREATEDB`) is left
+alone: reason `DatabaseNotManaged`, nothing is altered and deleting the
+Database never drops it. A database's comment never authorizes a take-over
+(its owner can set it).
+
+- pgop stores a signed marker
+  (`COMMENT ON DATABASE <db> IS 'pgop:v2:Database/<Database name>:<HMAC>'`,
+  keyed by the Cluster's `<cluster>-marker-key` Secret) on the databases it
+  owns; a recorded database whose comment was replaced by something unrelated
+  is left alone, and a missing, unsigned (`pgop:v1:`) or stale (lost key)
+  marker is refreshed;
+- of two Databases of a Cluster with the same PostgreSQL name only the older
+  one is reconciled; the other reports `DuplicateDatabaseName`;
+- a Database re-created without its status, or whose Cluster was deleted and
+  re-created, reports `DatabaseNotManaged` (and deleting it drops nothing)
+  until a Cluster editor lists the database in `adoptableDatabases`; removing
+  the name from the list later does not un-adopt it. Databases recorded by an
+  earlier pgop (no `status.clusterUID`) count as recorded when their
+  credentials Secret, controlled by the Database, points at this Cluster;
+- a database whose owner turned connections off (`ALTER DATABASE ... WITH
+  ALLOW_CONNECTIONS false`, which also locks out superusers) reports
+  `DatabaseNotConnectable`: its settings and grants are still applied, its
+  extensions and schemas wait until connections are allowed again.
+
+### Upgrade / breaking changes
+
+- Untrusted extensions are no longer installed unless the Cluster lists them
+  in `spec.rolePolicy.allowedExtensions` (reason `ExtensionNotAllowed`).
+- Extension names must match `[A-Za-z0-9_-]` (at most 63 characters); without
+  `schema`, extensions are installed into their control file schema or
+  `public`, no longer into the first schema of the database's `search_path`.
+- System schema names (`pg_*`, `information_schema`) are rejected in
+  `schemas`, and a Database named `postgres`, `template0` or `template1` must
+  set `databaseName`.
+- Existing databases are no longer taken over (`DatabaseNotManaged`) unless a
+  Cluster editor lists them in `spec.rolePolicy.adoptableDatabases`;
+  databases an earlier pgop created and recorded in status keep working and
+  are marked automatically.
+- `lo_compat_privileges` is refused in `settings`.
 
 ## Schema with Grants
 

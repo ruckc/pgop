@@ -85,27 +85,39 @@ spec:
                     template0, template1)
                   rule: '!(self in [''postgres'', ''template0'', ''template1''])'
               extensions:
-                description: extensions lists PostgreSQL extensions to install in
-                  this database
+                description: |-
+                  extensions lists PostgreSQL extensions to install in this database.
+                  The operator installs them as a superuser, so only extensions that the
+                  server marks as trusted (pg_available_extension_versions.trusted) or
+                  that the Cluster lists in spec.rolePolicy.allowedExtensions are
+                  installed; others are reported with reason ExtensionNotAllowed.
+                  Extensions are never dropped when removed from the list.
                 items:
                   description: ExtensionSpec defines a PostgreSQL extension to install
                   properties:
                     name:
                       description: name is the name of the PostgreSQL extension
+                      maxLength: 63
+                      minLength: 1
+                      pattern: ^[A-Za-z0-9_-]+$
                       type: string
                     schema:
                       description: |-
-                        schema is the schema to install the extension into.
-                        If not specified, the extension is installed into the default schema.
+                        schema is the schema to install the extension into. If not specified,
+                        the extension is installed into the schema named by its control file,
+                        or else into public.
+                      maxLength: 63
                       type: string
                     version:
                       description: |-
                         version is the version of the extension to install.
-                        If not specified, the latest available version is installed.
+                        If not specified, the default version is installed.
+                      maxLength: 64
                       type: string
                   required:
                   - name
                   type: object
+                maxItems: 64
                 type: array
               grants:
                 description: |-
@@ -195,8 +207,18 @@ spec:
                         type: object
                       type: array
                     name:
-                      description: name is the name of the schema
+                      description: |-
+                        name is the name of the schema. System schemas (pg_catalog,
+                        information_schema and other names starting with pg_) are not allowed:
+                        owning or creating objects in them would affect every session in the
+                        database, including the operator's superuser sessions.
+                      maxLength: 63
+                      minLength: 1
                       type: string
+                      x-kubernetes-validations:
+                      - message: schema name must not be a system schema (pg_* or
+                          information_schema)
+                        rule: '!self.startsWith(''pg_'') && self != ''information_schema'''
                     owner:
                       description: |-
                         owner is the role that owns this schema.
@@ -233,23 +255,34 @@ spec:
                 - message: settings values must be at most 4096 characters
                   rule: self.all(k, size(self[k]) <= 4096)
                 - message: settings must not include role, session_authorization,
-                    *_preload_libraries, dynamic_library_path, jit_provider, session_replication_role
-                    or pgaudit.*, set_user.*, anon.*, sepgsql.* parameters
+                    *_preload_libraries, dynamic_library_path, jit_provider, session_replication_role,
+                    lo_compat_privileges or pgaudit.*, set_user.*, anon.*, sepgsql.*
+                    parameters
                   rule: '!self.exists(k, k.lowerAscii() in [''role'', ''session_authorization'',
                     ''session_preload_libraries'', ''local_preload_libraries'', ''shared_preload_libraries'',
-                    ''dynamic_library_path'', ''jit_provider'', ''session_replication_role'']
-                    || k.lowerAscii().startsWith(''pgaudit.'') || k.lowerAscii().startsWith(''set_user.'')
-                    || k.lowerAscii().startsWith(''anon.'') || k.lowerAscii().startsWith(''sepgsql.''))'
+                    ''dynamic_library_path'', ''jit_provider'', ''session_replication_role'',
+                    ''lo_compat_privileges''] || k.lowerAscii().startsWith(''pgaudit.'')
+                    || k.lowerAscii().startsWith(''set_user.'') || k.lowerAscii().startsWith(''anon.'')
+                    || k.lowerAscii().startsWith(''sepgsql.''))'
             required:
             - clusterRef
             type: object
             x-kubernetes-validations:
+            - message: clusterRef is immutable; create a new Database for another
+                Cluster
+              rule: self.clusterRef.name == oldSelf.clusterRef.name
             - message: databaseName is immutable
               rule: has(oldSelf.databaseName) == has(self.databaseName) && (!has(self.databaseName)
                 || self.databaseName == oldSelf.databaseName)
           status:
             description: status defines the observed state of Database
             properties:
+              clusterUID:
+                description: |-
+                  clusterUID is the UID of the Cluster on which databaseName was created
+                  or adopted. pgop only treats databaseName as this Database's own when
+                  it matches the UID of the Cluster the Database references.
+                type: string
               conditions:
                 description: conditions represent the current state of the Database
                   resource.
@@ -376,6 +409,11 @@ spec:
         required:
         - spec
         type: object
+        x-kubernetes-validations:
+        - message: 'a Database named postgres, template0 or template1 must set spec.databaseName:
+            those PostgreSQL databases are reserved'
+          rule: has(self.spec.databaseName) || !(self.metadata.name in ['postgres',
+            'template0', 'template1'])
     served: true
     storage: true
     subresources:

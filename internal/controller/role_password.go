@@ -28,6 +28,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -201,6 +202,13 @@ func (r *RoleReconciler) readPasswordSecretRef(ctx context.Context, role *postgr
 		}
 		return "", fmt.Errorf("failed to get password Secret %q: %w", ref.Name, err)
 	}
+	if p, err := r.protectedSecretProblem(ctx, secret); err != nil || p != "" {
+		if err != nil {
+			return "", err
+		}
+		return "", &conditionError{reason: ReasonRolePolicyViolation,
+			err: fmt.Errorf("password Secret %q cannot be used: %s", ref.Name, p)}
+	}
 	pw := secret.Data[ref.Key]
 	if len(pw) == 0 {
 		return "", &conditionError{reason: ReasonPasswordSecretNotFound,
@@ -211,6 +219,36 @@ func (r *RoleReconciler) readPasswordSecretRef(ctx context.Context, role *postgr
 			err: fmt.Errorf("the value of key %q in password Secret %q %s", ref.Key, ref.Name, problem)}
 	}
 	return string(pw), nil
+}
+
+// protectedSecretProblem explains why secret must not be used as a
+// passwordSecretRef, or returns "". The operator reads that Secret with its
+// own permissions and copies the value into the role credentials Secret, so
+// without this check a Role writer could read the Cluster's superuser
+// credentials (<cluster>-credentials) or other Secrets the operator manages
+// (TLS keys, other roles' passwords, backup credentials) and act as the
+// operator. Refused: Secrets labeled as managed by pgop, Secrets owned by a
+// pgop resource, and Secrets a Cluster of the namespace uses as its TLS
+// Secret (spec.tls.secretName, which holds the server's private key).
+func (r *RoleReconciler) protectedSecretProblem(ctx context.Context, secret *corev1.Secret) (string, error) {
+	if secret.Labels[LabelAppManagedBy] == LabelValuePgop {
+		return "it is managed by pgop", nil
+	}
+	for _, ref := range secret.OwnerReferences {
+		if gv, err := schema.ParseGroupVersion(ref.APIVersion); err == nil && gv.Group == postgresv1alpha1.GroupVersion.Group {
+			return fmt.Sprintf("it is owned by the %s %q", ref.Kind, ref.Name), nil
+		}
+	}
+	clusters := &postgresv1alpha1.ClusterList{}
+	if err := r.List(ctx, clusters, client.InNamespace(secret.Namespace)); err != nil {
+		return "", fmt.Errorf("failed to list Clusters: %w", err)
+	}
+	for i := range clusters.Items {
+		if tls := clusters.Items[i].Spec.TLS; tls != nil && tls.SecretName == secret.Name {
+			return fmt.Sprintf("it is the TLS Secret of Cluster %q", clusters.Items[i].Name), nil
+		}
+	}
+	return "", nil
 }
 
 // passwordProblem returns why pw cannot be used as a password, or "". The

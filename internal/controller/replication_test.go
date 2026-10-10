@@ -666,7 +666,6 @@ var _ = Describe("Cluster replication", func() {
 		opts := fake.createdRole[0]
 		Expect(opts.Login).To(BeTrue())
 		Expect(opts.Replication).To(BeTrue())
-		Expect(opts.Superuser).To(BeFalse())
 		Expect(opts.ConnectionLimit).To(Equal(int32(-1)))
 		secret := &corev1.Secret{}
 		Expect(k8sClient.Get(ctx, key(name+"-credentials"), secret)).To(Succeed())

@@ -17,6 +17,8 @@ limitations under the License.
 package v1alpha1
 
 import (
+	"slices"
+
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -140,6 +142,189 @@ type ClusterSpec struct {
 	// +kubebuilder:validation:XValidation:rule="self.all(k, k.matches('^[a-zA-Z_][a-zA-Z0-9_.]*$'))",message="parameter names must match ^[a-zA-Z_][a-zA-Z0-9_.]*$"
 	// +kubebuilder:validation:XValidation:rule="!self.exists(k, k.lowerAscii() in ['archive_command', 'archive_library', 'archive_mode', 'config_file', 'data_directory', 'external_pid_file', 'hba_file', 'hot_standby', 'ident_file', 'include', 'include_dir', 'include_if_exists', 'listen_addresses', 'max_replication_slots', 'max_wal_senders', 'port', 'primary_conninfo', 'primary_slot_name', 'restore_command', 'ssl', 'ssl_cert_file', 'ssl_key_file', 'ssl_min_protocol_version', 'unix_socket_directories', 'wal_level'])",message="parameters must not set operator-managed parameters (archive_command, archive_library, archive_mode, config_file, data_directory, external_pid_file, hba_file, hot_standby, ident_file, include, include_dir, include_if_exists, listen_addresses, max_replication_slots, max_wal_senders, port, primary_conninfo, primary_slot_name, restore_command, ssl, ssl_cert_file, ssl_key_file, ssl_min_protocol_version, unix_socket_directories, wal_level)"
 	Parameters map[string]string `json:"parameters,omitempty"`
+
+	// rolePolicy limits what Role and Database resources that reference this
+	// Cluster may obtain in PostgreSQL. Without it (the default), Roles can
+	// only get non-privileged attributes (login, createDB, inherit,
+	// connectionLimit), cannot be members of predefined pg_* roles, and
+	// Databases can only install extensions that the server marks as trusted.
+	// The policy lives on the Cluster on purpose: it can only be widened by
+	// someone allowed to edit the Cluster, not by someone who can only create
+	// Roles or Databases.
+	// +optional
+	RolePolicy *RolePolicySpec `json:"rolePolicy,omitempty"`
+}
+
+// RoleAttribute is a privileged role attribute that a Cluster can allow
+// Roles to request.
+// +kubebuilder:validation:Enum=createRole;replication;bypassRLS
+type RoleAttribute string
+
+const (
+	// RoleAttributeCreateRole is Role.spec.createRole (CREATEROLE).
+	RoleAttributeCreateRole RoleAttribute = "createRole"
+	// RoleAttributeReplication is Role.spec.replication (REPLICATION).
+	RoleAttributeReplication RoleAttribute = "replication"
+	// RoleAttributeBypassRLS is Role.spec.bypassRLS (BYPASSRLS).
+	RoleAttributeBypassRLS RoleAttribute = "bypassRLS"
+)
+
+// RolePolicySpec is the policy for the Roles and Databases of a Cluster.
+type RolePolicySpec struct {
+	// allowedAttributes lists the privileged attributes Roles may request.
+	// A Role that requests an attribute not listed here is reported with
+	// reason RolePolicyViolation and gets none of the privileged attributes
+	// (an existing role is altered to NOCREATEROLE NOREPLICATION
+	// NOBYPASSRLS). Superuser is never allowed. Note that on PostgreSQL 15
+	// and older, CREATEROLE lets the role grant itself membership in any
+	// non-superuser role, including pg_execute_server_program, so allowing
+	// createRole there is close to allowing superuser.
+	// +optional
+	// +listType=set
+	// +kubebuilder:validation:MaxItems=3
+	AllowedAttributes []RoleAttribute `json:"allowedAttributes,omitempty"`
+
+	// allowedPredefinedRoles lists the predefined pg_* roles that Roles may
+	// be members of (Role.spec.memberships / memberOf). Memberships in any
+	// other pg_* role are refused (reason MembershipNotAllowed).
+	// pg_execute_server_program, pg_read_server_files and
+	// pg_write_server_files give file system or shell access on the server
+	// and can never be allowed. Most predefined roles act on every database
+	// of the cluster (for example pg_read_all_data reads every table of
+	// every database), so allow them only when all Roles on the Cluster are
+	// trusted with that.
+	// +optional
+	// +listType=set
+	// +kubebuilder:validation:MaxItems=32
+	// +kubebuilder:validation:items:Enum=pg_checkpoint;pg_create_subscription;pg_maintain;pg_monitor;pg_read_all_data;pg_read_all_settings;pg_read_all_stats;pg_signal_autovacuum_worker;pg_signal_backend;pg_stat_scan_tables;pg_use_reserved_connections;pg_write_all_data
+	AllowedPredefinedRoles []string `json:"allowedPredefinedRoles,omitempty"`
+
+	// allowedExistingRoles lists PostgreSQL roles that are not managed by a
+	// Role of this Cluster (created by a DBA, a bootstrap Job, ...) that Roles
+	// may nevertheless be members of. Membership in any other role that no
+	// Role of this Cluster manages is refused (reason MembershipNotAllowed).
+	// The other membership rules (superuser, predefined roles, privileged
+	// attributes) still apply to the listed roles.
+	// +optional
+	// +listType=set
+	// +kubebuilder:validation:MaxItems=256
+	// +kubebuilder:validation:items:MinLength=1
+	// +kubebuilder:validation:items:MaxLength=63
+	// +kubebuilder:validation:items:Pattern=`^[a-z_][a-z0-9_]*$`
+	// +kubebuilder:validation:XValidation:rule="self.all(r, r != 'postgres' && !r.startsWith('pg_') && !r.startsWith('pgop_'))",message="allowedExistingRoles must not list postgres, pg_* or pgop_* roles"
+	AllowedExistingRoles []string `json:"allowedExistingRoles,omitempty"`
+
+	// adoptableRoles lists existing PostgreSQL roles that a Role of this
+	// Cluster may take over: pgop then sets their attributes and password,
+	// hands the password out and drops the role when the Role is deleted.
+	// Without this list a Role only manages a role it created itself (or
+	// recorded in its status). Only list roles you are willing to hand to
+	// whoever can write Roles in the namespace: pgop still refuses a
+	// superuser, a role reaching forbidden roles, and privileged attributes
+	// beyond the policy, but it cannot see everything a role's previous
+	// owner may have prepared (functions, grants, ownerships).
+	// +optional
+	// +listType=set
+	// +kubebuilder:validation:MaxItems=256
+	// +kubebuilder:validation:items:MinLength=1
+	// +kubebuilder:validation:items:MaxLength=63
+	// +kubebuilder:validation:items:Pattern=`^[a-z_][a-z0-9_]*$`
+	// +kubebuilder:validation:XValidation:rule="self.all(r, r != 'postgres' && !r.startsWith('pg_') && !r.startsWith('pgop_'))",message="adoptableRoles must not list postgres, pg_* or pgop_* roles"
+	AdoptableRoles []string `json:"adoptableRoles,omitempty"`
+
+	// adoptableDatabases lists existing PostgreSQL databases that a Database
+	// of this Cluster may take over: pgop then changes their owner, settings,
+	// grants, extensions and schemas and drops the database when the Database
+	// is deleted. Without this list a Database only manages a database it
+	// created itself (or recorded in its status).
+	// +optional
+	// +listType=set
+	// +kubebuilder:validation:MaxItems=256
+	// +kubebuilder:validation:items:MinLength=1
+	// +kubebuilder:validation:items:MaxLength=63
+	// +kubebuilder:validation:items:Pattern=`^[a-z_][a-z0-9_]*$`
+	// +kubebuilder:validation:XValidation:rule="self.all(d, d != 'postgres' && !d.startsWith('template') && !d.startsWith('pg_') && !d.startsWith('pgop_'))",message="adoptableDatabases must not list postgres, template*, pg_* or pgop_* databases"
+	AdoptableDatabases []string `json:"adoptableDatabases,omitempty"`
+
+	// allowedExtensions lists extensions that Databases may install although
+	// the server does not mark them as trusted
+	// (pg_available_extension_versions.trusted). Trusted extensions are
+	// always allowed: a role with CREATE on the database could install them
+	// itself. Untrusted extensions (for example file_fdw, dblink, adminpack,
+	// plpython3u, postgis) are installed by the operator as a superuser and
+	// may give access to the server's files, network or code execution; a
+	// Database requesting one that is not listed is reported with reason
+	// ExtensionNotAllowed and the extension is not installed.
+	// +optional
+	// +listType=set
+	// +kubebuilder:validation:MaxItems=128
+	// +kubebuilder:validation:items:MaxLength=63
+	// +kubebuilder:validation:items:Pattern=`^[A-Za-z0-9_-]+$`
+	AllowedExtensions []string `json:"allowedExtensions,omitempty"`
+}
+
+// GrantablePredefinedRoles are the predefined roles a Cluster can allow in
+// spec.rolePolicy.allowedPredefinedRoles. The enum on that field must list
+// exactly these names; a test checks that the generated CRD and this list
+// agree.
+var GrantablePredefinedRoles = []string{
+	"pg_checkpoint",
+	"pg_create_subscription",
+	"pg_maintain",
+	"pg_monitor",
+	"pg_read_all_data",
+	"pg_read_all_settings",
+	"pg_read_all_stats",
+	"pg_signal_autovacuum_worker",
+	"pg_signal_backend",
+	"pg_stat_scan_tables",
+	"pg_use_reserved_connections",
+	"pg_write_all_data",
+}
+
+// ForbiddenPredefinedRoles are predefined roles that give file system or
+// shell access on the server. Membership in them is always refused.
+var ForbiddenPredefinedRoles = []string{
+	"pg_execute_server_program",
+	"pg_read_server_files",
+	"pg_write_server_files",
+}
+
+// AllowsAttribute reports whether the policy allows Roles to request attr.
+// A nil policy allows none.
+func (p *RolePolicySpec) AllowsAttribute(attr RoleAttribute) bool {
+	return p != nil && slices.Contains(p.AllowedAttributes, attr)
+}
+
+// AllowsPredefinedRole reports whether the policy allows membership in the
+// predefined role name. A nil policy allows none.
+func (p *RolePolicySpec) AllowsPredefinedRole(name string) bool {
+	return p != nil && slices.Contains(p.AllowedPredefinedRoles, name) && slices.Contains(GrantablePredefinedRoles, name)
+}
+
+// AllowsExistingRole reports whether the policy allows membership in the
+// role name although no Role of the Cluster manages it. A nil policy allows
+// none.
+func (p *RolePolicySpec) AllowsExistingRole(name string) bool {
+	return p != nil && slices.Contains(p.AllowedExistingRoles, name)
+}
+
+// AllowsAdoptingRole reports whether a Role may take over the existing role
+// name. A nil policy allows none.
+func (p *RolePolicySpec) AllowsAdoptingRole(name string) bool {
+	return p != nil && slices.Contains(p.AdoptableRoles, name)
+}
+
+// AllowsAdoptingDatabase reports whether a Database may take over the
+// existing database name. A nil policy allows none.
+func (p *RolePolicySpec) AllowsAdoptingDatabase(name string) bool {
+	return p != nil && slices.Contains(p.AdoptableDatabases, name)
+}
+
+// AllowsExtension reports whether the policy explicitly allows the untrusted
+// extension name. A nil policy allows none.
+func (p *RolePolicySpec) AllowsExtension(name string) bool {
+	return p != nil && slices.Contains(p.AllowedExtensions, name)
 }
 
 // ReservedParameters are the PostgreSQL parameters spec.parameters must not

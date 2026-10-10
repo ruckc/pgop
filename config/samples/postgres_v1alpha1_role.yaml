@@ -8,13 +8,17 @@ spec:
   # Optional PostgreSQL role name; defaults to metadata.name. Immutable.
   # roleName: app_user
   login: true
-  superuser: false
   createDB: false
-  createRole: false
   inherit: true
+  # Privileged attributes (createRole, replication, bypassRLS) are refused
+  # unless the Cluster lists them in spec.rolePolicy.allowedAttributes.
+  # Superuser is never available.
+  # createRole: false
   connectionLimit: 10
   # Optional memberships in other PostgreSQL roles (raw PostgreSQL role names).
   # inherit/set require PostgreSQL 16+. Removed entries are revoked.
+  # Superuser roles, postgres, pgop_* roles and predefined pg_* roles not
+  # allowed by the Cluster's spec.rolePolicy.allowedPredefinedRoles are refused.
   # memberships:
   #   - role: app_read_role
   #     inherit: true

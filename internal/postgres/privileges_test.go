@@ -253,7 +253,7 @@ func TestBuildAlterDatabaseSetQuery(t *testing.T) {
 		param, value, want string
 	}{
 		{"work_mem", "64MB", `ALTER DATABASE "db" SET "work_mem" TO '64MB'`},
-		{"statement_timeout", "0", `ALTER DATABASE "db" SET "statement_timeout" TO '0'`},
+		{settingStatementTimeout, "0", `ALTER DATABASE "db" SET "statement_timeout" TO '0'`},
 		{"DateStyle", "ISO, MDY", `ALTER DATABASE "db" SET "datestyle" TO 'ISO, MDY'`},
 		{"myapp.tenant", "x'; DROP DATABASE db; --", `ALTER DATABASE "db" SET "myapp"."tenant" TO 'x''; DROP DATABASE db; --'`},
 		{"myapp.path", `C:\temp`, `ALTER DATABASE "db" SET "myapp"."path" TO E'C:\\temp'`},
@@ -264,7 +264,7 @@ func TestBuildAlterDatabaseSetQuery(t *testing.T) {
 		{paramSearchPath, "", ""},
 		{paramSearchPath, "  ", ""},
 		{paramSearchPath, `x'); DROP DATABASE db; --`, ""},
-		{"temp_tablespaces", `"a"x`, ""},
+		{settingTempTablespaces, `"a"x`, ""},
 		{paramSearchPath, `a,,b`, ""},
 		{paramSearchPath, `"unterminated`, ""},
 	}
@@ -313,15 +313,15 @@ func TestAllPrivilegesAndCase(t *testing.T) {
 
 func TestDeniedParameter(t *testing.T) {
 	for _, name := range []string{
-		"role", "ROLE", "session_authorization", "session_preload_libraries", "local_preload_libraries",
-		"shared_preload_libraries", "dynamic_library_path", "jit_provider", "session_replication_role",
+		settingRole, "ROLE", "session_authorization", "session_preload_libraries", "local_preload_libraries",
+		"shared_preload_libraries", "dynamic_library_path", "jit_provider", "session_replication_role", "lo_compat_privileges",
 		"pgaudit.log", "PgAudit.Role", "set_user.block_alter_system", "anon.salt", "sepgsql.permissive",
 	} {
 		if !DeniedParameter(name) {
 			t.Errorf("%q should be denied", name)
 		}
 	}
-	for _, name := range []string{"maintenance_work_mem", paramSearchPath, "statement_timeout", "myapp.tenant", "rolex", "pgauditx"} {
+	for _, name := range []string{"maintenance_work_mem", paramSearchPath, settingStatementTimeout, "myapp.tenant", "rolex", "pgauditx"} {
 		if DeniedParameter(name) {
 			t.Errorf("%q should not be denied", name)
 		}

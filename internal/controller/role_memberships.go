@@ -18,9 +18,11 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"slices"
+	"strings"
 
 	postgresv1alpha1 "github.com/ruckc/pgop/api/v1alpha1"
 	"github.com/ruckc/pgop/internal/postgres"
@@ -34,6 +36,7 @@ type membershipClient interface {
 	GrantRole(ctx context.Context, role, member string, opts postgres.MembershipOptions) error
 	RevokeAdminOption(ctx context.Context, role, member string) error
 	RevokeRole(ctx context.Context, role, member string) error
+	MembershipClosure(ctx context.Context, name string) ([]postgres.ReachableRole, error)
 }
 
 var _ membershipClient = (*postgres.Client)(nil)
@@ -96,14 +99,79 @@ func diffMemberships(desired []postgresv1alpha1.RoleMembership, managed []string
 	return plan
 }
 
+// membershipChecker decides, with the Cluster's role policy, whether
+// membership in a role is allowed. Results are cached for one reconcile.
+type membershipChecker struct {
+	pg     membershipClient
+	policy *postgresv1alpha1.RolePolicySpec
+	// managed lists the roles the Cluster's Roles manage.
+	managed managedRoles
+	cache   map[string]string
+}
+
+// problem explains why membership in target is not allowed, or returns ""
+// when it is.
+func (c *membershipChecker) problem(ctx context.Context, target string) (string, error) {
+	if p, ok := c.cache[target]; ok {
+		return p, nil
+	}
+	p := membershipNameProblem(target, c.policy)
+	if p != "" {
+		p = target + " " + p
+	} else {
+		closure, err := c.pg.MembershipClosure(ctx, target)
+		if err != nil {
+			return "", err
+		}
+		p = membershipProblem(target, closure, c.policy, c.managed)
+	}
+	if c.cache == nil {
+		c.cache = map[string]string{}
+	}
+	c.cache[target] = p
+	return p, nil
+}
+
 // reconcileMemberships brings member's role memberships to the state declared
 // by role.Spec and records the managed memberships in
 // role.Status.ManagedMemberships (the caller persists the status).
-func reconcileMemberships(ctx context.Context, pg membershipClient, role *postgresv1alpha1.Role, member string) error {
-	desired := role.Spec.DesiredMemberships()
+//
+// Memberships the policy does not allow (see membershipProblem) are not
+// granted and are reported with reason MembershipNotAllowed; the others are
+// still applied. A forbidden membership that pgop granted earlier (tracked in
+// status.managedMemberships) is revoked, whatever revokeRemovedMemberships
+// says.
+func reconcileMemberships(ctx context.Context, pg membershipClient, role *postgresv1alpha1.Role, member string,
+	policy *postgresv1alpha1.RolePolicySpec, clusterRoles managedRoles) error {
+	requested := role.Spec.DesiredMemberships()
 	managed := role.Status.ManagedMemberships
-	if len(desired) == 0 && len(managed) == 0 {
+	if len(requested) == 0 && len(managed) == 0 {
 		return nil
+	}
+
+	checker := &membershipChecker{pg: pg, policy: policy, managed: clusterRoles}
+	desired := make([]postgresv1alpha1.RoleMembership, 0, len(requested))
+	var refused []string
+	for _, d := range requested {
+		p, err := checker.problem(ctx, d.Role)
+		if err != nil {
+			return err
+		}
+		if p != "" {
+			refused = append(refused, p)
+			continue
+		}
+		desired = append(desired, d)
+	}
+	var forbiddenManaged []string
+	for _, m := range managed {
+		p, err := checker.problem(ctx, m)
+		if err != nil {
+			return err
+		}
+		if p != "" {
+			forbiddenManaged = append(forbiddenManaged, m)
+		}
 	}
 
 	version, err := pg.ServerVersionNum(ctx)
@@ -125,6 +193,15 @@ func reconcileMemberships(ctx context.Context, pg membershipClient, role *postgr
 	}
 
 	plan := diffMemberships(desired, managed, current, role.Spec.ShouldRevokeRemovedMemberships())
+	var revokedForbidden []string
+	for _, m := range forbiddenManaged {
+		if _, exists := current[m]; exists {
+			revokedForbidden = append(revokedForbidden, m)
+		}
+	}
+	plan.Revoke = append(plan.Revoke, revokedForbidden...)
+	slices.Sort(plan.Revoke)
+	plan.Revoke = slices.Compact(plan.Revoke)
 
 	// Track what pgop manages as statements succeed, so a partial failure
 	// still records grants that were made and keeps revokes that are pending.
@@ -162,15 +239,23 @@ func reconcileMemberships(ctx context.Context, pg membershipClient, role *postgr
 		delete(tracked, r)
 	}
 
-	// Everything succeeded: pgop now manages exactly the desired memberships.
-	// With revokeRemovedMemberships=false, removed ones are dropped from
-	// tracking without being revoked.
+	// Everything succeeded: pgop now manages exactly the desired (allowed)
+	// memberships. With revokeRemovedMemberships=false, removed ones are
+	// dropped from tracking without being revoked.
 	tracked = make(map[string]bool, len(desired))
 	for _, d := range desired {
 		tracked[d.Role] = true
 	}
 	record()
-	return nil
+
+	if len(refused) == 0 {
+		return nil
+	}
+	msg := "memberships not allowed: " + strings.Join(refused, "; ")
+	if len(revokedForbidden) > 0 {
+		msg += "; revoked the membership(s) pgop had granted in " + strings.Join(revokedForbidden, ", ")
+	}
+	return &conditionError{reason: ReasonMembershipNotAllowed, err: errors.New(msg)}
 }
 
 func sortedKeys(m map[string]bool) []string {

@@ -18,7 +18,9 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"slices"
 	"strings"
 
 	postgresv1alpha1 "github.com/ruckc/pgop/api/v1alpha1"
@@ -33,6 +35,41 @@ type parameterGrantClient interface {
 	RoleExists(ctx context.Context, name string) (bool, error)
 	GrantParameterPrivileges(ctx context.Context, parameter, role string, privileges []string, withGrantOption bool) error
 	RevokeParameterPrivileges(ctx context.Context, parameter, role string, privileges []string, mode postgres.RevokeMode) error
+	ParameterContext(ctx context.Context, name string) (pgContext string, found bool, err error)
+}
+
+// grantableParameterContexts are the pg_settings contexts of parameters pgop
+// grants SET on. SET on a superuser-context parameter is what parameterGrants
+// is for; SET on a user-context one is harmless. Other contexts are refused:
+// sighup, postmaster and internal parameters cannot be SET in a session at
+// all (the grant would only be a trap for a later ALTER SYSTEM privilege),
+// and backend / superuser-backend parameters (log_connections, ...) would be
+// settable by the role at connection start.
+var grantableParameterContexts = []string{pgContextUser, pgContextSuperuser}
+
+// pg_settings contexts pgop checks for.
+const (
+	pgContextUser      = "user"
+	pgContextSuperuser = "superuser"
+)
+
+// filterParameterContexts drops from desired the parameters whose context
+// pgop does not grant SET on, and returns their names. Custom placeholders
+// unknown to the server are kept, as for Database.spec.settings.
+func filterParameterContexts(ctx context.Context, pg parameterGrantClient, desired []privilegeGrant) (allowed []privilegeGrant, refused []string, err error) {
+	allowed = desired[:0:0]
+	for _, g := range desired {
+		pgContext, found, err := pg.ParameterContext(ctx, g.Key)
+		if err != nil {
+			return nil, nil, err
+		}
+		if found && !slices.Contains(grantableParameterContexts, pgContext) {
+			refused = append(refused, fmt.Sprintf("%s (context %q)", g.Key, pgContext))
+			continue
+		}
+		allowed = append(allowed, g)
+	}
+	return allowed, refused, nil
 }
 
 var _ parameterGrantClient = (*postgres.Client)(nil)
@@ -118,6 +155,16 @@ func reconcileParameterGrants(ctx context.Context, pg parameterGrantClient, role
 		// No parameter privileges can exist on this server.
 		role.Status.ManagedParameterGrants = nil
 		return deniedErr
+	}
+
+	desired, refused, err := filterParameterContexts(ctx, pg, desired)
+	if err != nil {
+		return err
+	}
+	if len(refused) > 0 {
+		deniedErr = errors.Join(deniedErr, &conditionError{reason: ReasonParameterNotAllowed, err: fmt.Errorf(
+			"parameterGrants not allowed (only user and superuser parameters can be granted): %s",
+			strings.Join(refused, ", "))})
 	}
 
 	after, err := applyPrivilegeGrants(ctx, desired, managed, parameterOps(pg, member))
