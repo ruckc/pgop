@@ -65,6 +65,7 @@ spec:
 | `rolePolicy.adoptableRoles` | []string | `[]` | Existing roles a Role may take over. See [Role policy](#role-policy) |
 | `rolePolicy.adoptableDatabases` | []string | `[]` | Existing databases a Database may take over. See [Role policy](#role-policy) |
 | `rolePolicy.allowedExtensions` | []string | `[]` | Untrusted extensions Databases may install (trusted ones are always allowed). See [Role policy](#role-policy) |
+| `rolePolicy.allowedSettingPrefixes` | []string | `[]` | Custom parameter namespaces (`myapp` for `myapp.*`) Database and Role settings may set as placeholders. See [Role policy](#role-policy) |
 
 ## Status
 
@@ -210,6 +211,7 @@ spec:
     adoptableRoles: [legacy_app]            # existing roles a Role may take over
     adoptableDatabases: [legacy_db]         # existing databases a Database may take over
     allowedExtensions: [postgis, file_fdw]  # untrusted extensions
+    allowedSettingPrefixes: [myapp]         # custom setting namespaces (myapp.*)
 ```
 
 Without `rolePolicy` (the default):
@@ -241,6 +243,16 @@ Without `rolePolicy` (the default):
 - Databases can only install extensions the server marks as trusted (reason
   `ExtensionNotAllowed` otherwise). See
   [Databases: extension policy](databases.md#extension-policy).
+- Database and Role `settings` cannot set custom parameters the server does
+  not know (placeholders such as `myapp.tenant`; reason `SettingNotAllowed`)
+  unless `allowedSettingPrefixes` lists their namespace (`myapp`). pgop sets
+  them as a superuser, and PostgreSQL applies a superuser-stored placeholder
+  even if an extension later defines it as superuser-only, so list only your
+  applications' namespaces. Namespaces of extensions whose settings run code,
+  read server files or are superuser-only (`plperl`, `pltcl`, `plv8`,
+  `plpgsql`, `postgis`, `auto_explain`, `pg_stat_statements`, `pgaudit`,
+  `cron`, ...) are rejected by the API server. See
+  [Databases: which parameters may be set](databases.md#which-parameters-may-be-set).
 
 `allowedPredefinedRoles` accepts these roles (others are rejected by the API
 server):

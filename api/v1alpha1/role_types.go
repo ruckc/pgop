@@ -213,6 +213,73 @@ type RoleSpec struct {
 	// +listMapKey=parameter
 	// +kubebuilder:validation:MaxItems=256
 	ParameterGrants []ParameterGrantSpec `json:"parameterGrants,omitempty"`
+
+	// settings are per-role defaults for configuration parameters (ALTER ROLE
+	// ... SET name TO value). They apply to new sessions of this role only
+	// (sessions that log in as it, not SET ROLE). Settings that pgop applied
+	// (tracked in status.managedSettings) are reset (ALTER ROLE ... RESET
+	// name) once they are removed from the spec. Keys and values follow the
+	// rules of Database spec.settings: parameter names, values written as SQL
+	// string literals, and for search_path and temp_tablespaces a
+	// comma-separated list as in postgresql.conf. Only parameters that any
+	// user may set (context "user" in pg_settings) and custom parameters are
+	// accepted; superuser-only parameters and the same denylist as Database
+	// settings are refused (reason SettingNotAllowed), because pgop runs
+	// ALTER ROLE as a superuser. Values are readable by every role on the
+	// server (pg_roles.rolconfig): do not put secrets here.
+	// +optional
+	// +kubebuilder:validation:MaxProperties=256
+	// +kubebuilder:validation:XValidation:rule="self.all(k, size(k) <= 127 && k.matches('^[A-Za-z_][A-Za-z0-9_]*(\\\\.[A-Za-z_][A-Za-z0-9_]*)*$'))",message="settings keys must be parameter names: identifiers ([A-Za-z_][A-Za-z0-9_]*) optionally separated by dots, at most 127 characters"
+	// +kubebuilder:validation:XValidation:rule="self.all(k, size(self[k]) <= 4096)",message="settings values must be at most 4096 characters"
+	// +kubebuilder:validation:XValidation:rule="!self.exists(k, k.lowerAscii() in ['role', 'session_authorization', 'session_preload_libraries', 'local_preload_libraries', 'shared_preload_libraries', 'dynamic_library_path', 'jit_provider', 'session_replication_role', 'lo_compat_privileges'] || k.lowerAscii().startsWith('pgaudit.') || k.lowerAscii().startsWith('set_user.') || k.lowerAscii().startsWith('anon.') || k.lowerAscii().startsWith('sepgsql.'))",message="settings must not include role, session_authorization, *_preload_libraries, dynamic_library_path, jit_provider, session_replication_role, lo_compat_privileges or pgaudit.*, set_user.*, anon.*, sepgsql.* parameters"
+	Settings map[string]string `json:"settings,omitempty"`
+
+	// databaseSettings are per-role defaults that apply only in one database
+	// (ALTER ROLE ... IN DATABASE db SET name TO value). They take precedence
+	// over settings and over the database's own settings. The same rules as
+	// for settings apply, and removed entries pgop applied (tracked in
+	// status.managedDatabaseSettings) are reset. A database that does not
+	// exist yet is retried: the Role stays Available and the condition
+	// message lists the pending databases.
+	// +optional
+	// +listType=map
+	// +listMapKey=database
+	// +kubebuilder:validation:MaxItems=32
+	DatabaseSettings []RoleDatabaseSettings `json:"databaseSettings,omitempty"`
+}
+
+// RoleDatabaseSettings are a role's settings in one database.
+type RoleDatabaseSettings struct {
+	// database is the PostgreSQL name of the database (a raw PostgreSQL
+	// database name, not a Database resource name). The settings only affect
+	// this role's sessions in it, so any database of the Cluster may be named.
+	// At most 63 bytes (PostgreSQL's identifier limit; non-ASCII characters
+	// take several bytes).
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:XValidation:rule="bytes(self).size() <= 63",message="database must be at most 63 bytes (PostgreSQL's identifier limit)"
+	Database string `json:"database"`
+
+	// settings are the parameter defaults for this role in database, with the
+	// same rules as the Role's spec.settings.
+	// +optional
+	// +kubebuilder:validation:MaxProperties=64
+	// +kubebuilder:validation:XValidation:rule="self.all(k, size(k) <= 127 && k.matches('^[A-Za-z_][A-Za-z0-9_]*(\\\\.[A-Za-z_][A-Za-z0-9_]*)*$'))",message="settings keys must be parameter names: identifiers ([A-Za-z_][A-Za-z0-9_]*) optionally separated by dots, at most 127 characters"
+	// +kubebuilder:validation:XValidation:rule="self.all(k, size(self[k]) <= 4096)",message="settings values must be at most 4096 characters"
+	// +kubebuilder:validation:XValidation:rule="!self.exists(k, k.lowerAscii() in ['role', 'session_authorization', 'session_preload_libraries', 'local_preload_libraries', 'shared_preload_libraries', 'dynamic_library_path', 'jit_provider', 'session_replication_role', 'lo_compat_privileges'] || k.lowerAscii().startsWith('pgaudit.') || k.lowerAscii().startsWith('set_user.') || k.lowerAscii().startsWith('anon.') || k.lowerAscii().startsWith('sepgsql.'))",message="settings must not include role, session_authorization, *_preload_libraries, dynamic_library_path, jit_provider, session_replication_role, lo_compat_privileges or pgaudit.*, set_user.*, anon.*, sepgsql.* parameters"
+	Settings map[string]string `json:"settings,omitempty"`
+}
+
+// ManagedRoleDatabaseSettings records the settings pgop applied for a role in
+// one database.
+type ManagedRoleDatabaseSettings struct {
+	// database is the PostgreSQL database name.
+	Database string `json:"database"`
+
+	// settings are the parameter names pgop set (normalized to lowercase).
+	// +listType=set
+	Settings []string `json:"settings"`
 }
 
 // ParameterGrantSpec grants privileges on a configuration parameter.
@@ -326,6 +393,21 @@ type RoleStatus struct {
 	// +listMapKey=parameter
 	// +kubebuilder:validation:MaxItems=512
 	ManagedParameterGrants []ManagedParameterGrant `json:"managedParameterGrants,omitempty"`
+
+	// managedSettings lists the parameter names pgop has set with ALTER ROLE
+	// ... SET (normalized to lowercase). Only these are reset when they are
+	// removed from spec.settings.
+	// +optional
+	// +listType=set
+	ManagedSettings []string `json:"managedSettings,omitempty"`
+
+	// managedDatabaseSettings lists, per database, the parameter names pgop
+	// has set with ALTER ROLE ... IN DATABASE ... SET. Only these are reset
+	// when they are removed from spec.databaseSettings.
+	// +optional
+	// +listType=map
+	// +listMapKey=database
+	ManagedDatabaseSettings []ManagedRoleDatabaseSettings `json:"managedDatabaseSettings,omitempty"`
 
 	// conditions represent the current state of the Role resource.
 	// +listType=map

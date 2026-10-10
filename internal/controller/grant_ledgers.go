@@ -18,6 +18,8 @@ package controller
 
 import (
 	"context"
+	"maps"
+	"slices"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/client-go/util/retry"
@@ -116,9 +118,12 @@ func mergeLedgers(a, b []privilegeGrant) []privilegeGrant {
 
 // mergeDatabaseLedgers adds the ledger entries of theirs (a newer copy of the
 // status) to ours, so a status write never drops what another write recorded.
+// The settings ledger is merged too (a RESET of a setting that is not set
+// changes nothing).
 func mergeDatabaseLedgers(ours, theirs *postgresv1alpha1.DatabaseStatus) {
 	ours.ManagedGrants = databaseLedgerStatus(mergeLedgers(databaseLedger("", ours.ManagedGrants), databaseLedger("", theirs.ManagedGrants)))
 	ours.ManagedSchemaGrants = schemaLedgerStatus(mergeLedgers(schemaLedger(ours.ManagedSchemaGrants), schemaLedger(theirs.ManagedSchemaGrants)))
+	ours.ManagedSettings = unionStrings(ours.ManagedSettings, theirs.ManagedSettings)
 	revoked := map[postgresv1alpha1.PublicPrivilege]bool{}
 	for _, p := range append(ours.RevokedPublicPrivileges, theirs.RevokedPublicPrivileges...) {
 		revoked[p] = true
@@ -131,15 +136,31 @@ func mergeDatabaseLedgers(ours, theirs *postgresv1alpha1.DatabaseStatus) {
 	}
 }
 
-// mergeRoleLedgers is mergeDatabaseLedgers for a Role.
+// mergeRoleLedgers is mergeDatabaseLedgers for a Role (parameter grants,
+// memberships and settings).
 func mergeRoleLedgers(ours, theirs *postgresv1alpha1.RoleStatus) {
 	ours.ManagedParameterGrants = parameterLedgerStatus(mergeLedgers(parameterLedger("", ours.ManagedParameterGrants),
 		parameterLedger("", theirs.ManagedParameterGrants)))
-	memberships := map[string]bool{}
-	for _, m := range append(ours.ManagedMemberships, theirs.ManagedMemberships...) {
-		memberships[m] = true
+	ours.ManagedMemberships = unionStrings(ours.ManagedMemberships, theirs.ManagedMemberships)
+	ours.ManagedSettings = unionStrings(ours.ManagedSettings, theirs.ManagedSettings)
+	perDB := map[string][]string{}
+	for _, d := range append(slices.Clone(ours.ManagedDatabaseSettings), theirs.ManagedDatabaseSettings...) {
+		perDB[d.Database] = unionStrings(perDB[d.Database], d.Settings)
 	}
-	ours.ManagedMemberships = sortedKeys(memberships)
+	ours.ManagedDatabaseSettings = nil
+	for _, db := range slices.Sorted(maps.Keys(perDB)) {
+		ours.ManagedDatabaseSettings = append(ours.ManagedDatabaseSettings,
+			postgresv1alpha1.ManagedRoleDatabaseSettings{Database: db, Settings: perDB[db]})
+	}
+}
+
+// unionStrings returns the sorted union of two string sets, nil when empty.
+func unionStrings(a, b []string) []string {
+	set := map[string]bool{}
+	for _, s := range append(slices.Clone(a), b...) {
+		set[s] = true
+	}
+	return sortedKeys(set)
 }
 
 // updateStatusKeepingLedgers writes obj's status. On a conflict (the cached

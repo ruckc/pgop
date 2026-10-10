@@ -81,7 +81,15 @@ func RegisterGrantsTests() {
 		// dbACL returns the database's ACL.
 		const dbACL = `SELECT coalesce(datacl::text, '') FROM pg_database WHERE datname = 'grant_db'`
 
+		// myapp.note below is a custom placeholder: the Cluster must allow
+		// its namespace.
+		setPrefixes := func(prefixes string) {
+			patch("cluster.pgop.ruck.io/"+clusterName, `{"spec":{"rolePolicy":{"allowedSettingPrefixes":`+prefixes+`}}}`)
+		}
+		BeforeAll(func() { setPrefixes(`["myapp"]`) })
+
 		AfterAll(func() {
+			setPrefixes(`null`)
 			for _, res := range []string{
 				"database.pgop.ruck.io/grant-db", "role.pgop.ruck.io/grant-app", "role.pgop.ruck.io/grant-param",
 			} {

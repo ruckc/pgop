@@ -540,10 +540,10 @@ func extensionAllowed(ctx context.Context, pg extensionClient, policy *postgresv
 // before the database connection used for extensions is opened), the
 // database-level grants and PUBLIC's database privileges. Each is attempted
 // even when another fails.
-func reconcileSettingsAndGrants(ctx context.Context, pg databaseGrantClient,
-	database *postgresv1alpha1.Database, pgName string, checker *granteeChecker, save statusSaver) error {
+func reconcileSettingsAndGrants(ctx context.Context, pg databaseGrantClient, database *postgresv1alpha1.Database,
+	pgName string, policy *postgresv1alpha1.RolePolicySpec, checker *granteeChecker, save statusSaver) error {
 	return errors.Join(
-		reconcileDatabaseSettings(ctx, pg, database, pgName),
+		reconcileDatabaseSettings(ctx, pg, database, pgName, policy),
 		reconcileDatabaseGrants(ctx, pg, database, pgName, checker, save),
 		reconcilePublicPrivileges(ctx, pg, database, pgName, postgres.ObjectDatabase, save),
 	)
@@ -559,7 +559,7 @@ func (r *DatabaseReconciler) reconcileDatabaseAccess(ctx context.Context, pg *po
 	if err != nil {
 		return nil, nil, err
 	}
-	accessErr = reconcileSettingsAndGrants(ctx, pg, database, pgName, checker, r.statusSaver(database))
+	accessErr = reconcileSettingsAndGrants(ctx, pg, database, pgName, cluster.Spec.RolePolicy, checker, r.statusSaver(database))
 	if accessErr != nil {
 		logf.FromContext(ctx).Error(accessErr, "Failed to reconcile database settings or grants")
 	}

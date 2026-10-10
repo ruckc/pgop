@@ -696,6 +696,7 @@ spec:
 	RegisterGrantsTests()
 	RegisterGrantTrackingTests()
 	RegisterRolePolicyTests()
+	RegisterRoleSettingsTests()
 	RegisterBackupTests()
 	RegisterRetentionTests()
 	RegisterTLSTests()
