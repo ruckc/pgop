@@ -12,10 +12,14 @@ The Database controller:
 4. Applies database-level grants (`GRANT ... ON DATABASE`) and revokes removed ones
 5. Revokes PostgreSQL's default `PUBLIC` privileges when asked
    ([`publicPrivileges`](#default-public-privileges))
-6. Installs requested extensions (trusted ones, or those the Cluster's
-   [role policy](clusters.md#role-policy) allows)
-7. Creates schemas with ownership, applies schema grants and revokes removed ones
-8. Drops the database on deletion
+6. Creates schemas with ownership
+7. Installs and updates requested [extensions](#extensions) (trusted ones, or
+   those the Cluster's [role policy](clusters.md#role-policy) allows, and only
+   into schemas no untrusted role can write to); drops removed ones only when
+   asked (`dropOnRemoval`)
+8. Applies schema grants and grants on extension objects, and revokes removed
+   ones
+9. Drops the database on deletion
 
 See [Security model](#security-model) for what a Database writer can and
 cannot do.
@@ -42,7 +46,7 @@ spec:
     - name: uuid-ossp
     - name: pg_trgm
     - name: postgis            # untrusted: needs the Cluster's rolePolicy.allowedExtensions
-      schema: public
+      schema: postgis          # and a schema only superusers can write to (created by pgop)
   schemas:
     - name: app
       owner: app-user
@@ -71,9 +75,24 @@ spec:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `name` | string | **required** | Extension name (`[A-Za-z0-9_-]`, at most 63 characters) |
-| `schema` | string | control file schema, else `public` | Schema to install extension in |
-| `version` | string | default version | Extension version to install |
+| `name` | string | **required** | Extension name (`[A-Za-z0-9_-]`, at most 63 characters; unique, at most 64 extensions) |
+| `schema` | string | control file schema, else `public` | Schema to install the extension in (not `pg_*` or `information_schema`); created by pgop, owned by the operator, when missing and not in `schemas`. See [the schema rules](#the-schema-an-extensions-scripts-run-in) |
+| `version` | string | default version | Version to install; changing it updates the extension (no downgrades). See [Versions](#versions) |
+| `cascade` | bool | `false` | Install missing dependencies too (each must pass the policy). See [Dependencies](#dependencies-and-cascade) |
+| `dropOnRemoval` | bool | `false` | Drop the extension (without `CASCADE`) once removed from the list, if pgop created it. See [Removing an extension](#removing-an-extension) |
+| `grants` | []ExtensionGrantSpec | - | Privileges on the extension's objects (at most 16). See [Grants on extension objects](#grants-on-extension-objects) |
+
+### ExtensionGrantSpec
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `role` | string | Grantee: a PostgreSQL role name or `PUBLIC` (unique within the extension's `grants`; see [Grantee policy](#grantee-policy)) |
+| `schema` | []string | `USAGE`, `CREATE`, `ALL` on the extension's own schema |
+| `tables` | []string | `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`, `REFERENCES`, `MAINTAIN`, `ALL` on its plain and partitioned tables |
+| `sequences` | []string | `USAGE`, `SELECT`, `UPDATE`, `ALL` on its sequences |
+| `functions` | []string | `EXECUTE` (or `ALL`) on its SQL and PL/pgSQL functions and procedures that are not `SECURITY DEFINER` |
+
+At least one of `schema`, `tables`, `sequences` and `functions` is required.
 
 ### SchemaSpec
 
@@ -116,7 +135,9 @@ Unset or `true` leaves PostgreSQL's default alone (and restores what pgop revoke
 |-------|-------------|
 | `ready` | Whether the database is ready |
 | `databaseName` | The effective PostgreSQL database name that was reconciled |
-| `installedExtensions` | List of installed extensions |
+| `installedExtensions` | The extensions of `extensions` that are installed |
+| `extensions` | Per extension: installed `version` and `schema`, whether pgop `created` it, `dropOnRemoval` as last reconciled, `reason`/`message` when it is not as requested, `skippedObjects` (see [Extensions](#extensions)) |
+| `managedExtensionGrants` | Privileges pgop added on extension objects, per extension, grantee and kind (revoked when removed from `extensions[].grants`) |
 | `createdSchemas` | Schemas the Database manages (created by it, or existing and owned by the declared or database owner) |
 | `managedGrants` | Database privileges and grant options pgop added (revoked when removed from `grants`) |
 | `managedSchemaGrants` | Schema privileges and grant options pgop added (revoked when removed from `schemas[].grants`) |
@@ -203,8 +224,11 @@ spec:
   `AUTHORIZATION <owner>`, so the **owner Role has full DDL** (create tables,
   run migrations) on the database and its owned schemas — make your app's login
   role the `owner` if it needs to create tables at runtime.
-- Arbitrary SQL (event triggers, setup that depends on an extension) is not
-  supported yet; an `initSQL` escape hatch is tracked in issue #24.
+- `extensions[].grants` grant privileges on an extension's own objects
+  (owned by the superuser that installed it), such as pg_partman's tables and
+  functions; see [Grants on extension objects](#grants-on-extension-objects).
+- There is no arbitrary SQL (`initSQL`): pgop declares grants instead (issue
+  #24). Objects your own roles own can be granted on from your migrations.
 
 !!! note "Upgrade note: schema privileges are validated"
     Earlier versions passed `schemas[].grants[].privileges` into the `GRANT`
@@ -461,8 +485,8 @@ spec:
 
 ## How two resources interact
 
-Every privilege pgop tracks belongs to exactly one resource: database and
-schema grants are on the Database's own PostgreSQL database, which no other
+Every privilege pgop tracks belongs to exactly one resource: database,
+schema and extension grants are on the Database's own PostgreSQL database, which no other
 Database manages (a second Database with the same PostgreSQL name reports
 `DuplicateDatabaseName` and does nothing), and a Role's parameter grants and
 memberships are for its own role (`DuplicateRoleName` likewise). So two
@@ -604,61 +628,262 @@ at once also converges once the Cluster and Role become ready.
     `clusterRef` (and a Database's `owner` Role) must live in the **same
     namespace** as the Database. Cross-namespace references are not supported.
 
-## Common Extensions
+## Extensions
 
 ```yaml
-extensions:
-  # UUID generation
-  - name: uuid-ossp
-
-  # Full-text search
-  - name: pg_trgm
-
-  # JSON functions
-  - name: pgcrypto
-
-  # Geographic data
-  - name: postgis
-
-  # Time-series
-  - name: timescaledb
+spec:
+  extensions:
+    - name: pg_trgm                 # trusted: installed into public
+    - name: hstore
+      version: "1.8"                # changing it later runs ALTER EXTENSION ... UPDATE TO
+    - name: earthdistance           # untrusted: needs the Cluster's allowedExtensions
+      schema: geo                   # created by pgop (owned by the operator) if missing
+      cascade: true                 # also installs cube, which must pass the policy too
+    - name: pg_partman              # in a custom image; untrusted
+      schema: partman
+      dropOnRemoval: false          # the default: removing the entry leaves it installed
+      grants:
+        - role: rs_owner
+          schema: [USAGE, CREATE]
+          tables: [ALL]
+          sequences: [ALL]
+          functions: [EXECUTE]
+        - role: rs_control
+          schema: [USAGE]
+          tables: [SELECT]
 ```
+
+The operator runs `CREATE EXTENSION` and `ALTER EXTENSION ... UPDATE` as a
+superuser, so an extension's install and update scripts run **as a
+superuser** inside the database. Installing an extension is therefore a
+privileged operation, and a Database writer (who must not become
+superuser-equivalent) can only request it within the limits below. Every
+refusal is reported in the `Available` condition and in
+`status.extensions[].reason`/`message`; the other extensions, schemas and
+grants are still reconciled.
 
 ### Extension policy
 
-The operator installs extensions as a superuser. To keep that from being a
-way around the server's own rules, an extension is only installed when
+An extension is only installed (or updated) when
 
 - the server marks the requested version (the default version when
   `version` is unset) as **trusted** (`pg_available_extension_versions.trusted`;
   for example `pg_trgm`, `pgcrypto`, `uuid-ossp`, `citext`, `hstore`,
-  `btree_gist`, `tablefunc`), or
+  `btree_gist`, `ltree`, `cube`), or
 - the Cluster lists it in
   [`spec.rolePolicy.allowedExtensions`](clusters.md#role-policy).
 
 Trusted extensions are those PostgreSQL lets any role with `CREATE` on the
 database install, so pgop installing them gives the Database writer nothing
-extra. Untrusted extensions, such as `file_fdw`, `dblink`, `adminpack`,
-`plpython3u`, `postgis` or anything added to a custom image, can give access to
-the server's files, network or code execution, or were simply not reviewed for
-that; a cluster administrator has to allow them.
+extra. Untrusted extensions, such as `file_fdw`, `dblink`, `earthdistance`,
+`plpython3u`, `postgis`, `pg_partman` or anything added to a custom image, can
+give access to the server's files, network or code execution, or were simply
+not reviewed for that; a cluster administrator has to allow them. Listing an
+extension there is the Cluster editor's explicit decision to let pgop install
+it as a superuser; grants on its objects still follow the rules in
+[Grants on extension objects](#grants-on-extension-objects).
 
-A refused extension is not installed; the other extensions and the schemas are
-still reconciled and the Database reports `Available=False` with reason
-`ExtensionNotAllowed`. An extension already installed in the database is never
-dropped (also not when it is removed from the list or no longer allowed).
+A refused extension is not installed (reason `ExtensionNotAllowed`). An
+installed extension the policy no longer allows is reported the same way, is
+not updated, and the grants pgop made on its objects are revoked; it is not
+dropped.
 
-Without `schema`, the extension goes to the schema its control file names, or
-else `public` (the operator no longer uses the database's `search_path` for
-this).
+### Dependencies and `cascade`
+
+An extension can require others (`earthdistance` requires `cube`). Without
+`cascade`, they must be installed already: list them before the extension.
+Otherwise the Database reports `ExtensionDependencyMissing`.
+
+With `cascade: true`, pgop runs `CREATE EXTENSION ... CASCADE`, which installs
+the missing dependencies (recursively, at their default versions) **as a
+superuser too**. So pgop resolves the whole dependency list first, from
+`pg_available_extension_versions.requires`, and checks every extension it
+would install against the same policy. If one of them is neither trusted nor
+allowed, **nothing is installed** (`ExtensionNotAllowed`, naming the
+dependency). A dependency the server does not have is reported as
+`ExtensionVersionNotAvailable`. Dependencies installed by `cascade` go into the
+schema their control file names, or else into the extension's schema; they
+are not listed in `status.extensions` and are never dropped by pgop.
+
+### The schema an extension's scripts run in
+
+While an extension's script runs, `search_path` is the extension's target
+schema (followed by the schemas of the extensions it requires). A role that
+can create objects in one of those schemas can plant a function or operator
+there that the superuser-run script then calls instead of the one it meant
+(the class of CVE-2022-2625 and CVE-2023-39417; third-party scripts are not
+always written defensively). So before every `CREATE EXTENSION` and
+`ALTER EXTENSION ... UPDATE` pgop checks each of these schemas and refuses
+(`ExtensionSchemaNotAllowed`, nothing runs) unless:
+
+- the schema is owned by a superuser, by the database owner (also through
+  `pg_database_owner`, the owner of `public` since PostgreSQL 15), or is a
+  schema the Database manages (see
+  [Which schemas a Database manages](#which-schemas-a-database-manages)); and
+- no other role, and not `PUBLIC`, holds `CREATE` on it (superusers, the
+  schema's owner and the database owner may).
+
+For an extension that is **not trusted** (installed only because the Cluster
+allows it) the rule is stricter: its scripts were never meant to be safe for a
+non-superuser to install, and the database owner is controlled by whoever
+writes Databases. So each schema must be **owned by a superuser and writable
+by superusers only**. In practice:
+
+- Without `schema`, an untrusted extension goes to `public`, which is owned
+  by the database owner: allowed only for a Database without `owner` (owned by
+  the operator). Give it a `schema` of its own instead.
+- A `schema` that does not exist and is not listed in `spec.schemas` is
+  **created by pgop, owned by the operator** (a superuser), so no other role
+  can write to it. pgop never drops it. Such a schema is not one `schemas`
+  manages (listing it there reports `SchemaNotManaged`): grant on it with
+  `extensions[].grants[].schema`. A schema listed in `spec.schemas` is
+  created there first, owned by the database owner (fine for trusted
+  extensions, refused for untrusted ones).
+- On PostgreSQL 14 and older, `PUBLIC` holds `CREATE` on `public` by default:
+  revoke it with
+  [`publicPrivileges.publicSchemaCreate: false`](#default-public-privileges)
+  before installing extensions there.
+- Granting `CREATE` on an extension's schema to another role (in
+  `schemas[].grants` or `extensions[].grants[].schema`) makes later updates
+  of every extension in that schema refused. Remove the grant for the update
+  (pgop revokes what it granted) and add it back afterwards. Objects that role
+  already created in the schema are not checked: review the schema before
+  updating.
+
+When the control file of an extension names a schema (`schema = ...`), it is
+always installed there, and a different `schema` in the spec is refused.
+pgop never moves an installed extension: a `schema` that differs from where
+the extension is installed is reported as `ExtensionSchemaMismatch` (and the
+extension is not updated).
+
+### Versions
+
+- Without `version`, the default version is installed, and an installed
+  extension is left at its version (pgop does not update it on its own).
+- With `version`, a missing extension is installed at that version, and an
+  installed one at another version is updated with
+  `ALTER EXTENSION ... UPDATE TO '<version>'` when the server has an update
+  path (`pg_extension_update_paths`). Objects the update adds are picked up by
+  the [grants](#grants-on-extension-objects) on the same reconcile.
+- A version **lower** than the installed one is refused
+  (`ExtensionDowngradeNotAllowed`), even if the extension ships a downgrade
+  script: downgrades are not something a Database writer can undo.
+  Versions are compared numerically (`1.10` is higher than `1.9`); versions
+  that are not dotted numbers (`1.0beta1`) are only checked for an update
+  path.
+- A version the server does not have, or cannot update to, is reported as
+  `ExtensionVersionNotAvailable`; the extension stays at its version.
+- The policy and the schema rules apply to the version being installed or
+  updated to (the `trusted` flag is per version).
+- `version` must match `^[A-Za-z0-9][A-Za-z0-9._+~-]*$` (at most 64
+  characters); names and versions are always sent as quoted identifiers and
+  literals.
+
+`status.extensions[]` reports each extension's installed `version` and
+`schema`, whether pgop `created` it, and the `reason` and `message` when it is
+not as requested.
+
+### Grants on extension objects
+
+An extension's objects belong to the superuser that installed it, so their
+owner cannot grant on them for the application (for example pg_partman's
+configuration tables and maintenance functions). `extensions[].grants` lets
+pgop do it:
+
+| Field | Privileges | Applied to |
+|-------|------------|------------|
+| `schema` | `USAGE`, `CREATE`, `ALL` | the extension's own schema |
+| `tables` | `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`, `REFERENCES`, `MAINTAIN` (PostgreSQL 17+), `ALL` (all but `MAINTAIN`) | the extension's plain and partitioned tables |
+| `sequences` | `USAGE`, `SELECT`, `UPDATE`, `ALL` | the extension's sequences |
+| `functions` | `EXECUTE` (or `ALL`) | the extension's SQL and PL/pgSQL functions and procedures that are not `SECURITY DEFINER` |
+
+- The objects are the extension's members (`pg_depend` entries of type `e`),
+  listed again on every reconcile, so objects an update adds are granted on
+  too. Only what a grantee is missing is granted.
+- **Function safety rule.** `EXECUTE` is only granted on functions and
+  procedures written in `sql` or `plpgsql` that are not `SECURITY DEFINER`.
+  Two kinds of member functions are skipped, because granting on them would
+  let a Database writer escalate beyond their database:
+    - `SECURITY DEFINER` functions owned by the superuser run **as that
+      superuser**;
+    - C (and other internal-language) functions often have no access check
+      of their own and rely on `REVOKE EXECUTE ... FROM PUBLIC` instead
+      (`dblink_connect_u`, file readers, `pageinspect`, ...).
+
+    An invoker SQL or PL/pgSQL function runs with the caller's privileges, so
+    it gives nothing the caller could not do itself. If an update turns a
+    function pgop granted `EXECUTE` on into one that no longer qualifies, pgop
+    revokes that `EXECUTE`.
+- Table privileges are only granted on plain and partitioned tables: a view
+  or materialized view reads its tables with its owner's (superuser)
+  privileges, and a foreign table may read server files. `TRIGGER` is not
+  offered: a trigger on a table the extension's superuser-run code writes to
+  (a background worker, for example) would run as that superuser. Write
+  privileges on an extension's configuration tables still influence what that
+  code does: grant them only to roles you would trust with the extension.
+- Skipped objects are counted in `status.extensions[].skippedObjects`; they do
+  not make the Database not ready.
+- `schema` grants are only applied on a schema of the extension's own: not
+  `public`, not a system schema, and not a schema listed in `spec.schemas`
+  (grant on those in [`schemas[].grants`](#schema-grants); reason
+  `ExtensionGrantNotAllowed`).
+- Grantees follow the [grantee policy](#grantee-policy) (`PUBLIC`, roles of
+  the Cluster's Roles, or `allowedExistingRoles`). Grants are only applied
+  while the extension is installed and allowed by the policy.
+- pgop records what it added in `status.managedExtensionGrants` (per
+  extension, grantee and kind, before granting, as for the other ledgers).
+  When a grant, a privilege or the extension's entry is removed, pgop revokes
+  the recorded privilege **from every object of that kind of the extension**,
+  including the same privilege granted on one of them by hand. Grants on an
+  extension that was dropped are forgotten (its objects are gone); a privilege
+  on a schema another extension still grants to the same role is kept. When
+  the state of an extension cannot be read (a transient error), its tracked
+  grants are left alone.
+- Deleting a grantee's Role revokes its privileges on extension objects too
+  (see [Roles: deletion](roles.md#deletion)).
+
+### Removing an extension
+
+Removing an extension from `extensions` **does not drop it**: `DROP EXTENSION`
+deletes every column, index and object that uses its types or functions,
+which is data loss. Grants pgop made on its objects are revoked.
+
+To drop it, set `dropOnRemoval: true` and let the Database reconcile (the
+setting is recorded in `status.extensions[].dropOnRemoval`), then remove the
+entry. pgop then runs `DROP EXTENSION ... RESTRICT`, and only for an extension
+it created for this Database (`status.extensions[].created`, recorded before
+`CREATE EXTENSION` runs): an extension that was there before, or that someone
+else created while pgop was creating it (`ExtensionNotManaged`), is never
+dropped. pgop never drops with `CASCADE`: when other objects depend on the
+extension, the Database reports `ExtensionDropBlocked` and retries until they
+are gone (or the entry is listed again). Dependencies installed by `cascade`
+are not dropped.
 
 !!! warning "Extensions must exist in the image"
-    The operator runs `CREATE EXTENSION IF NOT EXISTS`, which only succeeds if
-    the extension's files are already present in the running image. It does
-    **not** install packages. The default `postgres:18` image does **not**
-    include PostGIS or TimescaleDB — to use `postgis` set the Cluster's
-    `spec.image` to a PostGIS-capable image (e.g. `postgis/postgis:18-3.5`), and
-    similarly use a TimescaleDB image for `timescaledb`.
+    The operator does **not** install packages: `CREATE EXTENSION` only
+    succeeds if the extension's files are present in the running image
+    (otherwise: `ExtensionVersionNotAvailable`). The default `postgres:18`
+    image includes the contrib extensions but **not** PostGIS, TimescaleDB or
+    pg_partman: set the Cluster's `spec.image` to an image that has them
+    (e.g. `postgis/postgis:18-3.5`).
+
+### Common extensions
+
+```yaml
+extensions:
+  - name: uuid-ossp     # UUID generation (trusted)
+  - name: pg_trgm       # trigram matching (trusted)
+  - name: pgcrypto      # cryptographic functions (trusted)
+  - name: citext        # case-insensitive text (trusted)
+  - name: postgis       # geographic data (untrusted, custom image)
+    schema: postgis
+  - name: timescaledb   # time-series (untrusted, custom image)
+    schema: timescale
+```
+
+PostgreSQL 13 and later also let a role with `CREATE` on the database install
+trusted extensions itself (grant it in [`grants`](#database-grants)); pgop is
+only needed for untrusted ones and for grants on extension objects.
 
 ## Security model
 
@@ -670,7 +895,13 @@ the server:
 - settings are limited to user-context parameters minus a denylist (see
   [Which parameters may be set](#which-parameters-may-be-set));
 - extensions are limited to trusted ones unless the Cluster allows more (see
-  [Extension policy](#extension-policy));
+  [Extension policy](#extension-policy)), dependencies installed by `cascade`
+  included; their superuser-run scripts only run in schemas no untrusted role
+  can write to (see
+  [the schema rules](#the-schema-an-extensions-scripts-run-in));
+- grants on extension objects never include `EXECUTE` on `SECURITY DEFINER`
+  or C functions, privileges on views, or `TRIGGER` (see
+  [Grants on extension objects](#grants-on-extension-objects));
 - system schemas (`pg_catalog`, `pg_toast`, other `pg_*` names and
   `information_schema`) cannot be created, owned or granted on (reason
   `SchemaNotAllowed`): `CREATE` on `pg_catalog` would let the grantee shadow
@@ -749,6 +980,29 @@ Database never drops it. A database's comment never authorizes a take-over
   databases an earlier pgop created and recorded in status keep working and
   are marked automatically.
 - `lo_compat_privileges` is refused in `settings`.
+- **Extensions** (see [Extensions](#extensions)):
+    - an untrusted extension (listed in the Cluster's `allowedExtensions`) is
+      only installed or updated in a schema owned by a superuser that only
+      superusers can create in. Without `schema` it goes to `public`, which
+      the database owner owns: a Database with an `owner` now reports
+      `ExtensionSchemaNotAllowed`. Set `schema` to a new schema (pgop creates
+      it, owned by the operator). Extensions already installed are not
+      touched until they are updated;
+    - any extension is refused in a schema `PUBLIC` or another role can
+      create in, notably `public` on PostgreSQL 14 and older (revoke with
+      `publicPrivileges.publicSchemaCreate: false`);
+    - `version` is now enforced: an installed extension at another version is
+      updated (or the downgrade reported), where `CREATE EXTENSION IF NOT
+      EXISTS` used to ignore it;
+    - schemas are created before extensions are installed, so an extension can
+      be installed into a schema of `schemas`;
+    - extension names must be unique, `version` must match
+      `^[A-Za-z0-9][A-Za-z0-9._+~-]*$`, and `schema` cannot be a system
+      schema;
+    - `status.installedExtensions` only lists extensions of `extensions` that
+      are installed; `status.extensions` has the details. Extensions installed
+      before this release are not recorded as created by pgop, so
+      `dropOnRemoval` never drops them.
 - **Schema grants are tracked and revoked.** `schemas[].grants` entries
   pgop adds from now on are revoked when they are removed (see
   [Schema Grants](#schema-grants)). There is no opt-out.

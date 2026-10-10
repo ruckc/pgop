@@ -240,9 +240,16 @@ Without `rolePolicy` (the default):
   are willing to hand to the namespace's writers: pgop refuses superuser and
   forbidden-member roles, but cannot see everything an object's previous
   owner may have prepared (functions, grants, ownerships).
-- Databases can only install extensions the server marks as trusted (reason
-  `ExtensionNotAllowed` otherwise). See
-  [Databases: extension policy](databases.md#extension-policy).
+- Databases can only install extensions the server marks as trusted for the
+  requested version (reason `ExtensionNotAllowed` otherwise), also as a
+  dependency installed by `cascade`. An extension listed in
+  `allowedExtensions` is installed by pgop as a superuser: that is the
+  Cluster editor's decision to trust it. Its scripts were not written to be
+  safe for a non-superuser to install, so pgop only runs them in a schema
+  that only superusers can write to (a Database can name a `schema`, which
+  pgop then creates owned by the operator); grants on its objects still
+  follow the function safety rule. See
+  [Databases: extensions](databases.md#extensions).
 - Database and Role `settings` cannot set custom parameters the server does
   not know (placeholders such as `myapp.tenant`; reason `SettingNotAllowed`)
   unless `allowedSettingPrefixes` lists their namespace (`myapp`). pgop sets
@@ -289,8 +296,8 @@ roles the role created itself.
 
 Changing `rolePolicy` re-reconciles the Cluster's Roles and Databases: removing
 an entry takes the attribute away, revokes the membership pgop granted, or
-stops installing the extension (extensions already installed are not
-dropped).
+stops installing and updating the extension and revokes the grants pgop made
+on its objects (extensions already installed are not dropped).
 
 !!! note "Upgrade / breaking change"
     Earlier versions applied whatever a Role or Database requested, including

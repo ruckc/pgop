@@ -17,7 +17,6 @@ limitations under the License.
 package controller
 
 import (
-	"context"
 	"errors"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -26,13 +25,6 @@ import (
 	postgresv1alpha1 "github.com/ruckc/pgop/api/v1alpha1"
 	"github.com/ruckc/pgop/internal/postgres"
 )
-
-type fakeExtensionClient map[string]bool
-
-func (f fakeExtensionClient) ExtensionTrusted(_ context.Context, name, _ string) (bool, bool, error) {
-	trusted, ok := f[name]
-	return trusted, ok, nil
-}
 
 // Role names used by the policy tests.
 const (
@@ -263,22 +255,5 @@ var _ = Describe("Role policy", func() {
 			Expect(opts.BypassRLS).To(BeTrue())
 			Expect(opts.Replication).To(BeFalse())
 		})
-	})
-
-	Describe("extensionAllowed", func() {
-		ctx := context.Background()
-		pg := fakeExtensionClient{polTrgm: true, polFileFDW: false}
-
-		DescribeTable("decisions",
-			func(name string, policy *postgresv1alpha1.RolePolicySpec, want bool) {
-				got, err := extensionAllowed(ctx, pg, policy, postgresv1alpha1.ExtensionSpec{Name: name})
-				Expect(err).NotTo(HaveOccurred())
-				Expect(got).To(Equal(want))
-			},
-			Entry("trusted", polTrgm, nil, true),
-			Entry("untrusted", polFileFDW, nil, false),
-			Entry("untrusted but allowed", polFileFDW, &postgresv1alpha1.RolePolicySpec{AllowedExtensions: []string{polFileFDW}}, true),
-			Entry("not available", "nope", nil, false),
-		)
 	})
 })

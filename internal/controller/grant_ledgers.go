@@ -101,6 +101,34 @@ func parameterLedgerStatus(ledger []privilegeGrant) []postgresv1alpha1.ManagedPa
 	return out
 }
 
+func extensionLedger(managed []postgresv1alpha1.ManagedExtensionGrant) []privilegeGrant {
+	out := make([]privilegeGrant, 0, len(managed))
+	for _, m := range managed {
+		ek, ok := extensionKindOf(m.Kind)
+		if !ok {
+			continue
+		}
+		out = append(out, privilegeGrant{Target: extensionTarget(ek.engine, m.Extension, m.Schema, m.Role), Privileges: m.Privileges})
+	}
+	return out
+}
+
+func extensionLedgerStatus(ledger []privilegeGrant) []postgresv1alpha1.ManagedExtensionGrant {
+	if len(ledger) == 0 {
+		return nil
+	}
+	out := make([]postgresv1alpha1.ManagedExtensionGrant, 0, len(ledger))
+	for _, g := range ledger {
+		ek, ok := extensionKindOf(g.Target.Kind)
+		if !ok {
+			continue
+		}
+		out = append(out, postgresv1alpha1.ManagedExtensionGrant{Extension: g.Target.Name, Role: g.Target.Grantee,
+			Kind: ek.api, Schema: g.Target.Schema, Privileges: g.Privileges})
+	}
+	return out
+}
+
 // saveStatus writes the Database's status. A conflict (a stale cached copy,
 // or a concurrent change) is returned, not retried: the status computed from
 // a stale copy must not overwrite a newer one (it could drop the record of

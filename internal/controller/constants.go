@@ -135,6 +135,40 @@ const (
 	// that is neither trusted nor listed in the Cluster's
 	// spec.rolePolicy.allowedExtensions. It is not installed.
 	ReasonExtensionNotAllowed = "ExtensionNotAllowed"
+	// ReasonExtensionVersionNotAvailable: the server does not have the
+	// extension, the requested version of it, or an update path from the
+	// installed version to the requested one (the extension's files are not
+	// in the image).
+	ReasonExtensionVersionNotAvailable = "ExtensionVersionNotAvailable"
+	// ReasonExtensionDowngradeNotAllowed: spec.extensions[].version is lower
+	// than the installed version. pgop never downgrades an extension.
+	ReasonExtensionDowngradeNotAllowed = "ExtensionDowngradeNotAllowed"
+	// ReasonExtensionDependencyMissing: the extension requires extensions
+	// that are not installed, and cascade is not set (or, for an update,
+	// the new version requires them).
+	ReasonExtensionDependencyMissing = "ExtensionDependencyMissing"
+	// ReasonExtensionSchemaNotAllowed: the schema an extension's install or
+	// update script would run in (its target schema, or the schema of an
+	// extension it requires) can be written to by a role that could plant
+	// objects the superuser-run script would pick up, or is not one the
+	// Database manages. Nothing is installed or updated.
+	ReasonExtensionSchemaNotAllowed = "ExtensionSchemaNotAllowed"
+	// ReasonExtensionSchemaMismatch: the extension is installed in another
+	// schema than spec.extensions[].schema names. pgop does not move
+	// installed extensions.
+	ReasonExtensionSchemaMismatch = "ExtensionSchemaMismatch"
+	// ReasonExtensionNotManaged: the extension was created by someone else
+	// while pgop was creating it; pgop does not record it as its own.
+	ReasonExtensionNotManaged = "ExtensionNotManaged"
+	// ReasonExtensionDropBlocked: an extension removed from the spec with
+	// dropOnRemoval cannot be dropped without CASCADE (other objects depend
+	// on it). pgop retries; it never cascades.
+	ReasonExtensionDropBlocked = "ExtensionDropBlocked"
+	// ReasonExtensionGrantNotAllowed: spec.extensions[].grants asks for
+	// privileges on an extension schema pgop does not grant on through the
+	// extension (public, a system schema, or a schema listed in
+	// spec.schemas).
+	ReasonExtensionGrantNotAllowed = "ExtensionGrantNotAllowed"
 	// ReasonSchemaNotAllowed: Database.spec.schemas names a system schema.
 	ReasonSchemaNotAllowed = "SchemaNotAllowed"
 	// ReasonRoleNotManaged: the PostgreSQL role exists but does not carry this

@@ -111,14 +111,14 @@ func (r *DatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	// name only the older one is reconciled.
 	pgName := database.PostgresName()
 	if err := r.checkDatabaseName(ctx, database, pgName); err != nil {
-		return r.updateStatus(ctx, database, false, nil, nil, err)
+		return r.updateStatus(ctx, database, false, nil, err)
 	}
 
 	// Get the referenced cluster
 	cluster, err := r.getCluster(ctx, database)
 	if err != nil {
 		log.Error(err, "Failed to get Cluster")
-		return r.updateStatus(ctx, database, false, nil, nil, err)
+		return r.updateStatus(ctx, database, false, nil, err)
 	}
 
 	// Check if cluster is ready
@@ -132,7 +132,7 @@ func (r *DatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	ownerRole, err := r.resolveOwnerRole(ctx, database)
 	if err != nil {
 		log.Info("Owner role not available", "reason", err.Error())
-		return r.updateStatus(ctx, database, false, nil, nil, err)
+		return r.updateStatus(ctx, database, false, nil, err)
 	}
 	ownerPGName := ""
 	if ownerRole != nil {
@@ -143,7 +143,7 @@ func (r *DatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	adminClient, err := newOperatorClient(ctx, r.Client, cluster, defaultDatabaseName)
 	if err != nil {
 		log.Error(err, "Failed to create PostgreSQL admin client")
-		return r.updateStatus(ctx, database, false, nil, nil, err)
+		return r.updateStatus(ctx, database, false, nil, err)
 	}
 	defer func() { _ = adminClient.Close() }()
 
@@ -160,15 +160,15 @@ func (r *DatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	// (it carries the Database's signed ownership marker).
 	signer, err := loadMarkerSigner(ctx, r.Client, cluster)
 	if err != nil {
-		return r.updateStatus(ctx, database, false, nil, nil, err)
+		return r.updateStatus(ctx, database, false, nil, err)
 	}
 	recorded, err := r.databaseRecorded(ctx, database, cluster, pgName)
 	if err != nil {
-		return r.updateStatus(ctx, database, false, nil, nil, err)
+		return r.updateStatus(ctx, database, false, nil, err)
 	}
 	if err := ensureDatabase(ctx, adminClient, database, cluster, signer, pgName, ownerPGName, recorded); err != nil {
 		log.Error(err, "Failed to create database")
-		return r.updateStatus(ctx, database, false, nil, nil, err)
+		return r.updateStatus(ctx, database, false, nil, err)
 	}
 
 	// Settings, database grants and PUBLIC's database privileges. A problem
@@ -178,7 +178,7 @@ func (r *DatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	// Database stays not ready until it is fixed.
 	checker, accessErr, err := r.reconcileDatabaseAccess(ctx, adminClient, database, cluster, signer, pgName)
 	if err != nil {
-		return r.updateStatus(ctx, database, false, nil, nil, err)
+		return r.updateStatus(ctx, database, false, nil, err)
 	}
 
 	// Get a connection to the new database to install extensions and create
@@ -189,74 +189,50 @@ func (r *DatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 				"the database %s does not allow connections (ALTER DATABASE %s WITH ALLOW_CONNECTIONS true); "+
 					"its extensions and schemas cannot be reconciled", pgName, pgName)}
 		}
-		return r.updateStatus(ctx, database, false, nil, nil, errors.Join(err, accessErr))
+		return r.updateStatus(ctx, database, false, nil, errors.Join(err, accessErr))
 	}
 	dbClient, err := newOperatorClient(ctx, r.Client, cluster, pgName)
 	if err != nil {
 		log.Error(err, "Failed to create PostgreSQL database client")
-		return r.updateStatus(ctx, database, false, nil, nil, err)
+		return r.updateStatus(ctx, database, false, nil, err)
 	}
 	defer func() { _ = dbClient.Close() }()
 
-	// Install extensions (only trusted ones and those the Cluster's
-	// rolePolicy allows), then create the schemas and apply their grants.
-	// Refused extensions and schemas are reported once the rest is done.
-	installedExtensions, refusedErr, err := installExtensions(ctx, dbClient, cluster.Spec.RolePolicy, database)
-	if err != nil {
-		log.Error(err, "Failed to create extension")
-		return r.updateStatus(ctx, database, false, installedExtensions, nil, err)
-	}
-	accessErr = errors.Join(refusedErr, accessErr)
+	// Create the schemas first (extensions may be installed into them),
+	// then install and update the extensions (only trusted ones and those
+	// the Cluster's rolePolicy allows, and only into schemas no untrusted
+	// role can write to), then apply the schema and extension grants.
+	// Refused schemas, extensions and grants are reported once the rest is
+	// done.
 	createdSchemas, refusedErr, err := reconcileSchemas(ctx, dbClient, database)
 	if err != nil {
 		log.Error(err, "Failed to reconcile schemas")
-		return r.updateStatus(ctx, database, false, installedExtensions, createdSchemas, err)
+		return r.updateStatus(ctx, database, false, createdSchemas, err)
+	}
+	accessErr = errors.Join(refusedErr, accessErr)
+	extStates, extErr := reconcileExtensions(ctx, dbClient, database, cluster.Spec.RolePolicy, createdSchemas, r.statusSaver(database))
+	if extErr != nil {
+		log.Error(extErr, "Failed to reconcile extensions")
 	}
 	// Schema grants and PUBLIC's privileges on the schema public, once every
-	// schema exists. Like the database grants, a problem here is reported
-	// after the credentials Secret is reconciled.
-	accessErr = errors.Join(refusedErr, accessErr, reconcileSchemaAccess(ctx, dbClient, database, pgName, createdSchemas, checker, r.statusSaver(database)))
+	// schema exists, then the grants on the extensions' objects. Like the
+	// database grants, a problem here is reported after the credentials
+	// Secret is reconciled.
+	accessErr = errors.Join(extErr, accessErr,
+		reconcileSchemaAccess(ctx, dbClient, database, pgName, createdSchemas, checker, r.statusSaver(database)),
+		reconcileExtensionAccess(ctx, dbClient, database, extStates, checker, r.statusSaver(database)))
 
 	if err := r.reconcileCredentialsSecret(ctx, database, ownerRole, cluster); err != nil {
 		log.Error(err, "Failed to reconcile database credentials secret")
-		return r.updateStatus(ctx, database, false, installedExtensions, createdSchemas, err)
+		return r.updateStatus(ctx, database, false, createdSchemas, err)
 	}
 
 	if accessErr != nil {
-		return r.updateStatus(ctx, database, false, installedExtensions, createdSchemas, accessErr)
+		return r.updateStatus(ctx, database, false, createdSchemas, accessErr)
 	}
 
 	log.Info("Database reconciled successfully")
-	return r.updateStatus(ctx, database, true, installedExtensions, createdSchemas, nil)
-}
-
-// installExtensions installs the Database's extensions that the policy
-// allows. It returns the installed extensions, an ExtensionNotAllowed error
-// listing the refused ones (nil when none) and the error that stopped it.
-func installExtensions(ctx context.Context, pg *postgres.Client, policy *postgresv1alpha1.RolePolicySpec,
-	database *postgresv1alpha1.Database) (installed []string, refusedErr, err error) {
-	installed = make([]string, 0, len(database.Spec.Extensions))
-	var refused []string
-	for _, ext := range database.Spec.Extensions {
-		allowed, err := extensionAllowed(ctx, pg, policy, ext)
-		if err != nil {
-			return installed, nil, err
-		}
-		if !allowed {
-			refused = append(refused, ext.Name)
-			continue
-		}
-		if err := pg.CreateExtension(ctx, ext.Name, ext.Schema, ext.Version); err != nil {
-			return installed, nil, fmt.Errorf("extension %q: %w", ext.Name, err)
-		}
-		installed = append(installed, ext.Name)
-	}
-	if len(refused) > 0 {
-		refusedErr = &conditionError{reason: ReasonExtensionNotAllowed, err: fmt.Errorf(
-			"extensions not installed: %s: not marked trusted by the server (or not available) and not listed in "+
-				"the Cluster's spec.rolePolicy.allowedExtensions", strings.Join(refused, ", "))}
-	}
-	return installed, refusedErr, nil
+	return r.updateStatus(ctx, database, true, createdSchemas, nil)
 }
 
 // schemaClient is the subset of *postgres.Client used to create schemas and
@@ -512,25 +488,6 @@ func (r *DatabaseReconciler) dropPostgresDatabase(ctx context.Context, cluster *
 	return adminClient.DropDatabase(ctx, pgName)
 }
 
-// extensionClient is the subset of *postgres.Client used to check the
-// extension policy.
-type extensionClient interface {
-	ExtensionTrusted(ctx context.Context, name, version string) (trusted, available bool, err error)
-}
-
-// extensionAllowed reports whether pgop may install ext under policy: the
-// Cluster lists it in spec.rolePolicy.allowedExtensions, or the server marks
-// the requested version (its default version when unset) as trusted, so a
-// non-superuser with CREATE on the database could install it as well.
-func extensionAllowed(ctx context.Context, pg extensionClient, policy *postgresv1alpha1.RolePolicySpec,
-	ext postgresv1alpha1.ExtensionSpec) (bool, error) {
-	if policy.AllowsExtension(ext.Name) {
-		return true, nil
-	}
-	trusted, _, err := pg.ExtensionTrusted(ctx, ext.Name, ext.Version)
-	return trusted, err
-}
-
 // reconcileSettingsAndGrants applies the per-database settings (ALTER
 // DATABASE ... SET/RESET; they only affect new sessions, so they are applied
 // before the database connection used for extensions is opened), the
@@ -705,9 +662,8 @@ func (r *DatabaseReconciler) getCluster(ctx context.Context, database *postgresv
 	return cluster, nil
 }
 
-func (r *DatabaseReconciler) updateStatus(ctx context.Context, database *postgresv1alpha1.Database, ready bool, extensions, schemas []string, reconcileErr error) (ctrl.Result, error) {
+func (r *DatabaseReconciler) updateStatus(ctx context.Context, database *postgresv1alpha1.Database, ready bool, schemas []string, reconcileErr error) (ctrl.Result, error) {
 	database.Status.Ready = ready
-	database.Status.InstalledExtensions = extensions
 	// nil means the schemas were not reconciled: keep the record of the
 	// schemas the Database manages (it decides which existing schemas it may
 	// change).
@@ -769,7 +725,8 @@ func (r *DatabaseReconciler) databasesForOwnerRole(ctx context.Context, obj clie
 		if pgName == "" {
 			return false
 		}
-		if slices.ContainsFunc(db.Spec.Grants, func(g postgresv1alpha1.DatabaseGrantSpec) bool { return g.Role == pgName }) {
+		if slices.ContainsFunc(db.Spec.Grants, func(g postgresv1alpha1.DatabaseGrantSpec) bool { return g.Role == pgName }) ||
+			extensionsGrantingTo(db, pgName) {
 			return true
 		}
 		return slices.ContainsFunc(db.Spec.Schemas, func(s postgresv1alpha1.SchemaSpec) bool {

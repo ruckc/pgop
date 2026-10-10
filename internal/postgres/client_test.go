@@ -542,16 +542,3 @@ func containsSubstring(s, substr string) bool {
 	}
 	return false
 }
-
-func TestBuildCreateExtensionQuery(t *testing.T) {
-	tests := []struct{ name, schema, version, want string }{
-		{"pg_trgm", "", "", `CREATE EXTENSION IF NOT EXISTS "pg_trgm"`},
-		{"uuid-ossp", "ext", "1.1", `CREATE EXTENSION IF NOT EXISTS "uuid-ossp" SCHEMA "ext" VERSION '1.1'`},
-		{`x"y`, `s"`, `1'0`, `CREATE EXTENSION IF NOT EXISTS "x""y" SCHEMA "s""" VERSION '1''0'`},
-	}
-	for _, tt := range tests {
-		if got := buildCreateExtensionQuery(tt.name, tt.schema, tt.version); got != tt.want {
-			t.Errorf("buildCreateExtensionQuery(%q, %q, %q) = %q, want %q", tt.name, tt.schema, tt.version, got, tt.want)
-		}
-	}
-}

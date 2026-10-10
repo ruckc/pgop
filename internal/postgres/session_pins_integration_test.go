@@ -191,8 +191,8 @@ func checkCatalogHelpers(ctx context.Context, t *testing.T, admin, c *Client, db
 	if allow, err := admin.DatabaseAllowsConnections(ctx, db); err != nil || allow {
 		t.Errorf("DatabaseAllowsConnections = %t %v, want false", allow, err)
 	}
-	dbs, err := admin.DatabasesWithSchemaPrivileges(ctx, "pgop_pin_member")
+	dbs, err := admin.DatabasesWithObjectPrivileges(ctx, "pgop_pin_member")
 	if err != nil || len(dbs) != 1 || dbs[0] != (DatabaseRef{Name: db, AllowConns: false}) {
-		t.Errorf("DatabasesWithSchemaPrivileges = %+v %v", dbs, err)
+		t.Errorf("DatabasesWithObjectPrivileges = %+v %v", dbs, err)
 	}
 }

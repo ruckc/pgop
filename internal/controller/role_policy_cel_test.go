@@ -29,6 +29,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	postgresv1alpha1 "github.com/ruckc/pgop/api/v1alpha1"
+	"github.com/ruckc/pgop/internal/postgres"
 )
 
 // reservedPrefixName is a name using the prefix reserved for the operator.
@@ -174,7 +175,7 @@ var _ = Describe("Role policy CRD validation", func() {
 			})
 		}
 
-		for _, name := range []string{"pg_catalog", "pg_toast", "information_schema"} {
+		for _, name := range []string{extTestPgCatalog, "pg_toast", extTestInfoSchema} {
 			It(fmt.Sprintf("rejects the system schema %q", name), func() {
 				expectInvalid(create(newDatabase("s-"+suffix, postgresv1alpha1.DatabaseSpec{
 					Schemas: []postgresv1alpha1.SchemaSpec{{Name: name}},
@@ -188,10 +189,43 @@ var _ = Describe("Role policy CRD validation", func() {
 			})))
 		})
 
+		It("validates extension versions, schemas and grants", func() {
+			for _, ext := range []postgresv1alpha1.ExtensionSpec{
+				{Name: polTrgm, Version: "1.6'; DROP ROLE x; --"},
+				{Name: polTrgm, Version: ".1"},
+				{Name: polTrgm, Schema: extTestPgCatalog},
+				{Name: polTrgm, Schema: extTestInfoSchema},
+				{Name: polTrgm, Grants: []postgresv1alpha1.ExtensionGrantSpec{{Role: grantTestRole}}},
+				{Name: polTrgm, Grants: []postgresv1alpha1.ExtensionGrantSpec{{Role: grantTestRole, Tables: []string{extTestTrigger}}}},
+				{Name: polTrgm, Grants: []postgresv1alpha1.ExtensionGrantSpec{{Role: grantTestRole, Functions: []string{"EXECUTE; DROP"}}}},
+				{Name: polTrgm, Grants: []postgresv1alpha1.ExtensionGrantSpec{{Role: grantTestRole, Sequences: []string{postgres.PrivilegeDelete}}}},
+				{Name: polTrgm, Grants: []postgresv1alpha1.ExtensionGrantSpec{{Role: grantTestLowerPublic, Functions: []string{postgres.PrivilegeExecute}}}},
+				{Name: polTrgm, Grants: []postgresv1alpha1.ExtensionGrantSpec{{Role: bootstrapRoleName, Functions: []string{postgres.PrivilegeExecute}}}},
+				{Name: polTrgm, Grants: []postgresv1alpha1.ExtensionGrantSpec{{Role: polMonitor, Functions: []string{postgres.PrivilegeExecute}}}},
+			} {
+				expectInvalid(create(newDatabase("ev-"+suffix, postgresv1alpha1.DatabaseSpec{
+					Extensions: []postgresv1alpha1.ExtensionSpec{ext},
+				})))
+			}
+			By("rejecting an extension listed twice")
+			expectInvalid(create(newDatabase("ed-"+suffix, postgresv1alpha1.DatabaseSpec{
+				Extensions: []postgresv1alpha1.ExtensionSpec{{Name: polTrgm}, {Name: polTrgm, Version: extV16}},
+			})))
+			By("accepting a full extension entry")
+			Expect(create(newDatabase("ef-"+suffix, postgresv1alpha1.DatabaseSpec{
+				Extensions: []postgresv1alpha1.ExtensionSpec{{Name: "pg_partman", Schema: "partman", Version: "5.2.4",
+					Cascade: true, DropOnRemoval: true, Grants: []postgresv1alpha1.ExtensionGrantSpec{
+						{Role: grantTestRole, Schema: []string{postgres.PrivilegeUsage, postgres.PrivilegeCreate}, Tables: []string{postgres.PrivilegeAll, postgres.PrivilegeMaintain},
+							Sequences: []string{postgres.PrivilegeAll}, Functions: []string{postgres.PrivilegeExecute}},
+						{Role: postgres.PublicGrantee, Functions: []string{postgres.PrivilegeExecute}},
+					}}},
+			}))).To(Succeed())
+		})
+
 		It("accepts regular schemas and extensions", func() {
 			Expect(create(newDatabase("ok-"+suffix, postgresv1alpha1.DatabaseSpec{
 				Schemas:    []postgresv1alpha1.SchemaSpec{{Name: "app_s"}, {Name: "public"}},
-				Extensions: []postgresv1alpha1.ExtensionSpec{{Name: polUUID}, {Name: polTrgm, Schema: "app_s", Version: "1.6"}},
+				Extensions: []postgresv1alpha1.ExtensionSpec{{Name: polUUID}, {Name: polTrgm, Schema: "app_s", Version: extV16}},
 			}))).To(Succeed())
 		})
 	})
