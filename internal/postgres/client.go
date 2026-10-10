@@ -541,6 +541,22 @@ type ReachableRole struct {
 	BypassRLS   bool
 }
 
+// LookupRole returns the role name with its comment and privileged
+// attributes (Via is ""), or nil when the role does not exist.
+func (c *Client) LookupRole(ctx context.Context, name string) (*ReachableRole, error) {
+	const query = `SELECT r.rolname, COALESCE(pg_catalog.shobj_description(r.oid, 'pg_authid'), ''), r.rolsuper, r.rolcreaterole, r.rolreplication, r.rolbypassrls
+FROM pg_catalog.pg_roles r WHERE r.rolname = $1`
+	var r ReachableRole
+	err := c.db.QueryRowContext(ctx, query, name).Scan(&r.Name, &r.Comment, &r.Superuser, &r.CreateRole, &r.Replication, &r.BypassRLS)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to look up role %q: %w", name, err)
+	}
+	return &r, nil
+}
+
 // MembershipClosure returns the role name itself (Via "") followed by every
 // role it is a member of, directly or indirectly, whatever the grant
 // options. It returns nil when the role does not exist.
@@ -858,22 +874,6 @@ func (c *Client) CreateSchema(ctx context.Context, name, owner string) error {
 	_, err = c.db.ExecContext(ctx, query)
 	if err != nil {
 		return fmt.Errorf("failed to create schema: %w", err)
-	}
-	return nil
-}
-
-// GrantSchemaPrivileges grants privileges on a schema to a role. The
-// privileges are checked against the schema allow-list (USAGE, CREATE, ALL)
-// before any SQL is built, since they cannot be passed as bind parameters.
-func (c *Client) GrantSchemaPrivileges(ctx context.Context, schema, role string, privileges []string, withGrantOption bool) error {
-	query, err := buildGrantSchemaPrivilegesQuery(schema, role, privileges, withGrantOption)
-	if err != nil {
-		return err
-	}
-
-	_, err = c.db.ExecContext(ctx, query)
-	if err != nil {
-		return fmt.Errorf("failed to grant schema privileges: %w", err)
 	}
 	return nil
 }

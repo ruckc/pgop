@@ -61,7 +61,7 @@ spec:
 | `parameters` | map[string]string | - | PostgreSQL configuration parameters. See [Parameters](#parameters) |
 | `rolePolicy.allowedAttributes` | []string | `[]` | Privileged attributes Roles may request: `createRole`, `replication`, `bypassRLS`. See [Role policy](#role-policy) |
 | `rolePolicy.allowedPredefinedRoles` | []string | `[]` | Predefined `pg_*` roles Roles may be members of. See [Role policy](#role-policy) |
-| `rolePolicy.allowedExistingRoles` | []string | `[]` | Roles not managed by a Role of this Cluster that Roles may be members of. See [Role policy](#role-policy) |
+| `rolePolicy.allowedExistingRoles` | []string | `[]` | Roles not managed by a Role of this Cluster that Roles may be members of and Databases may grant privileges to. See [Role policy](#role-policy) |
 | `rolePolicy.adoptableRoles` | []string | `[]` | Existing roles a Role may take over. See [Role policy](#role-policy) |
 | `rolePolicy.adoptableDatabases` | []string | `[]` | Existing databases a Database may take over. See [Role policy](#role-policy) |
 | `rolePolicy.allowedExtensions` | []string | `[]` | Untrusted extensions Databases may install (trusted ones are always allowed). See [Role policy](#role-policy) |
@@ -224,7 +224,10 @@ Without `rolePolicy` (the default):
   [Roles: membership policy](roles.md#membership-policy).
 - Roles cannot be members of roles that no Role of this Cluster manages (a
   DBA's or a bootstrap Job's roles), unless `allowedExistingRoles` lists them.
-  Roles managed by Roles of the same Cluster can always be joined: the
+  The same list decides which such roles Databases may grant privileges to
+  ([`grants`, `schemas[].grants`](databases.md#grantee-policy); reason
+  `GranteeNotAllowed`). Roles managed by Roles of the same Cluster can always
+  be joined and granted to: the
   Cluster's namespace is one trust domain.
 - Roles and Databases only manage roles and databases they created (or
   recorded in their status). Taking over an existing one needs

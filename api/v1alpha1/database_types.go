@@ -21,6 +21,8 @@ import (
 )
 
 // DatabaseSpec defines the desired state of Database
+// +kubebuilder:validation:XValidation:rule="!has(self.publicPrivileges) || !has(self.grants) || !self.grants.exists(g, g.role == 'PUBLIC' && ((has(self.publicPrivileges.connect) && !self.publicPrivileges.connect && g.privileges.exists(p, p in ['CONNECT', 'ALL'])) || (has(self.publicPrivileges.temporary) && !self.publicPrivileges.temporary && g.privileges.exists(p, p in ['TEMPORARY', 'TEMP', 'ALL']))))",message="grants must not grant PUBLIC a privilege that publicPrivileges revokes"
+// +kubebuilder:validation:XValidation:rule="!has(self.publicPrivileges) || !has(self.schemas) || !self.schemas.exists(s, s.name == 'public' && has(s.grants) && s.grants.exists(g, g.role == 'PUBLIC' && ((has(self.publicPrivileges.publicSchemaUsage) && !self.publicPrivileges.publicSchemaUsage && g.privileges.exists(p, p.lowerAscii() in ['usage', 'all', 'all privileges'])) || (has(self.publicPrivileges.publicSchemaCreate) && !self.publicPrivileges.publicSchemaCreate && g.privileges.exists(p, p.lowerAscii() in ['create', 'all', 'all privileges'])))))",message="schemas[public].grants must not grant PUBLIC a privilege that publicPrivileges revokes"
 // +kubebuilder:validation:XValidation:rule="self.clusterRef.name == oldSelf.clusterRef.name",message="clusterRef is immutable; create a new Database for another Cluster"
 // +kubebuilder:validation:XValidation:rule="has(oldSelf.databaseName) == has(self.databaseName) && (!has(self.databaseName) || self.databaseName == oldSelf.databaseName)",message="databaseName is immutable"
 type DatabaseSpec struct {
@@ -60,6 +62,9 @@ type DatabaseSpec struct {
 
 	// schemas lists schemas to create in this database
 	// +optional
+	// +listType=map
+	// +listMapKey=name
+	// +kubebuilder:validation:MaxItems=64
 	Schemas []SchemaSpec `json:"schemas,omitempty"`
 
 	// grants lists database-level privileges (GRANT ... ON DATABASE) to grant
@@ -92,16 +97,71 @@ type DatabaseSpec struct {
 	// +kubebuilder:validation:XValidation:rule="self.all(k, size(self[k]) <= 4096)",message="settings values must be at most 4096 characters"
 	// +kubebuilder:validation:XValidation:rule="!self.exists(k, k.lowerAscii() in ['role', 'session_authorization', 'session_preload_libraries', 'local_preload_libraries', 'shared_preload_libraries', 'dynamic_library_path', 'jit_provider', 'session_replication_role', 'lo_compat_privileges'] || k.lowerAscii().startsWith('pgaudit.') || k.lowerAscii().startsWith('set_user.') || k.lowerAscii().startsWith('anon.') || k.lowerAscii().startsWith('sepgsql.'))",message="settings must not include role, session_authorization, *_preload_libraries, dynamic_library_path, jit_provider, session_replication_role, lo_compat_privileges or pgaudit.*, set_user.*, anon.*, sepgsql.* parameters"
 	Settings map[string]string `json:"settings,omitempty"`
+
+	// publicPrivileges revokes the privileges PostgreSQL gives the PUBLIC
+	// pseudo-role (every role) by default: CONNECT and TEMPORARY on the
+	// database, and USAGE (and, before PostgreSQL 15, CREATE) on the schema
+	// named public. A field set to false revokes that privilege from PUBLIC;
+	// unset (or true) leaves PostgreSQL's default alone. pgop records what it
+	// revoked in status.revokedPublicPrivileges and grants exactly that back
+	// to PUBLIC once the field is unset or set to true again; a privilege
+	// PUBLIC did not hold is not recorded and never granted. Revoking CONNECT
+	// from PUBLIC locks out every role that has no CONNECT grant of its own
+	// (the owner and superusers keep it): grant it in spec.grants.
+	// +optional
+	PublicPrivileges *PublicPrivilegesSpec `json:"publicPrivileges,omitempty"`
 }
 
+// PublicPrivilegesSpec selects default PUBLIC privileges to revoke. false
+// revokes; unset or true keeps (or restores) PostgreSQL's default.
+type PublicPrivilegesSpec struct {
+	// connect: false revokes CONNECT on the database from PUBLIC.
+	// +optional
+	Connect *bool `json:"connect,omitempty"`
+
+	// temporary: false revokes TEMPORARY on the database from PUBLIC.
+	// +optional
+	Temporary *bool `json:"temporary,omitempty"`
+
+	// publicSchemaUsage: false revokes USAGE on the schema public from
+	// PUBLIC.
+	// +optional
+	PublicSchemaUsage *bool `json:"publicSchemaUsage,omitempty"`
+
+	// publicSchemaCreate: false revokes CREATE on the schema public from
+	// PUBLIC (PostgreSQL 15 and later no longer grant it by default).
+	// +optional
+	PublicSchemaCreate *bool `json:"publicSchemaCreate,omitempty"`
+}
+
+// PublicPrivilege names a default PUBLIC privilege that
+// spec.publicPrivileges can revoke (the name of its field there).
+// +kubebuilder:validation:Enum=connect;temporary;publicSchemaUsage;publicSchemaCreate
+type PublicPrivilege string
+
+// The default PUBLIC privileges spec.publicPrivileges can revoke.
+const (
+	PublicPrivilegeConnect            PublicPrivilege = "connect"
+	PublicPrivilegeTemporary          PublicPrivilege = "temporary"
+	PublicPrivilegePublicSchemaUsage  PublicPrivilege = "publicSchemaUsage"
+	PublicPrivilegePublicSchemaCreate PublicPrivilege = "publicSchemaCreate"
+)
+
 // DatabaseGrantSpec grants database-level privileges to a PostgreSQL role.
+// +kubebuilder:validation:XValidation:rule="self.role != 'PUBLIC' || !has(self.withGrantOption) || !self.withGrantOption",message="the grant option cannot be granted to PUBLIC"
 type DatabaseGrantSpec struct {
-	// role is the PostgreSQL name of the role to grant privileges to (a raw
-	// PostgreSQL role name, not a Role resource name). The role must exist;
-	// the grant is retried until it does.
+	// role is the grantee: the PostgreSQL name of a role (a raw PostgreSQL
+	// role name, not a Role resource name), or PUBLIC (upper case) for every
+	// role. A role must be managed by a Role of the same Cluster (created or
+	// adopted by it, recorded in its status) or be listed in the Cluster's
+	// spec.rolePolicy.allowedExistingRoles; superusers, postgres, pgop_* and
+	// predefined pg_* roles are never accepted (reason GranteeNotAllowed). The
+	// role must exist; the grant is retried until it does.
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:XValidation:rule="self == 'PUBLIC' || self.lowerAscii() != 'public'",message="write the PUBLIC pseudo-role in upper case"
+	// +kubebuilder:validation:XValidation:rule="self != 'postgres' && !self.startsWith('pgop_') && !self.startsWith('pg_') && self.lowerAscii() != 'none'",message="role must not be postgres, none, a pgop_* role or a predefined pg_* role"
 	Role string `json:"role"`
 
 	// privileges lists the database privileges to grant: CONNECT, CREATE,
@@ -174,15 +234,33 @@ type SchemaSpec struct {
 	// +optional
 	Owner string `json:"owner,omitempty"`
 
-	// grants lists privileges to grant on this schema
+	// grants lists privileges to grant on this schema (GRANT ... ON
+	// SCHEMA). Privileges that pgop granted (tracked in
+	// status.managedSchemaGrants) are revoked once they are removed from the
+	// spec, also when the whole schema entry is removed (the schema itself is
+	// never dropped); privileges granted outside pgop are never revoked.
 	// +optional
+	// +listType=map
+	// +listMapKey=role
+	// +kubebuilder:validation:MaxItems=16
 	Grants []GrantSpec `json:"grants,omitempty"`
 }
 
 // GrantSpec defines privileges to grant to a role
+// +kubebuilder:validation:XValidation:rule="self.role != 'PUBLIC' || !has(self.withGrantOption) || !self.withGrantOption",message="the grant option cannot be granted to PUBLIC"
 type GrantSpec struct {
-	// role is the role to grant privileges to
+	// role is the grantee: the PostgreSQL name of a role (a raw PostgreSQL
+	// role name, not a Role resource name), or PUBLIC (upper case) for every
+	// role. A role must be managed by a Role of the same Cluster (created or
+	// adopted by it, recorded in its status) or be listed in the Cluster's
+	// spec.rolePolicy.allowedExistingRoles; superusers, postgres, pgop_* and
+	// predefined pg_* roles are never accepted (reason GranteeNotAllowed). The
+	// role must exist; the grant is retried until it does.
 	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:XValidation:rule="self == 'PUBLIC' || self.lowerAscii() != 'public'",message="write the PUBLIC pseudo-role in upper case"
+	// +kubebuilder:validation:XValidation:rule="self != 'postgres' && !self.startsWith('pgop_') && !self.startsWith('pg_') && self.lowerAscii() != 'none'",message="role must not be postgres, none, a pgop_* role or a predefined pg_* role"
 	Role string `json:"role"`
 
 	// privileges lists the schema privileges to grant: USAGE, CREATE or ALL
@@ -194,7 +272,27 @@ type GrantSpec struct {
 	// +kubebuilder:validation:items:Pattern=`^(?i:usage|create|all|all privileges)$`
 	Privileges []string `json:"privileges"`
 
-	// withGrantOption allows the grantee to grant the same privileges to others
+	// withGrantOption allows the grantee to grant the same privileges to
+	// others. Turning it off for a grant pgop made revokes the grant option.
+	// +optional
+	WithGrantOption bool `json:"withGrantOption,omitempty"`
+}
+
+// ManagedSchemaGrant records schema privileges that pgop granted to a role.
+type ManagedSchemaGrant struct {
+	// schema is the schema the privileges are on.
+	Schema string `json:"schema"`
+
+	// role is the grantee: a PostgreSQL role, or PUBLIC.
+	Role string `json:"role"`
+
+	// privileges are the granted privileges, normalized (ALL is recorded as
+	// CREATE and USAGE).
+	// +listType=set
+	Privileges []string `json:"privileges"`
+
+	// withGrantOption records whether pgop granted the privileges with the
+	// grant option.
 	// +optional
 	WithGrantOption bool `json:"withGrantOption,omitempty"`
 }
@@ -227,7 +325,25 @@ type DatabaseStatus struct {
 	// +optional
 	// +listType=map
 	// +listMapKey=role
+	// +kubebuilder:validation:MaxItems=512
 	ManagedGrants []ManagedDatabaseGrant `json:"managedGrants,omitempty"`
+
+	// managedSchemaGrants lists the schema privileges pgop has granted. Only
+	// these are revoked when they are removed from spec.schemas[].grants.
+	// +optional
+	// +listType=map
+	// +listMapKey=schema
+	// +listMapKey=role
+	// +kubebuilder:validation:MaxItems=2048
+	ManagedSchemaGrants []ManagedSchemaGrant `json:"managedSchemaGrants,omitempty"`
+
+	// revokedPublicPrivileges lists the default PUBLIC privileges pgop has
+	// revoked for spec.publicPrivileges. Only these are granted back to
+	// PUBLIC when spec.publicPrivileges no longer revokes them.
+	// +optional
+	// +listType=set
+	// +kubebuilder:validation:MaxItems=4
+	RevokedPublicPrivileges []PublicPrivilege `json:"revokedPublicPrivileges,omitempty"`
 
 	// managedSettings lists the parameter names pgop has set with ALTER
 	// DATABASE ... SET (normalized to lowercase). Only these are reset when

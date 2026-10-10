@@ -146,12 +146,23 @@ spec:
                       type: array
                     role:
                       description: |-
-                        role is the PostgreSQL name of the role to grant privileges to (a raw
-                        PostgreSQL role name, not a Role resource name). The role must exist;
-                        the grant is retried until it does.
+                        role is the grantee: the PostgreSQL name of a role (a raw PostgreSQL
+                        role name, not a Role resource name), or PUBLIC (upper case) for every
+                        role. A role must be managed by a Role of the same Cluster (created or
+                        adopted by it, recorded in its status) or be listed in the Cluster's
+                        spec.rolePolicy.allowedExistingRoles; superusers, postgres, pgop_* and
+                        predefined pg_* roles are never accepted (reason GranteeNotAllowed). The
+                        role must exist; the grant is retried until it does.
                       maxLength: 63
                       minLength: 1
                       type: string
+                      x-kubernetes-validations:
+                      - message: write the PUBLIC pseudo-role in upper case
+                        rule: self == 'PUBLIC' || self.lowerAscii() != 'public'
+                      - message: role must not be postgres, none, a pgop_* role or
+                          a predefined pg_* role
+                        rule: self != 'postgres' && !self.startsWith('pgop_') && !self.startsWith('pg_')
+                          && self.lowerAscii() != 'none'
                     withGrantOption:
                       description: |-
                         withGrantOption allows the grantee to grant the same privileges to
@@ -161,6 +172,9 @@ spec:
                   - privileges
                   - role
                   type: object
+                  x-kubernetes-validations:
+                  - message: the grant option cannot be granted to PUBLIC
+                    rule: self.role != 'PUBLIC' || !has(self.withGrantOption) || !self.withGrantOption
                 maxItems: 256
                 type: array
                 x-kubernetes-list-map-keys:
@@ -173,13 +187,50 @@ spec:
                   role name (its spec.roleName, or metadata.name when unset).
                   If not specified, the operator superuser will be the owner.
                 type: string
+              publicPrivileges:
+                description: |-
+                  publicPrivileges revokes the privileges PostgreSQL gives the PUBLIC
+                  pseudo-role (every role) by default: CONNECT and TEMPORARY on the
+                  database, and USAGE (and, before PostgreSQL 15, CREATE) on the schema
+                  named public. A field set to false revokes that privilege from PUBLIC;
+                  unset (or true) leaves PostgreSQL's default alone. pgop records what it
+                  revoked in status.revokedPublicPrivileges and grants exactly that back
+                  to PUBLIC once the field is unset or set to true again; a privilege
+                  PUBLIC did not hold is not recorded and never granted. Revoking CONNECT
+                  from PUBLIC locks out every role that has no CONNECT grant of its own
+                  (the owner and superusers keep it): grant it in spec.grants.
+                properties:
+                  connect:
+                    description: 'connect: false revokes CONNECT on the database from
+                      PUBLIC.'
+                    type: boolean
+                  publicSchemaCreate:
+                    description: |-
+                      publicSchemaCreate: false revokes CREATE on the schema public from
+                      PUBLIC (PostgreSQL 15 and later no longer grant it by default).
+                    type: boolean
+                  publicSchemaUsage:
+                    description: |-
+                      publicSchemaUsage: false revokes USAGE on the schema public from
+                      PUBLIC.
+                    type: boolean
+                  temporary:
+                    description: 'temporary: false revokes TEMPORARY on the database
+                      from PUBLIC.'
+                    type: boolean
+                type: object
               schemas:
                 description: schemas lists schemas to create in this database
                 items:
                   description: SchemaSpec defines a schema to create in the database
                   properties:
                     grants:
-                      description: grants lists privileges to grant on this schema
+                      description: |-
+                        grants lists privileges to grant on this schema (GRANT ... ON
+                        SCHEMA). Privileges that pgop granted (tracked in
+                        status.managedSchemaGrants) are revoked once they are removed from the
+                        spec, also when the whole schema entry is removed (the schema itself is
+                        never dropped); privileges granted outside pgop are never revoked.
                       items:
                         description: GrantSpec defines privileges to grant to a role
                         properties:
@@ -195,17 +246,43 @@ spec:
                             minItems: 1
                             type: array
                           role:
-                            description: role is the role to grant privileges to
+                            description: |-
+                              role is the grantee: the PostgreSQL name of a role (a raw PostgreSQL
+                              role name, not a Role resource name), or PUBLIC (upper case) for every
+                              role. A role must be managed by a Role of the same Cluster (created or
+                              adopted by it, recorded in its status) or be listed in the Cluster's
+                              spec.rolePolicy.allowedExistingRoles; superusers, postgres, pgop_* and
+                              predefined pg_* roles are never accepted (reason GranteeNotAllowed). The
+                              role must exist; the grant is retried until it does.
+                            maxLength: 63
+                            minLength: 1
                             type: string
+                            x-kubernetes-validations:
+                            - message: write the PUBLIC pseudo-role in upper case
+                              rule: self == 'PUBLIC' || self.lowerAscii() != 'public'
+                            - message: role must not be postgres, none, a pgop_* role
+                                or a predefined pg_* role
+                              rule: self != 'postgres' && !self.startsWith('pgop_')
+                                && !self.startsWith('pg_') && self.lowerAscii() !=
+                                'none'
                           withGrantOption:
-                            description: withGrantOption allows the grantee to grant
-                              the same privileges to others
+                            description: |-
+                              withGrantOption allows the grantee to grant the same privileges to
+                              others. Turning it off for a grant pgop made revokes the grant option.
                             type: boolean
                         required:
                         - privileges
                         - role
                         type: object
+                        x-kubernetes-validations:
+                        - message: the grant option cannot be granted to PUBLIC
+                          rule: self.role != 'PUBLIC' || !has(self.withGrantOption)
+                            || !self.withGrantOption
+                      maxItems: 16
                       type: array
+                      x-kubernetes-list-map-keys:
+                      - role
+                      x-kubernetes-list-type: map
                     name:
                       description: |-
                         name is the name of the schema. System schemas (pg_catalog,
@@ -227,7 +304,11 @@ spec:
                   required:
                   - name
                   type: object
+                maxItems: 64
                 type: array
+                x-kubernetes-list-map-keys:
+                - name
+                x-kubernetes-list-type: map
               settings:
                 additionalProperties:
                   type: string
@@ -268,6 +349,22 @@ spec:
             - clusterRef
             type: object
             x-kubernetes-validations:
+            - message: grants must not grant PUBLIC a privilege that publicPrivileges
+                revokes
+              rule: '!has(self.publicPrivileges) || !has(self.grants) || !self.grants.exists(g,
+                g.role == ''PUBLIC'' && ((has(self.publicPrivileges.connect) && !self.publicPrivileges.connect
+                && g.privileges.exists(p, p in [''CONNECT'', ''ALL''])) || (has(self.publicPrivileges.temporary)
+                && !self.publicPrivileges.temporary && g.privileges.exists(p, p in
+                [''TEMPORARY'', ''TEMP'', ''ALL'']))))'
+            - message: schemas[public].grants must not grant PUBLIC a privilege that
+                publicPrivileges revokes
+              rule: '!has(self.publicPrivileges) || !has(self.schemas) || !self.schemas.exists(s,
+                s.name == ''public'' && has(s.grants) && s.grants.exists(g, g.role
+                == ''PUBLIC'' && ((has(self.publicPrivileges.publicSchemaUsage) &&
+                !self.publicPrivileges.publicSchemaUsage && g.privileges.exists(p,
+                p.lowerAscii() in [''usage'', ''all'', ''all privileges''])) || (has(self.publicPrivileges.publicSchemaCreate)
+                && !self.publicPrivileges.publicSchemaCreate && g.privileges.exists(p,
+                p.lowerAscii() in [''create'', ''all'', ''all privileges''])))))'
             - message: clusterRef is immutable; create a new Database for another
                 Cluster
               rule: self.clusterRef.name == oldSelf.clusterRef.name
@@ -389,8 +486,47 @@ spec:
                   - privileges
                   - role
                   type: object
+                maxItems: 512
                 type: array
                 x-kubernetes-list-map-keys:
+                - role
+                x-kubernetes-list-type: map
+              managedSchemaGrants:
+                description: |-
+                  managedSchemaGrants lists the schema privileges pgop has granted. Only
+                  these are revoked when they are removed from spec.schemas[].grants.
+                items:
+                  description: ManagedSchemaGrant records schema privileges that pgop
+                    granted to a role.
+                  properties:
+                    privileges:
+                      description: |-
+                        privileges are the granted privileges, normalized (ALL is recorded as
+                        CREATE and USAGE).
+                      items:
+                        type: string
+                      type: array
+                      x-kubernetes-list-type: set
+                    role:
+                      description: 'role is the grantee: a PostgreSQL role, or PUBLIC.'
+                      type: string
+                    schema:
+                      description: schema is the schema the privileges are on.
+                      type: string
+                    withGrantOption:
+                      description: |-
+                        withGrantOption records whether pgop granted the privileges with the
+                        grant option.
+                      type: boolean
+                  required:
+                  - privileges
+                  - role
+                  - schema
+                  type: object
+                maxItems: 2048
+                type: array
+                x-kubernetes-list-map-keys:
+                - schema
                 - role
                 x-kubernetes-list-type: map
               managedSettings:
@@ -405,6 +541,24 @@ spec:
               ready:
                 description: ready indicates if the database has been created
                 type: boolean
+              revokedPublicPrivileges:
+                description: |-
+                  revokedPublicPrivileges lists the default PUBLIC privileges pgop has
+                  revoked for spec.publicPrivileges. Only these are granted back to
+                  PUBLIC when spec.publicPrivileges no longer revokes them.
+                items:
+                  description: |-
+                    PublicPrivilege names a default PUBLIC privilege that
+                    spec.publicPrivileges can revoke (the name of its field there).
+                  enum:
+                  - connect
+                  - temporary
+                  - publicSchemaUsage
+                  - publicSchemaCreate
+                  type: string
+                maxItems: 4
+                type: array
+                x-kubernetes-list-type: set
             type: object
         required:
         - spec

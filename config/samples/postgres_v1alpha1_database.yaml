@@ -10,10 +10,19 @@ spec:
   # owner is the name of a Role resource (not a raw PostgreSQL role name).
   owner: app-user
   # Optional database-level privileges for PostgreSQL roles (CONNECT, CREATE,
-  # TEMPORARY/TEMP, ALL). Removed entries are revoked.
+  # TEMPORARY/TEMP, ALL). Removed entries are revoked. Grantees are PUBLIC,
+  # roles managed by Roles of this Cluster, or roles the Cluster lists in
+  # spec.rolePolicy.allowedExistingRoles (others: GranteeNotAllowed).
   # grants:
   #   - role: app_reader
   #     privileges: [CONNECT]
+  # Optional: revoke PostgreSQL's default PUBLIC privileges (false revokes;
+  # pgop grants back exactly what it revoked once a field is unset). Roles
+  # that should still connect then need their own CONNECT grant.
+  # publicPrivileges:
+  #   connect: false
+  #   temporary: false
+  #   publicSchemaUsage: false
   # Optional per-database parameter defaults (ALTER DATABASE ... SET).
   # Removed keys are reset. Only user-settable and custom parameters are
   # allowed. The YAML single quotes below are only quoting; the value is the
@@ -30,6 +39,8 @@ spec:
   schemas:
     - name: app
       owner: app-user
+      # Schema privileges (USAGE, CREATE, ALL). pgop tracks what it granted
+      # in status.managedSchemaGrants and revokes removed entries.
       grants:
         - role: app-user
           privileges:

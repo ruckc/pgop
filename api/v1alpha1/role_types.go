@@ -304,6 +304,7 @@ type RoleStatus struct {
 	// the spec.
 	// +optional
 	// +listType=set
+	// +kubebuilder:validation:MaxItems=1024
 	ManagedMemberships []string `json:"managedMemberships,omitempty"`
 
 	// managedParameterGrants lists the parameter privileges pgop has granted
@@ -312,6 +313,7 @@ type RoleStatus struct {
 	// +optional
 	// +listType=map
 	// +listMapKey=parameter
+	// +kubebuilder:validation:MaxItems=512
 	ManagedParameterGrants []ManagedParameterGrant `json:"managedParameterGrants,omitempty"`
 
 	// conditions represent the current state of the Role resource.

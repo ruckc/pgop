@@ -10,10 +10,12 @@ The Database controller:
 2. Creates the database with the specified owner
 3. Applies per-database settings (`ALTER DATABASE ... SET`) and resets removed ones
 4. Applies database-level grants (`GRANT ... ON DATABASE`) and revokes removed ones
-5. Installs requested extensions (trusted ones, or those the Cluster's
+5. Revokes PostgreSQL's default `PUBLIC` privileges when asked
+   ([`publicPrivileges`](#default-public-privileges))
+6. Installs requested extensions (trusted ones, or those the Cluster's
    [role policy](clusters.md#role-policy) allows)
-6. Creates schemas with ownership and applies schema grants
-7. Drops the database on deletion
+7. Creates schemas with ownership, applies schema grants and revokes removed ones
+8. Drops the database on deletion
 
 See [Security model](#security-model) for what a Database writer can and
 cannot do.
@@ -63,6 +65,7 @@ spec:
 | `schemas` | []SchemaSpec | - | Schemas to create |
 | `grants` | []DatabaseGrantSpec | - | Database-level privileges (see [Database Grants](#database-grants)) |
 | `settings` | map[string]string | - | Per-database parameter defaults (see [Database Settings](#database-settings)) |
+| `publicPrivileges` | PublicPrivilegesSpec | - | Default `PUBLIC` privileges to revoke (see [Default PUBLIC privileges](#default-public-privileges)) |
 
 ### ExtensionSpec
 
@@ -76,25 +79,36 @@ spec:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `name` | string | **required** | Schema name (not `pg_*` or `information_schema`) |
+| `name` | string | **required** | Schema name (not `pg_*` or `information_schema`; unique, at most 64 schemas) |
 | `owner` | string | - | PostgreSQL role name that owns the schema |
-| `grants` | []GrantSpec | - | Privileges to grant |
+| `grants` | []GrantSpec | - | Schema privileges to grant (at most 16; see [Schema Grants](#schema-grants)) |
 
 ### GrantSpec
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `role` | string | PostgreSQL role name to grant privileges to |
+| `role` | string | Grantee: a PostgreSQL role name or `PUBLIC` (unique within the schema's `grants`; see [Grantee policy](#grantee-policy)) |
 | `privileges` | []string | Schema privileges: `USAGE`, `CREATE` or `ALL` |
-| `withGrantOption` | bool | Allow the grantee to grant the privileges to others |
+| `withGrantOption` | bool | Allow the grantee to grant the privileges to others (not for `PUBLIC`) |
 
 ### DatabaseGrantSpec
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `role` | string | PostgreSQL role name to grant privileges to (unique within `grants`) |
+| `role` | string | Grantee: a PostgreSQL role name or `PUBLIC` (unique within `grants`; see [Grantee policy](#grantee-policy)) |
 | `privileges` | []string | Database privileges: `CONNECT`, `CREATE`, `TEMPORARY` (or `TEMP`), or `ALL` |
-| `withGrantOption` | bool | Allow the grantee to grant the privileges to others |
+| `withGrantOption` | bool | Allow the grantee to grant the privileges to others (not for `PUBLIC`) |
+
+### PublicPrivilegesSpec
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `connect` | bool | `false` revokes `CONNECT` on the database from `PUBLIC` |
+| `temporary` | bool | `false` revokes `TEMPORARY` on the database from `PUBLIC` |
+| `publicSchemaUsage` | bool | `false` revokes `USAGE` on the schema `public` from `PUBLIC` |
+| `publicSchemaCreate` | bool | `false` revokes `CREATE` on the schema `public` from `PUBLIC` (a default only before PostgreSQL 15) |
+
+Unset or `true` leaves PostgreSQL's default alone (and restores what pgop revoked).
 
 ## Status
 
@@ -105,6 +119,8 @@ spec:
 | `installedExtensions` | List of installed extensions |
 | `createdSchemas` | List of created schemas |
 | `managedGrants` | Database privileges pgop granted (revoked when removed from `grants`) |
+| `managedSchemaGrants` | Schema privileges pgop granted (revoked when removed from `schemas[].grants`) |
+| `revokedPublicPrivileges` | Default `PUBLIC` privileges pgop revoked (granted back when no longer requested) |
 | `managedSettings` | Parameter names pgop set (reset when removed from `settings`) |
 | `conditions` | Detailed status conditions |
 
@@ -177,8 +193,9 @@ spec:
 ## Grants and DDL
 
 - `schemas[].grants` grant **schema-level** privileges (`USAGE`, `CREATE`,
-  `ALL`/`ALL PRIVILEGES`, in any letter case) via `GRANT ... ON SCHEMA`. Table
-  privileges such as `SELECT` are not schema privileges and are rejected.
+  `ALL`/`ALL PRIVILEGES`, in any letter case) via `GRANT ... ON SCHEMA`; see
+  [Schema Grants](#schema-grants). Table privileges such as `SELECT` are not
+  schema privileges and are rejected.
 - `grants` grant **database-level** privileges (`CONNECT`, `CREATE`,
   `TEMPORARY`) via `GRANT ... ON DATABASE`; see
   [Database Grants](#database-grants).
@@ -218,12 +235,14 @@ spec:
   alias of `TEMPORARY`) or `ALL` (all three), in upper case. Anything else is
   rejected by the API server, and again by the operator before any SQL is
   built.
-- Each `role` may appear once. The role must exist; until it does, the Database
+- Each `role` may appear once. It is a role the [grantee policy](#grantee-policy)
+  allows, or `PUBLIC`. The role must exist; until it does, the Database
   reports `Available=False` with a message naming the missing role and retries
   (it also reconciles as soon as a Role resource with that PostgreSQL name
-  changes). A missing grantee or a refused setting does not hold up the rest
-  of the Database: extensions, schemas and the credentials Secret are still
-  reconciled, and the Database stays not ready until the problem is fixed.
+  changes). A missing or refused grantee, or a refused setting, does not hold
+  up the rest of the Database: the other grants, extensions, schemas and the
+  credentials Secret are still reconciled, and the Database stays not ready
+  until the problem is fixed.
 - Grants are re-applied on every reconcile, so privileges revoked by hand are
   restored.
 - pgop records what it granted in `status.managedGrants`. When a role is removed
@@ -235,13 +254,148 @@ spec:
   (otherwise PostgreSQL refuses with "dependent privileges exist").
 - PostgreSQL grants `CONNECT` and `TEMPORARY` on every new database to `PUBLIC`
   by default, so revoking `CONNECT` from a role does not stop it connecting
-  unless `PUBLIC`'s privilege is revoked as well (not managed by pgop).
+  unless `PUBLIC`'s privilege is revoked as well: see
+  [Default PUBLIC privileges](#default-public-privileges).
 - Deleting the grantee's Role works while a Database still grants to it: the
   Database stops granting to a Role that is being deleted (reported as
   "paused" in its condition), and the Role controller revokes the role's
   database and schema privileges before dropping it (see
   [Roles: deletion](roles.md#deletion)). Remove the entry from `grants`
   afterwards, or the Database reports the missing role.
+
+## Schema Grants
+
+`schemas[].grants` grants schema privileges (`GRANT ... ON SCHEMA`) once the
+schema exists:
+
+```yaml
+spec:
+  schemas:
+    - name: app
+      owner: app-owner
+      grants:
+        - role: app_reader        # raw PostgreSQL role name
+          privileges: [USAGE]
+        - role: app_migrator
+          privileges: [USAGE, CREATE]
+          withGrantOption: true
+```
+
+They follow the same rules as [database grants](#database-grants):
+
+- grants are re-applied on every reconcile, so privileges revoked by hand are
+  restored;
+- pgop records what it granted in `status.managedSchemaGrants` and, when a
+  grant, a privilege or a whole schema entry is removed, **revokes exactly what
+  it had granted** (the schema itself is never dropped). Turning
+  `withGrantOption` off revokes the grant option; privileges granted with the
+  grant option are revoked with `CASCADE`. Schema privileges granted outside
+  pgop are never revoked;
+- a grant on a schema that was dropped, or to a role that was dropped, is
+  forgotten without a statement (nothing is left to revoke);
+- grantees follow the [grantee policy](#grantee-policy), and grants to a Role
+  being deleted are paused.
+
+The first reconcile of a Database without `status.managedSchemaGrants` (for
+example after upgrading pgop) records the declared grants without revoking
+anything. If the status is lost (the Database is re-created, or restored
+without status), grants removed in the meantime are not revoked. A grant that
+already existed and is declared becomes managed: removing it from the spec
+revokes it.
+
+## Grantee policy
+
+pgop grants as a superuser, so the grantee of every entry in `grants` and
+`schemas[].grants` must be one of:
+
+- `PUBLIC` (see below);
+- a role managed by a Role of the same Cluster: the Role created or adopted it
+  (its `status.roleName` and `status.clusterUID` record it) and the role
+  carries that Role's signed ownership marker; or
+- a role a Cluster editor lists in the Cluster's
+  [`spec.rolePolicy.allowedExistingRoles`](clusters.md#role-policy) (roles a
+  DBA or a bootstrap Job created).
+
+Superusers (also when allowlisted), `postgres`, `none`, the operator's `pgop_*`
+roles and predefined `pg_*` roles are never accepted. The API server rejects
+the reserved names; the operator checks the rest on every reconcile. A grant
+to a grantee that is not allowed is not applied, is **revoked if pgop granted
+it earlier** (for example before the Cluster's policy changed), and is
+reported with reason `GranteeNotAllowed`; the other grants are still applied.
+A Role that is created later is picked up as soon as it is recorded (the
+Database reconciles when the Role changes).
+
+### PUBLIC
+
+`role: PUBLIC` grants to the `PUBLIC` pseudo-role, that is, to every role,
+including roles created later. Write it in upper case. pgop always emits the
+bare keyword `PUBLIC`, never a quoted identifier: PostgreSQL reads both
+`PUBLIC` and `"public"` as the pseudo-role, while `"PUBLIC"` (quoted, upper
+case) would be an ordinary role of that name. A role literally named `PUBLIC`
+can therefore never be a grantee. `withGrantOption` cannot be set for
+`PUBLIC` (PostgreSQL does not allow it).
+
+!!! warning
+    `CREATE` on a schema for `PUBLIC` lets every role create objects there,
+    which can shadow objects for other roles whose `search_path` includes the
+    schema. The operator's own sessions pin `search_path` and are not
+    affected.
+
+## Default PUBLIC privileges
+
+PostgreSQL gives `PUBLIC` `CONNECT` and `TEMPORARY` on every new database and
+`USAGE` on the schema `public` (and, before PostgreSQL 15, `CREATE` on it).
+`spec.publicPrivileges` revokes them:
+
+```yaml
+spec:
+  publicPrivileges:
+    connect: false            # REVOKE CONNECT ON DATABASE ... FROM PUBLIC
+    temporary: false          # REVOKE TEMPORARY ON DATABASE ... FROM PUBLIC
+    publicSchemaUsage: false  # REVOKE USAGE ON SCHEMA public FROM PUBLIC
+    publicSchemaCreate: false # REVOKE CREATE ON SCHEMA public FROM PUBLIC
+  grants:
+    - role: app_user          # roles that should still connect need their own grant
+      privileges: [CONNECT]
+```
+
+- `false` revokes the privilege from `PUBLIC`; unset or `true` leaves
+  PostgreSQL's default alone.
+- pgop revokes a privilege, and records it in `status.revokedPublicPrivileges`,
+  only while `PUBLIC` actually holds it. The check runs on every reconcile, so
+  a privilege granted back to `PUBLIC` by hand is revoked again.
+- When a field is unset or set back to `true`, pgop grants **exactly what it
+  revoked** back to `PUBLIC`, and nothing it did not revoke (for example
+  `CREATE` on `public`, which PostgreSQL 15 and later do not grant).
+- A `PUBLIC` entry in `grants` (or in `grants` of the schema `public`) that
+  grants the same privilege is rejected by the API server; the operator
+  leaves such a privilege alone and reports `PublicPrivilegeConflict`.
+- If the schema `public` does not exist, the `publicSchema*` fields do nothing.
+
+!!! warning "Locking roles out"
+    With `connect: false`, only the database owner, superusers and roles with
+    their own `CONNECT` grant can connect. Grant `CONNECT` in `grants` to every
+    other role that needs the database.
+
+## How two resources interact
+
+Every privilege pgop tracks belongs to exactly one resource: database and
+schema grants are on the Database's own PostgreSQL database, which no other
+Database manages (a second Database with the same PostgreSQL name reports
+`DuplicateDatabaseName` and does nothing), and a Role's parameter grants and
+memberships are for its own role (`DuplicateRoleName` likewise). So two
+resources never track the same privilege, and removing a grant from one
+resource never revokes a privilege another resource declares: two Databases
+that both grant `CONNECT` to `app_reader` each grant it on their own
+database, and removing it from one leaves the other alone.
+
+Should two resources ever declare the same privilege, "grant wins": every
+resource re-grants what it declares on every reconcile, so a privilege
+revoked by one is restored by the next reconcile of the other. Privileges
+granted outside pgop that are also declared become managed by the declaring
+resource (see above). Deleting a Role revokes the privileges its role holds on
+every database and schema, whatever Database granted them; the Databases stop
+granting to it while it is being deleted.
 
 ## Database Settings
 
@@ -423,9 +577,15 @@ The policy for untrusted extensions lives on the Cluster, so allowing them
 needs RBAC to edit the Cluster, separately from RBAC to create Databases. See
 [Roles: security model](roles.md#security-model) for the overall picture.
 
-Known gap: `schemas[].owner` and `grants[].role` accept any PostgreSQL role
-name on the Cluster (giving ownership or privileges away is not an
-escalation for the writer).
+- grantees (`grants[].role`, `schemas[].grants[].role`) are limited to
+  `PUBLIC`, roles managed by Roles of the same Cluster and roles a Cluster
+  editor allowlisted (see [Grantee policy](#grantee-policy));
+- grants only ever name objects of the Database's own PostgreSQL database
+  (its own schemas): there is no field that names another database or
+  Cluster.
+
+Known gap: `schemas[].owner` accepts any PostgreSQL role name on the Cluster
+(giving ownership away is not an escalation for the writer).
 
 ### Ownership of the PostgreSQL database
 
@@ -477,6 +637,22 @@ Database never drops it. A database's comment never authorizes a take-over
   databases an earlier pgop created and recorded in status keep working and
   are marked automatically.
 - `lo_compat_privileges` is refused in `settings`.
+- **Schema grants are tracked and revoked.** `schemas[].grants` entries
+  pgop granted are now revoked when they are removed (see
+  [Schema Grants](#schema-grants)). There is no opt-out. The first reconcile
+  after upgrading records the declared schema grants without revoking
+  anything, so a schema grant removed from the spec *before* the upgrade stays
+  in place; revoke it by hand if needed.
+- **Grantees are checked** (see [Grantee policy](#grantee-policy)): a grant
+  to a role that no Role of the Cluster manages (and that the Cluster's
+  `rolePolicy.allowedExistingRoles` does not list), to a superuser, or to
+  `postgres`, `pgop_*` or `pg_*` roles is refused with `GranteeNotAllowed`,
+  and **revoked** if pgop granted it before. `postgres`, `none`, `pgop_*` and
+  `pg_*` grantees, a lower-case `public` and grantee names longer than 63
+  characters are rejected by the API server.
+- `PUBLIC` must be written in upper case and cannot get `withGrantOption`.
+- `schemas` names must be unique (at most 64 schemas) and each schema's
+  `grants` lists a role at most once (at most 16 grants).
 
 ## Schema with Grants
 
@@ -493,8 +669,8 @@ schemas:
 ```
 
 `USAGE` lets the role look up objects in the schema. Table privileges such as
-`SELECT` are not schema privileges and are not managed by pgop; grant them in
-your migrations (for example with `ALTER DEFAULT PRIVILEGES`).
+`SELECT` are not schema privileges and are not managed by pgop yet; grant them
+in your migrations (for example with `ALTER DEFAULT PRIVILEGES`).
 
 ## Multi-Schema Application
 

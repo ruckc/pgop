@@ -32,9 +32,8 @@ import (
 // server.
 type parameterGrantClient interface {
 	ServerVersionNum(ctx context.Context) (int, error)
+	privilegeExecutor
 	RoleExists(ctx context.Context, name string) (bool, error)
-	GrantParameterPrivileges(ctx context.Context, parameter, role string, privileges []string, withGrantOption bool) error
-	RevokeParameterPrivileges(ctx context.Context, parameter, role string, privileges []string, mode postgres.RevokeMode) error
 	ParameterContext(ctx context.Context, name string) (pgContext string, found bool, err error)
 }
 
@@ -59,12 +58,12 @@ const (
 func filterParameterContexts(ctx context.Context, pg parameterGrantClient, desired []privilegeGrant) (allowed []privilegeGrant, refused []string, err error) {
 	allowed = desired[:0:0]
 	for _, g := range desired {
-		pgContext, found, err := pg.ParameterContext(ctx, g.Key)
+		pgContext, found, err := pg.ParameterContext(ctx, g.Target.Name)
 		if err != nil {
 			return nil, nil, err
 		}
 		if found && !slices.Contains(grantableParameterContexts, pgContext) {
-			refused = append(refused, fmt.Sprintf("%s (context %q)", g.Key, pgContext))
+			refused = append(refused, fmt.Sprintf("%s (context %q)", g.Target.Name, pgContext))
 			continue
 		}
 		allowed = append(allowed, g)
@@ -74,11 +73,16 @@ func filterParameterContexts(ctx context.Context, pg parameterGrantClient, desir
 
 var _ parameterGrantClient = (*postgres.Client)(nil)
 
+// parameterTarget is the ledger target of a parameter grant to member.
+func parameterTarget(parameter, member string) grantTarget {
+	return grantTarget{Kind: postgres.ObjectParameter, Name: parameter, Grantee: member}
+}
+
 // desiredParameterGrants converts spec.parameterGrants to canonical privilege
-// grants keyed by the lowercased parameter name. Parameters on pgop's
+// grants to member, one per lowercased parameter name. Parameters on pgop's
 // denylist (see postgres.DeniedParameter) are left out and returned in
 // denied.
-func desiredParameterGrants(grants []postgresv1alpha1.ParameterGrantSpec) (out []privilegeGrant, denied []string, err error) {
+func desiredParameterGrants(grants []postgresv1alpha1.ParameterGrantSpec, member string) (out []privilegeGrant, denied []string, err error) {
 	out = make([]privilegeGrant, 0, len(grants))
 	seen := make(map[string]bool, len(grants))
 	for _, g := range grants {
@@ -98,15 +102,15 @@ func desiredParameterGrants(grants []postgresv1alpha1.ParameterGrantSpec) (out [
 		if err != nil {
 			return nil, nil, fmt.Errorf("parameterGrants[%s]: %w", name, err)
 		}
-		out = append(out, privilegeGrant{Key: name, Privileges: privs, WithGrantOption: g.WithGrantOption})
+		out = append(out, privilegeGrant{Target: parameterTarget(name, member), Privileges: privs, WithGrantOption: g.WithGrantOption})
 	}
 	return out, denied, nil
 }
 
-func managedParameterGrants(role *postgresv1alpha1.Role) []privilegeGrant {
+func managedParameterGrants(role *postgresv1alpha1.Role, member string) []privilegeGrant {
 	out := make([]privilegeGrant, 0, len(role.Status.ManagedParameterGrants))
 	for _, m := range role.Status.ManagedParameterGrants {
-		out = append(out, privilegeGrant{Key: m.Parameter, Privileges: m.Privileges, WithGrantOption: m.WithGrantOption})
+		out = append(out, privilegeGrant{Target: parameterTarget(m.Parameter, member), Privileges: m.Privileges, WithGrantOption: m.WithGrantOption})
 	}
 	return out
 }
@@ -115,7 +119,7 @@ func recordParameterGrants(role *postgresv1alpha1.Role, grants []privilegeGrant)
 	role.Status.ManagedParameterGrants = nil
 	for _, g := range grants {
 		role.Status.ManagedParameterGrants = append(role.Status.ManagedParameterGrants, postgresv1alpha1.ManagedParameterGrant{
-			Parameter: g.Key, Privileges: g.Privileges, WithGrantOption: g.WithGrantOption,
+			Parameter: g.Target.Name, Privileges: g.Privileges, WithGrantOption: g.WithGrantOption,
 		})
 	}
 }
@@ -128,7 +132,7 @@ func recordParameterGrants(role *postgresv1alpha1.Role, grants []privilegeGrant)
 // UnsupportedServerVersion. Denylisted parameters are not granted (a managed
 // grant on one is revoked) and are reported with reason ParameterNotAllowed.
 func reconcileParameterGrants(ctx context.Context, pg parameterGrantClient, role *postgresv1alpha1.Role, member string) error {
-	desired, denied, err := desiredParameterGrants(role.Spec.ParameterGrants)
+	desired, denied, err := desiredParameterGrants(role.Spec.ParameterGrants, member)
 	if err != nil {
 		return err
 	}
@@ -138,7 +142,7 @@ func reconcileParameterGrants(ctx context.Context, pg parameterGrantClient, role
 			"parameterGrants not allowed (they switch identity, load code or bypass safeguards): %s",
 			strings.Join(denied, ", "))}
 	}
-	managed := managedParameterGrants(role)
+	managed := managedParameterGrants(role, member)
 	if len(desired) == 0 && len(managed) == 0 {
 		return deniedErr
 	}
@@ -167,7 +171,7 @@ func reconcileParameterGrants(ctx context.Context, pg parameterGrantClient, role
 			strings.Join(refused, ", "))})
 	}
 
-	after, err := applyPrivilegeGrants(ctx, desired, managed, parameterOps(pg, member))
+	after, err := applyPrivilegeGrants(ctx, desired, managed, executorOps(pg, nil))
 	recordParameterGrants(role, after)
 	if err != nil {
 		return err
@@ -175,22 +179,11 @@ func reconcileParameterGrants(ctx context.Context, pg parameterGrantClient, role
 	return deniedErr
 }
 
-func parameterOps(pg parameterGrantClient, member string) privilegeOps {
-	return privilegeOps{
-		grant: func(ctx context.Context, g privilegeGrant) error {
-			return pg.GrantParameterPrivileges(ctx, g.Key, member, g.Privileges, g.WithGrantOption)
-		},
-		revoke: func(ctx context.Context, g privilegeGrant, mode postgres.RevokeMode) error {
-			return pg.RevokeParameterPrivileges(ctx, g.Key, member, g.Privileges, mode)
-		},
-	}
-}
-
 // revokeManagedParameterGrants revokes every parameter privilege pgop granted
 // to member, before the role is dropped: DROP ROLE fails while the role holds
 // privileges on parameters.
 func revokeManagedParameterGrants(ctx context.Context, pg parameterGrantClient, role *postgresv1alpha1.Role, member string) error {
-	managed := managedParameterGrants(role)
+	managed := managedParameterGrants(role, member)
 	if len(managed) == 0 {
 		return nil
 	}
@@ -198,7 +191,7 @@ func revokeManagedParameterGrants(ctx context.Context, pg parameterGrantClient, 
 	if err != nil || !exists {
 		return err
 	}
-	after, err := applyPrivilegeGrants(ctx, nil, managed, parameterOps(pg, member))
+	after, err := applyPrivilegeGrants(ctx, nil, managed, executorOps(pg, nil))
 	recordParameterGrants(role, after)
 	return err
 }

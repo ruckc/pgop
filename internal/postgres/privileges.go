@@ -35,6 +35,9 @@ const (
 	PrivilegeTemp      = "TEMP"
 	PrivilegeUsage     = "USAGE"
 	PrivilegeSet       = "SET"
+
+	// privilegeAllPrivileges is the long form of ALL.
+	privilegeAllPrivileges = "ALL PRIVILEGES"
 )
 
 // paramSearchPath is the search_path parameter, a list parameter.
@@ -77,7 +80,7 @@ func checkPrivileges(kind string, privs, allowed []string) ([]string, error) {
 	out := make([]string, 0, len(privs))
 	for _, p := range privs {
 		u := strings.ToUpper(strings.Join(strings.Fields(p), " "))
-		if u == "ALL PRIVILEGES" {
+		if u == privilegeAllPrivileges {
 			u = PrivilegeAll
 		}
 		if !slices.Contains(allowed, u) {
@@ -109,6 +112,26 @@ func NormalizeDatabasePrivileges(privs []string) ([]string, error) {
 		default:
 			out = append(out, p)
 		}
+	}
+	slices.Sort(out)
+	return slices.Compact(out), nil
+}
+
+// NormalizeSchemaPrivileges validates schema privileges and returns them in
+// canonical form: sorted, without duplicates and ALL expanded to CREATE and
+// USAGE (the privileges ALL covers on a schema).
+func NormalizeSchemaPrivileges(privs []string) ([]string, error) {
+	checked, err := checkPrivileges("schema", privs, schemaPrivileges)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, p := range checked {
+		if p == PrivilegeAll {
+			out = append(out, PrivilegeCreate, PrivilegeUsage)
+			continue
+		}
+		out = append(out, p)
 	}
 	slices.Sort(out)
 	return slices.Compact(out), nil
@@ -152,10 +175,121 @@ func quoteParameterName(name string) (string, error) {
 	return strings.Join(parts, "."), nil
 }
 
-// buildGrantQuery builds GRANT <privs> ON <object> TO <role>. object must
-// already be quoted; privs must already be checked against an allow-list.
-func buildGrantQuery(privs []string, object, role string, withGrantOption bool) string {
-	query := fmt.Sprintf("GRANT %s ON %s TO %s", strings.Join(privs, ", "), object, quoteIdent(role))
+// ObjectKind is the kind of object privileges are granted on. Each kind has
+// a fixed privilege allow-list and renders its object name itself, so a new
+// kind (tables, functions, ...) plugs into the same GRANT/REVOKE builders.
+type ObjectKind string
+
+// Object kinds supported by GrantPrivileges and RevokePrivileges.
+const (
+	ObjectDatabase  ObjectKind = "DATABASE"
+	ObjectSchema    ObjectKind = "SCHEMA"
+	ObjectParameter ObjectKind = "PARAMETER"
+)
+
+// objectKind describes how privileges on one kind of object are granted.
+type objectKind struct {
+	// label names the kind in errors ("database privilege").
+	label string
+	// privileges is the allow-list of privilege keywords.
+	privileges []string
+	// render returns the object as it appears after ON, quoted.
+	render func(name string) (string, error)
+}
+
+// quotedName renders an object whose name is a single identifier.
+func quotedName(keyword string) func(string) (string, error) {
+	return func(name string) (string, error) {
+		if name == "" {
+			return "", errors.New("empty object name")
+		}
+		return keyword + " " + quoteIdent(name), nil
+	}
+}
+
+var objectKinds = map[ObjectKind]objectKind{
+	ObjectDatabase: {label: "database", privileges: databasePrivileges, render: quotedName("DATABASE")},
+	ObjectSchema:   {label: "schema", privileges: schemaPrivileges, render: quotedName("SCHEMA")},
+	ObjectParameter: {label: "parameter", privileges: parameterPrivileges, render: func(name string) (string, error) {
+		quoted, err := quoteParameterName(name)
+		if err != nil {
+			return "", err
+		}
+		return "PARAMETER " + quoted, nil
+	}},
+}
+
+// PrivilegeObject is an object privileges are granted on.
+type PrivilegeObject struct {
+	Kind ObjectKind
+	// Name is the database, schema or parameter name (unquoted).
+	Name string
+}
+
+func (o PrivilegeObject) String() string {
+	if k, ok := objectKinds[o.Kind]; ok {
+		return fmt.Sprintf("%s %q", k.label, o.Name)
+	}
+	return fmt.Sprintf("%s %q", o.Kind, o.Name)
+}
+
+// render checks privs against the kind's allow-list and renders the object.
+func (o PrivilegeObject) render(privs []string) (checked []string, object string, err error) {
+	k, ok := objectKinds[o.Kind]
+	if !ok {
+		return nil, "", fmt.Errorf("unsupported object kind %q", o.Kind)
+	}
+	if checked, err = checkPrivileges(k.label, privs, k.privileges); err != nil {
+		return nil, "", err
+	}
+	if object, err = k.render(o.Name); err != nil {
+		return nil, "", err
+	}
+	return checked, object, nil
+}
+
+// PublicGrantee is the PUBLIC pseudo-role: every role, present and future.
+const PublicGrantee = "PUBLIC"
+
+// IsPublic reports whether grantee names the PUBLIC pseudo-role. PostgreSQL
+// reads both the keyword PUBLIC and the quoted identifier "public" as the
+// pseudo-role (no role can be named public), so every letter case of public
+// is treated as PUBLIC: a role literally named "PUBLIC" can never be a
+// grantee.
+func IsPublic(grantee string) bool {
+	return strings.EqualFold(grantee, PublicGrantee)
+}
+
+// CanonicalGrantee returns PUBLIC for every spelling of public and grantee
+// unchanged otherwise.
+func CanonicalGrantee(grantee string) string {
+	if IsPublic(grantee) {
+		return PublicGrantee
+	}
+	return grantee
+}
+
+// renderGrantee renders the grantee of a GRANT or REVOKE: the bare keyword
+// PUBLIC for the pseudo-role (a quoted "PUBLIC" would name an ordinary role
+// called PUBLIC), otherwise a quoted identifier. The reserved role name none
+// is refused.
+func renderGrantee(grantee string) (string, error) {
+	switch {
+	case grantee == "":
+		return "", errors.New("empty grantee")
+	case IsPublic(grantee):
+		return PublicGrantee, nil
+	case strings.EqualFold(grantee, "none"):
+		return "", fmt.Errorf("invalid grantee %q: the role name none is reserved", grantee)
+	}
+	return quoteIdent(grantee), nil
+}
+
+// buildGrantQuery builds GRANT <privs> ON <object> TO <grantee>. object and
+// grantee must already be rendered; privs must already be checked against an
+// allow-list.
+func buildGrantQuery(privs []string, object, grantee string, withGrantOption bool) string {
+	query := fmt.Sprintf("GRANT %s ON %s TO %s", strings.Join(privs, ", "), object, grantee)
 	if withGrantOption {
 		query += " WITH GRANT OPTION"
 	}
@@ -173,119 +307,134 @@ type RevokeMode struct {
 }
 
 // buildRevokeQuery builds REVOKE [GRANT OPTION FOR] <privs> ON <object> FROM
-// <role> [CASCADE]. object must already be quoted; privs must already be
-// checked.
-func buildRevokeQuery(privs []string, object, role string, mode RevokeMode) string {
+// <grantee> [CASCADE]. object and grantee must already be rendered; privs
+// must already be checked.
+func buildRevokeQuery(privs []string, object, grantee string, mode RevokeMode) string {
 	prefix := "REVOKE "
 	if mode.GrantOptionOnly {
 		prefix += "GRANT OPTION FOR "
 	}
-	query := fmt.Sprintf("%s%s ON %s FROM %s", prefix, strings.Join(privs, ", "), object, quoteIdent(role))
+	query := fmt.Sprintf("%s%s ON %s FROM %s", prefix, strings.Join(privs, ", "), object, grantee)
 	if mode.Cascade {
 		query += " CASCADE"
 	}
 	return query
 }
 
-func buildGrantSchemaPrivilegesQuery(schema, role string, privileges []string, withGrantOption bool) (string, error) {
-	privs, err := checkPrivileges("schema", privileges, schemaPrivileges)
+// buildGrantPrivilegesQuery builds the GRANT of privileges on obj to grantee
+// (a role name or PUBLIC). Privileges are checked against the object kind's
+// allow-list, names are quoted, and the grant option cannot be given to
+// PUBLIC.
+func buildGrantPrivilegesQuery(obj PrivilegeObject, grantee string, privileges []string, withGrantOption bool) (string, error) {
+	privs, object, err := obj.render(privileges)
 	if err != nil {
 		return "", err
 	}
-	return buildGrantQuery(privs, "SCHEMA "+quoteIdent(schema), role, withGrantOption), nil
+	to, err := renderGrantee(grantee)
+	if err != nil {
+		return "", err
+	}
+	if withGrantOption && to == PublicGrantee {
+		return "", errors.New("the grant option cannot be granted to PUBLIC")
+	}
+	return buildGrantQuery(privs, object, to, withGrantOption), nil
 }
 
-func buildGrantDatabasePrivilegesQuery(database, role string, privileges []string, withGrantOption bool) (string, error) {
-	privs, err := checkPrivileges("database", privileges, databasePrivileges)
+// buildRevokePrivilegesQuery builds the REVOKE of privileges (or, with
+// mode.GrantOptionOnly, of their grant option) on obj from grantee.
+func buildRevokePrivilegesQuery(obj PrivilegeObject, grantee string, privileges []string, mode RevokeMode) (string, error) {
+	privs, object, err := obj.render(privileges)
 	if err != nil {
 		return "", err
 	}
-	return buildGrantQuery(privs, "DATABASE "+quoteIdent(database), role, withGrantOption), nil
+	from, err := renderGrantee(grantee)
+	if err != nil {
+		return "", err
+	}
+	return buildRevokeQuery(privs, object, from, mode), nil
 }
 
-func buildRevokeDatabasePrivilegesQuery(database, role string, privileges []string, mode RevokeMode) (string, error) {
-	privs, err := checkPrivileges("database", privileges, databasePrivileges)
-	if err != nil {
-		return "", err
-	}
-	return buildRevokeQuery(privs, "DATABASE "+quoteIdent(database), role, mode), nil
-}
-
-func buildGrantParameterQuery(parameter, role string, privileges []string, withGrantOption bool) (string, error) {
-	privs, err := checkPrivileges("parameter", privileges, parameterPrivileges)
-	if err != nil {
-		return "", err
-	}
-	name, err := quoteParameterName(parameter)
-	if err != nil {
-		return "", err
-	}
-	return buildGrantQuery(privs, "PARAMETER "+name, role, withGrantOption), nil
-}
-
-func buildRevokeParameterQuery(parameter, role string, privileges []string, mode RevokeMode) (string, error) {
-	privs, err := checkPrivileges("parameter", privileges, parameterPrivileges)
-	if err != nil {
-		return "", err
-	}
-	name, err := quoteParameterName(parameter)
-	if err != nil {
-		return "", err
-	}
-	return buildRevokeQuery(privs, "PARAMETER "+name, role, mode), nil
-}
-
-// GrantDatabasePrivileges grants database-level privileges on database to
-// role. The privileges are checked against the database allow-list.
-func (c *Client) GrantDatabasePrivileges(ctx context.Context, database, role string, privileges []string, withGrantOption bool) error {
-	query, err := buildGrantDatabasePrivilegesQuery(database, role, privileges, withGrantOption)
+// GrantPrivileges grants privileges on obj to grantee (a role name, or
+// PUBLIC in any letter case). The privileges are checked against the object
+// kind's allow-list before any SQL is built.
+func (c *Client) GrantPrivileges(ctx context.Context, obj PrivilegeObject, grantee string, privileges []string, withGrantOption bool) error {
+	query, err := buildGrantPrivilegesQuery(obj, grantee, privileges, withGrantOption)
 	if err != nil {
 		return err
 	}
 	if _, err := c.db.ExecContext(ctx, query); err != nil {
-		return fmt.Errorf("failed to grant privileges on database %q to %q: %w", database, role, err)
+		return fmt.Errorf("failed to grant privileges on %s to %q: %w", obj, grantee, err)
 	}
 	return nil
 }
 
-// RevokeDatabasePrivileges revokes database-level privileges (or, with
-// mode.GrantOptionOnly, only their grant option) on database from role.
-func (c *Client) RevokeDatabasePrivileges(ctx context.Context, database, role string, privileges []string, mode RevokeMode) error {
-	query, err := buildRevokeDatabasePrivilegesQuery(database, role, privileges, mode)
+// RevokePrivileges revokes privileges (or, with mode.GrantOptionOnly, only
+// their grant option) on obj from grantee.
+func (c *Client) RevokePrivileges(ctx context.Context, obj PrivilegeObject, grantee string, privileges []string, mode RevokeMode) error {
+	query, err := buildRevokePrivilegesQuery(obj, grantee, privileges, mode)
 	if err != nil {
 		return err
 	}
 	if _, err := c.db.ExecContext(ctx, query); err != nil {
-		return fmt.Errorf("failed to revoke privileges on database %q from %q: %w", database, role, err)
+		return fmt.Errorf("failed to revoke privileges on %s from %q: %w", obj, grantee, err)
 	}
 	return nil
 }
 
-// GrantParameterPrivileges grants privileges on a configuration parameter
-// to role (PostgreSQL 15+).
-func (c *Client) GrantParameterPrivileges(ctx context.Context, parameter, role string, privileges []string, withGrantOption bool) error {
-	query, err := buildGrantParameterQuery(parameter, role, privileges, withGrantOption)
-	if err != nil {
-		return err
-	}
-	if _, err := c.db.ExecContext(ctx, query); err != nil {
-		return fmt.Errorf("failed to grant privileges on parameter %q to %q: %w", parameter, role, err)
-	}
-	return nil
+// publicPrivilegesQueries list the privileges PUBLIC holds on a database or
+// schema: the entries for grantee 0 in its ACL, or in the default ACL when
+// the ACL is NULL (PostgreSQL's built-in defaults). A missing object yields
+// no row; an object PUBLIC holds nothing on yields one row with a NULL
+// privilege. The schema query reads the catalog of the database the client
+// is connected to.
+var publicPrivilegesQueries = map[ObjectKind]string{
+	ObjectDatabase: `SELECT a.privilege_type FROM pg_catalog.pg_database d
+LEFT JOIN LATERAL pg_catalog.aclexplode(COALESCE(d.datacl, pg_catalog.acldefault('d', d.datdba))) a ON a.grantee = 0
+WHERE d.datname = $1`,
+	ObjectSchema: `SELECT a.privilege_type FROM pg_catalog.pg_namespace n
+LEFT JOIN LATERAL pg_catalog.aclexplode(COALESCE(n.nspacl, pg_catalog.acldefault('n', n.nspowner))) a ON a.grantee = 0
+WHERE n.nspname = $1`,
 }
 
-// RevokeParameterPrivileges revokes privileges (or, with
-// mode.GrantOptionOnly, only their grant option) on a configuration parameter
-// from role.
-func (c *Client) RevokeParameterPrivileges(ctx context.Context, parameter, role string, privileges []string, mode RevokeMode) error {
-	query, err := buildRevokeParameterQuery(parameter, role, privileges, mode)
+// PublicPrivileges returns the privileges PUBLIC holds on obj (a database,
+// or a schema of the connected database), sorted. found is false when the
+// object does not exist.
+func (c *Client) PublicPrivileges(ctx context.Context, obj PrivilegeObject) (privileges []string, found bool, err error) {
+	query, ok := publicPrivilegesQueries[obj.Kind]
+	if !ok {
+		return nil, false, fmt.Errorf("unsupported object kind %q", obj.Kind)
+	}
+	rows, err := c.db.QueryContext(ctx, query, obj.Name)
 	if err != nil {
-		return err
+		return nil, false, fmt.Errorf("failed to read the privileges of PUBLIC on %s: %w", obj, err)
 	}
-	if _, err := c.db.ExecContext(ctx, query); err != nil {
-		return fmt.Errorf("failed to revoke privileges on parameter %q from %q: %w", parameter, role, err)
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		found = true
+		var p sql.NullString
+		if err := rows.Scan(&p); err != nil {
+			return nil, false, fmt.Errorf("failed to scan privilege: %w", err)
+		}
+		if p.Valid {
+			privileges = append(privileges, p.String)
+		}
 	}
-	return nil
+	if err := rows.Err(); err != nil {
+		return nil, false, fmt.Errorf("failed to read the privileges of PUBLIC on %s: %w", obj, err)
+	}
+	slices.Sort(privileges)
+	return slices.Compact(privileges), found, nil
+}
+
+// SchemaExists reports whether the schema exists in the database the client
+// is connected to.
+func (c *Client) SchemaExists(ctx context.Context, name string) (bool, error) {
+	var exists bool
+	err := c.db.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM pg_catalog.pg_namespace WHERE nspname = $1)", name).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("failed to check schema existence: %w", err)
+	}
+	return exists, nil
 }
 
 // listQuoteParameters are the parameters whose SET values are lists of

@@ -467,13 +467,19 @@ func (r *RoleReconciler) checkRoleAdoption(ctx context.Context, pg roleOwnership
 // clusterRoles returns the Roles of role's Cluster (in its namespace), oldest
 // first.
 func (r *RoleReconciler) clusterRoles(ctx context.Context, role *postgresv1alpha1.Role) ([]*postgresv1alpha1.Role, error) {
+	return listClusterRoles(ctx, r.Client, role.Namespace, role.Spec.ClusterRef.Name)
+}
+
+// listClusterRoles returns the Roles in namespace that reference the Cluster
+// clusterName, oldest first.
+func listClusterRoles(ctx context.Context, c client.Reader, namespace, clusterName string) ([]*postgresv1alpha1.Role, error) {
 	roles := &postgresv1alpha1.RoleList{}
-	if err := r.List(ctx, roles, client.InNamespace(role.Namespace)); err != nil {
+	if err := c.List(ctx, roles, client.InNamespace(namespace)); err != nil {
 		return nil, fmt.Errorf("failed to list Roles: %w", err)
 	}
 	out := make([]*postgresv1alpha1.Role, 0, len(roles.Items))
 	for i := range roles.Items {
-		if roles.Items[i].Spec.ClusterRef.Name == role.Spec.ClusterRef.Name {
+		if roles.Items[i].Spec.ClusterRef.Name == clusterName {
 			out = append(out, &roles.Items[i])
 		}
 	}
@@ -497,6 +503,13 @@ func (r *RoleReconciler) managedRoles(ctx context.Context, role *postgresv1alpha
 	if err != nil {
 		return nil, err
 	}
+	return managedRolesOf(roles, cluster, signer), nil
+}
+
+// managedRolesOf returns the PostgreSQL roles that roles (the Roles of
+// cluster, oldest first) manage, with the marker each must carry (the oldest
+// Role wins a name).
+func managedRolesOf(roles []*postgresv1alpha1.Role, cluster *postgresv1alpha1.Cluster, signer markerSigner) managedRoles {
 	out := make(managedRoles, len(roles))
 	for _, other := range roles {
 		// Only a role the Role has actually created or adopted on this
@@ -511,7 +524,7 @@ func (r *RoleReconciler) managedRoles(ctx context.Context, role *postgresv1alpha
 			out[name] = signer.marker(markerKindRole, other.Name)
 		}
 	}
-	return out, nil
+	return out
 }
 
 // checkRoleName returns a ReservedName error for a reserved PostgreSQL name

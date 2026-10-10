@@ -152,6 +152,19 @@ const (
 	// ReasonDuplicateDatabaseName: an older Database of the same Cluster
 	// resolves to the same PostgreSQL database name.
 	ReasonDuplicateDatabaseName = "DuplicateDatabaseName"
+	// ReasonGranteeNotAllowed: Database.spec.grants or schemas[].grants names
+	// a grantee the policy does not allow (not managed by a Role of the
+	// Cluster nor listed in rolePolicy.allowedExistingRoles, a superuser, or
+	// a reserved role). Grants to it are not applied; managed ones are
+	// revoked. The other grants are still applied.
+	ReasonGranteeNotAllowed = "GranteeNotAllowed"
+	// ReasonPublicPrivilegeConflict: Database.spec.publicPrivileges revokes a
+	// privilege from PUBLIC that spec.grants or schemas[public].grants grant
+	// to PUBLIC. That PUBLIC privilege is left as it is.
+	ReasonPublicPrivilegeConflict = "PublicPrivilegeConflict"
+	// ReasonTooManyGrants: the Database declares more schema grants than pgop
+	// tracks. Nothing is granted or revoked on schemas.
+	ReasonTooManyGrants = "TooManyGrants"
 
 	DefaultPostgresImage    = "postgres:18"
 	DefaultOperatorUsername = "pgop_operator"

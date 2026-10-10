@@ -165,13 +165,14 @@ func (r *DatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return r.updateStatus(ctx, database, false, nil, nil, err)
 	}
 
-	// Settings and database grants. A problem with them (a grantee that does
-	// not exist yet, a setting that is not allowed) does not hold up the
-	// extensions, schemas and credentials below: it is reported once those
-	// are done, and the Database stays not ready until it is fixed.
-	accessErr := r.reconcileSettingsAndGrants(ctx, adminClient, database, pgName)
-	if accessErr != nil {
-		log.Error(accessErr, "Failed to reconcile database settings or grants")
+	// Settings, database grants and PUBLIC's database privileges. A problem
+	// with them (a grantee that does not exist yet or is not allowed, a
+	// setting that is not allowed) does not hold up the extensions, schemas
+	// and credentials below: it is reported once those are done, and the
+	// Database stays not ready until it is fixed.
+	checker, accessErr, err := r.reconcileDatabaseAccess(ctx, adminClient, database, cluster, signer, pgName)
+	if err != nil {
+		return r.updateStatus(ctx, database, false, nil, nil, err)
 	}
 
 	// Get a connection to the new database to install extensions and create
@@ -205,7 +206,10 @@ func (r *DatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		log.Error(err, "Failed to reconcile schemas")
 		return r.updateStatus(ctx, database, false, installedExtensions, createdSchemas, err)
 	}
-	accessErr = errors.Join(refusedErr, accessErr)
+	// Schema grants and PUBLIC's privileges on the schema public, once every
+	// schema exists. Like the database grants, a problem here is reported
+	// after the credentials Secret is reconciled.
+	accessErr = errors.Join(refusedErr, accessErr, reconcileSchemaAccess(ctx, dbClient, database, pgName, checker))
 
 	if err := r.reconcileCredentialsSecret(ctx, database, ownerRole, cluster); err != nil {
 		log.Error(err, "Failed to reconcile database credentials secret")
@@ -249,10 +253,10 @@ func installExtensions(ctx context.Context, pg *postgres.Client, policy *postgre
 	return installed, refusedErr, nil
 }
 
-// reconcileSchemas creates the Database's schemas and applies their grants.
-// System schemas are refused. It returns the created schemas, a
-// SchemaNotAllowed error listing the refused ones (nil when none) and the
-// error that stopped it.
+// reconcileSchemas creates the Database's schemas (their grants are applied
+// by reconcileSchemaGrants). System schemas are refused. It returns the
+// created schemas, a SchemaNotAllowed error listing the refused ones (nil
+// when none) and the error that stopped it.
 func reconcileSchemas(ctx context.Context, pg *postgres.Client, database *postgresv1alpha1.Database) (created []string, refusedErr, err error) {
 	created = make([]string, 0, len(database.Spec.Schemas))
 	var refused []string
@@ -265,11 +269,6 @@ func reconcileSchemas(ctx context.Context, pg *postgres.Client, database *postgr
 			return created, nil, fmt.Errorf("schema %q: %w", schema.Name, err)
 		}
 		created = append(created, schema.Name)
-		for _, grant := range schema.Grants {
-			if err := pg.GrantSchemaPrivileges(ctx, schema.Name, grant.Role, grant.Privileges, grant.WithGrantOption); err != nil {
-				return created, nil, fmt.Errorf("schema %q, role %q: %w", schema.Name, grant.Role, err)
-			}
-		}
 	}
 	if len(refused) > 0 {
 		refusedErr = &conditionError{reason: ReasonSchemaNotAllowed, err: fmt.Errorf(
@@ -436,39 +435,71 @@ func extensionAllowed(ctx context.Context, pg extensionClient, policy *postgresv
 
 // reconcileSettingsAndGrants applies the per-database settings (ALTER
 // DATABASE ... SET/RESET; they only affect new sessions, so they are applied
-// before the database connection used for extensions is opened) and the
-// database-level grants. Both are attempted even when the other fails.
-func (r *DatabaseReconciler) reconcileSettingsAndGrants(ctx context.Context, pg databaseGrantClient,
-	database *postgresv1alpha1.Database, pgName string) error {
-	deleting, err := r.deletingRoleNames(ctx, database)
-	if err != nil {
-		return err
-	}
+// before the database connection used for extensions is opened), the
+// database-level grants and PUBLIC's database privileges. Each is attempted
+// even when another fails.
+func reconcileSettingsAndGrants(ctx context.Context, pg databaseGrantClient,
+	database *postgresv1alpha1.Database, pgName string, checker *granteeChecker) error {
 	return errors.Join(
 		reconcileDatabaseSettings(ctx, pg, database, pgName),
-		reconcileDatabaseGrants(ctx, pg, database, pgName, deleting),
+		reconcileDatabaseGrants(ctx, pg, database, pgName, checker),
+		reconcilePublicPrivileges(ctx, pg, database, pgName, postgres.ObjectDatabase),
 	)
 }
 
-// deletingRoleNames returns the PostgreSQL names of the Roles on the
-// Database's cluster that are being deleted, so their grants are not
-// re-applied while the Role controller revokes them and drops the role.
-func (r *DatabaseReconciler) deletingRoleNames(ctx context.Context, database *postgresv1alpha1.Database) (map[string]bool, error) {
-	if len(database.Spec.Grants) == 0 {
-		return nil, nil
+// reconcileDatabaseAccess builds the grantee policy and runs
+// reconcileSettingsAndGrants on the admin connection. err is set only when
+// the policy cannot be built; accessErr reports problems with the settings
+// and grants, which do not hold up the rest of the reconcile.
+func (r *DatabaseReconciler) reconcileDatabaseAccess(ctx context.Context, pg *postgres.Client, database *postgresv1alpha1.Database,
+	cluster *postgresv1alpha1.Cluster, signer markerSigner, pgName string) (checker *granteeChecker, accessErr, err error) {
+	checker, err = r.granteeChecker(ctx, pg, database, cluster, signer)
+	if err != nil {
+		return nil, nil, err
 	}
-	roles := &postgresv1alpha1.RoleList{}
-	if err := r.List(ctx, roles, client.InNamespace(database.Namespace)); err != nil {
-		return nil, fmt.Errorf("failed to list Roles: %w", err)
+	accessErr = reconcileSettingsAndGrants(ctx, pg, database, pgName, checker)
+	if accessErr != nil {
+		logf.FromContext(ctx).Error(accessErr, "Failed to reconcile database settings or grants")
+	}
+	return checker, accessErr, nil
+}
+
+// reconcileSchemaAccess applies the schema grants and PUBLIC's privileges on
+// the schema public, on a connection to the database.
+func reconcileSchemaAccess(ctx context.Context, pg *postgres.Client, database *postgresv1alpha1.Database, pgName string,
+	checker *granteeChecker) error {
+	err := errors.Join(
+		reconcileSchemaGrants(ctx, pg, database, checker),
+		reconcilePublicPrivileges(ctx, pg, database, pgName, postgres.ObjectSchema),
+	)
+	if err != nil {
+		logf.FromContext(ctx).Error(err, "Failed to reconcile schema grants")
+	}
+	return err
+}
+
+// granteeChecker returns the grantee policy for the Database's grants: the
+// Cluster's rolePolicy, the roles the Cluster's Roles manage, and the Roles
+// being deleted (their grants are paused, so they are not re-applied while
+// the Role controller revokes them and drops the role).
+func (r *DatabaseReconciler) granteeChecker(ctx context.Context, pg granteeClient, database *postgresv1alpha1.Database,
+	cluster *postgresv1alpha1.Cluster, signer markerSigner) (*granteeChecker, error) {
+	roles, err := listClusterRoles(ctx, r.Client, database.Namespace, database.Spec.ClusterRef.Name)
+	if err != nil {
+		return nil, err
 	}
 	deleting := map[string]bool{}
-	for i := range roles.Items {
-		role := &roles.Items[i]
-		if role.DeletionTimestamp != nil && role.Spec.ClusterRef.Name == database.Spec.ClusterRef.Name {
+	for _, role := range roles {
+		if role.DeletionTimestamp != nil {
 			deleting[role.PostgresName()] = true
 		}
 	}
-	return deleting, nil
+	return &granteeChecker{
+		pg:       pg,
+		policy:   cluster.Spec.RolePolicy,
+		managed:  managedRolesOf(roles, cluster, signer),
+		deleting: deleting,
+	}, nil
 }
 
 // resolveOwnerRole returns the Role named by spec.owner, or nil when no owner
@@ -608,8 +639,9 @@ func (r *DatabaseReconciler) updateStatus(ctx context.Context, database *postgre
 }
 
 // databasesForOwnerRole maps a Role to the Databases in its namespace whose
-// spec.owner names it, or whose spec.grants name its PostgreSQL role, so they
-// reconcile when the owner becomes Ready or a grantee is created.
+// spec.owner names it, or whose spec.grants or spec.schemas[].grants name its
+// PostgreSQL role, so they reconcile when the owner becomes Ready, a grantee
+// is created (and recorded, which the grantee policy requires) or deleted.
 func (r *DatabaseReconciler) databasesForOwnerRole(ctx context.Context, obj client.Object) []reconcile.Request {
 	databases := &postgresv1alpha1.DatabaseList{}
 	if err := r.List(ctx, databases, client.InNamespace(obj.GetNamespace())); err != nil {
@@ -621,8 +653,14 @@ func (r *DatabaseReconciler) databasesForOwnerRole(ctx context.Context, obj clie
 		pgName = role.PostgresName()
 	}
 	grantsTo := func(db *postgresv1alpha1.Database) bool {
-		return pgName != "" && slices.ContainsFunc(db.Spec.Grants, func(g postgresv1alpha1.DatabaseGrantSpec) bool {
-			return g.Role == pgName
+		if pgName == "" {
+			return false
+		}
+		if slices.ContainsFunc(db.Spec.Grants, func(g postgresv1alpha1.DatabaseGrantSpec) bool { return g.Role == pgName }) {
+			return true
+		}
+		return slices.ContainsFunc(db.Spec.Schemas, func(s postgresv1alpha1.SchemaSpec) bool {
+			return slices.ContainsFunc(s.Grants, func(g postgresv1alpha1.GrantSpec) bool { return g.Role == pgName })
 		})
 	}
 	var requests []reconcile.Request
