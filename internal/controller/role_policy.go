@@ -43,29 +43,33 @@ const reservedRolePrefix = "pgop_"
 // pgop's clusters use their own operator role, but the name stays reserved.
 const bootstrapRoleName = "postgres"
 
-// Ownership markers.
+// Ownership.
 //
-// pgop records which resource owns a PostgreSQL role or database in the
-// object's comment (COMMENT ON ROLE / COMMENT ON DATABASE):
+// pgop only alters, re-passwords or drops an existing PostgreSQL role or
+// database when
+//
+//   - the resource's own status records that exact name (status.roleName /
+//     status.databaseName): pgop created or adopted it earlier. Status cannot
+//     be written by Role or Database writers;
+//   - it creates the object itself in this reconcile; or
+//   - a Cluster editor allowlisted the name in spec.rolePolicy.adoptableRoles
+//     / adoptableDatabases (and, for a role, it passes the privilege checks).
+//
+// A comment can be set by people pgop does not trust (a database's owner, a
+// role's ADMIN holder, any CREATEROLE role on PostgreSQL 15 and older), so a
+// comment never authorizes a take-over. pgop still stores a signed marker
+// with every object it manages:
 //
 //	pgop:v2:<Kind>/<name>:<base64url HMAC-SHA256(key, "<kind>|<namespace>|<cluster>|<name>")>
 //
-// The key is a random per-Cluster secret (markerKeySecretName), so nobody who
-// cannot read that Secret can compute a marker. Printing a marker (the
-// RoleNotManaged / DatabaseNotManaged messages do, so a superuser can hand an
-// object over) only reveals the marker for that one name on that one Cluster.
-// Because a database owner can set the comment of their own database, and a
-// role with ADMIN on a role can set its comment, a marker alone is never
-// enough to adopt an object pgop has not recorded in status: see
-// checkRoleOwnership and ensureDatabase.
-//
-// The marker names the resource, not its UID: re-creating the resources from
-// Git keeps their markers valid. Every resource that can reach a Cluster
-// lives in the Cluster's namespace and resource names are unique there.
+// keyed by the Cluster's <cluster>-marker-key Secret. It serves as a
+// consistency check (an object recorded in status that carries an unrelated
+// comment is left alone) and tells which roles Roles of the Cluster manage
+// (membership policy). Markers that are missing, unsigned (v1) or signed with
+// a lost key are refreshed on objects recorded in status.
 const (
 	markerV2Prefix = "pgop:v2:"
-	// markerV1Prefix marked objects before markers were signed. A v1 marker
-	// is only trusted together with the resource's status (legacy path).
+	// markerV1Prefix marked objects before markers were signed.
 	markerV1Prefix = "pgop:v1:"
 
 	markerKindRole     = "Role"
@@ -101,53 +105,66 @@ func legacyMarker(kind, name string) string {
 	return markerV1Prefix + kind + "/" + name
 }
 
-// isOwnerMarker reports whether comment looks like a pgop ownership marker
-// (signed or not; it says nothing about whether it is valid).
-func isOwnerMarker(comment string) bool {
-	return strings.HasPrefix(comment, markerV2Prefix) || strings.HasPrefix(comment, markerV1Prefix)
+// ownMarkerComment reports whether comment is, or was, the marker of
+// kind/name: empty, the unsigned v1 marker, or a v2 marker of that name
+// (whose signature may come from a lost key).
+func ownMarkerComment(comment, kind, name string) bool {
+	return comment == "" || comment == legacyMarker(kind, name) ||
+		strings.HasPrefix(comment, markerV2Prefix+kind+"/"+name+":")
 }
 
-// ownership is how a resource relates to an existing PostgreSQL object of
-// its name.
+// ownership is how a resource relates to the PostgreSQL object of its name.
 type ownership int
 
 const (
 	// ownedAbsent: the object does not exist; create it with the marker.
 	ownedAbsent ownership = iota
-	// owned: the object carries this resource's valid (signed) marker.
+	// owned: the status records the object and it carries the valid marker.
 	owned
-	// ownedLegacy: the resource's status records that pgop created or took
-	// over the object, which has no comment or an unsigned v1 marker; mark
-	// it. Status cannot be written by Role or Database writers.
-	ownedLegacy
-	// notOwned: the object belongs to someone else; leave it alone.
+	// ownedRemark: the status records the object; its marker is missing,
+	// unsigned or stale (lost key): refresh it.
+	ownedRemark
+	// adoptable: not recorded, but a Cluster editor allowlisted the name.
+	adoptable
+	// notOwned: leave the object alone.
 	notOwned
 )
 
-// decideOwnership classifies an existing object by its comment.
-func decideOwnership(s markerSigner, kind, name string, exists bool, comment string, recordedInStatus bool) ownership {
+// decideOwnership classifies the PostgreSQL object of kind/name. recorded
+// reports whether the resource's status records the name; allowlisted
+// whether the Cluster's rolePolicy lists it as adoptable. The comment never
+// grants ownership on its own.
+func decideOwnership(s markerSigner, kind, name string, exists bool, comment string, recorded, allowlisted bool) ownership {
 	switch {
 	case !exists:
 		return ownedAbsent
-	case s.verify(comment, kind, name):
+	case recorded && s.verify(comment, kind, name):
 		return owned
-	case recordedInStatus && (comment == "" || comment == legacyMarker(kind, name)):
-		return ownedLegacy
+	case recorded && ownMarkerComment(comment, kind, name):
+		return ownedRemark
+	case allowlisted:
+		return adoptable
 	}
 	return notOwned
 }
 
 // notManagedMessage explains why pgop leaves an existing object alone and
-// how a superuser can hand it over deliberately.
-func notManagedMessage(kind, name, comment, marker string) string {
-	if isOwnerMarker(comment) {
-		return fmt.Sprintf("the PostgreSQL %s %s carries an ownership marker that is not this resource's valid marker; "+
-			"pgop does not touch it. To hand it over deliberately, a superuser can run: COMMENT ON %s %s IS '%s'",
-			kind, name, strings.ToUpper(kind), name, marker)
+// how a Cluster editor can let the resource take it over.
+func notManagedMessage(kind, name string, recorded bool) string {
+	field := "adoptableRoles"
+	statusField := "status.roleName"
+	if kind == "database" {
+		field, statusField = "adoptableDatabases", "status.databaseName"
 	}
-	return fmt.Sprintf("the PostgreSQL %s %s already exists and was not created by this resource; pgop does not take it over "+
-		"(it would reset its owner, settings or password and could drop it). To hand it over deliberately, a superuser "+
-		"can run: COMMENT ON %s %s IS '%s'", kind, name, strings.ToUpper(kind), name, marker)
+	if recorded {
+		return fmt.Sprintf("the PostgreSQL %s %s carries a comment that is not this resource's ownership marker; pgop "+
+			"leaves it alone. To let this resource manage it again, a Cluster editor adds %s to the Cluster's "+
+			"spec.rolePolicy.%s", kind, name, name, field)
+	}
+	return fmt.Sprintf("the PostgreSQL %s %s already exists and this resource did not create it (%s does not record "+
+		"it); pgop does not take it over, since that would reset its owner, settings or password and could drop it. "+
+		"To let this resource take it over (also after re-creating the resource without its status), a Cluster "+
+		"editor adds %s to the Cluster's spec.rolePolicy.%s", kind, name, statusField, name, field)
 }
 
 // managedRoles maps the PostgreSQL role names of a Cluster's Roles to the
@@ -180,7 +197,10 @@ func reservedRoleName(name string) string {
 // reservedDatabaseNames are the databases a Database resource cannot manage
 // (or drop): the maintenance database and the templates every new database
 // is copied from.
-var reservedDatabaseNames = []string{defaultDatabaseName, "template0", "template1"}
+var reservedDatabaseNames = []string{defaultDatabaseName, "template0", template1Name}
+
+// template1Name is the template every new database is copied from.
+const template1Name = "template1"
 
 // reservedDatabaseName explains why name cannot be managed by a Database
 // resource, or returns "" when it can.

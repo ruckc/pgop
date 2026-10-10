@@ -210,26 +210,26 @@ var _ = Describe("Role policy", func() {
 
 	Describe("ownership markers", func() {
 		DescribeTable("decideOwnership",
-			func(exists bool, comment string, recorded bool, want ownership) {
-				Expect(decideOwnership(testSigner, markerKindRole, "me", exists, comment, recorded)).To(Equal(want))
+			func(exists bool, comment string, recorded, allowlisted bool, want ownership) {
+				Expect(decideOwnership(testSigner, markerKindRole, "me", exists, comment, recorded, allowlisted)).To(Equal(want))
 			},
-			Entry("absent", false, "", false, ownedAbsent),
-			Entry("valid marker", true, ownerMarker(markerKindRole, "me"), false, owned),
-			Entry("valid marker, recorded", true, ownerMarker(markerKindRole, "me"), true, owned),
-			Entry("legacy: no comment, recorded in status", true, "", true, ownedLegacy),
-			Entry("legacy: v1 marker, recorded in status", true, "pgop:v1:Role/me", true, ownedLegacy),
-			Entry("v1 marker without status is not trusted", true, "pgop:v1:Role/me", false, notOwned),
-			Entry("pre-existing DBA role", true, "", false, notOwned),
-			Entry("DBA comment, even if recorded", true, "app team", true, notOwned),
-			Entry("forged v2 marker", true, "pgop:v2:Role/me:AAAA", true, notOwned),
-			Entry("another resource's marker", true, ownerMarker(markerKindRole, "other"), true, notOwned),
+			Entry("absent", false, "", false, false, ownedAbsent),
+			Entry("recorded, valid marker", true, ownerMarker(markerKindRole, "me"), true, false, owned),
+			Entry("recorded, no comment", true, "", true, false, ownedRemark),
+			Entry("recorded, v1 marker", true, "pgop:v1:Role/me", true, false, ownedRemark),
+			Entry("recorded, marker from a lost key", true, otherKeySigner.marker(markerKindRole, "me"), true, false, ownedRemark),
+			Entry("recorded, DBA comment", true, "app team", true, false, notOwned),
+			Entry("recorded, another resource's marker", true, ownerMarker(markerKindRole, "other"), true, false, notOwned),
+			Entry("unrecorded, valid marker (copied)", true, ownerMarker(markerKindRole, "me"), false, false, notOwned),
+			Entry("unrecorded, v1 marker", true, "pgop:v1:Role/me", false, false, notOwned),
+			Entry("unrecorded, no comment", true, "", false, false, notOwned),
+			Entry("unrecorded, allowlisted", true, "anything", false, true, adoptable),
 		)
 
-		It("tells how to hand an object over", func() {
-			Expect(notManagedMessage("role", "analytics", "", "pgop:v1:ns/c/me")).
-				To(ContainSubstring("COMMENT ON ROLE analytics IS 'pgop:v1:ns/c/me'"))
-			Expect(notManagedMessage("database", "app", "pgop:v2:Database/app:AAAA", "pgop:v2:Database/app:me")).
-				To(ContainSubstring("not this resource's valid marker"))
+		It("tells to ask a Cluster editor, never to set a comment", func() {
+			Expect(notManagedMessage("role", "analytics", false)).
+				To(SatisfyAll(ContainSubstring("spec.rolePolicy.adoptableRoles"), Not(ContainSubstring("COMMENT"))))
+			Expect(notManagedMessage("database", "app", true)).To(ContainSubstring("spec.rolePolicy.adoptableDatabases"))
 		})
 	})
 

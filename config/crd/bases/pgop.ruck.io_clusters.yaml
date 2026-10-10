@@ -232,6 +232,50 @@ spec:
                   someone allowed to edit the Cluster, not by someone who can only create
                   Roles or Databases.
                 properties:
+                  adoptableDatabases:
+                    description: |-
+                      adoptableDatabases lists existing PostgreSQL databases that a Database
+                      of this Cluster may take over: pgop then changes their owner, settings,
+                      grants, extensions and schemas and drops the database when the Database
+                      is deleted. Without this list a Database only manages a database it
+                      created itself (or recorded in its status).
+                    items:
+                      maxLength: 63
+                      minLength: 1
+                      pattern: ^[a-z_][a-z0-9_]*$
+                      type: string
+                    maxItems: 256
+                    type: array
+                    x-kubernetes-list-type: set
+                    x-kubernetes-validations:
+                    - message: adoptableDatabases must not list postgres, template*,
+                        pg_* or pgop_* databases
+                      rule: self.all(d, d != 'postgres' && !d.startsWith('template')
+                        && !d.startsWith('pg_') && !d.startsWith('pgop_'))
+                  adoptableRoles:
+                    description: |-
+                      adoptableRoles lists existing PostgreSQL roles that a Role of this
+                      Cluster may take over: pgop then sets their attributes and password,
+                      hands the password out and drops the role when the Role is deleted.
+                      Without this list a Role only manages a role it created itself (or
+                      recorded in its status). Only list roles you are willing to hand to
+                      whoever can write Roles in the namespace: pgop still refuses a
+                      superuser, a role reaching forbidden roles, and privileged attributes
+                      beyond the policy, but it cannot see everything a role's previous
+                      owner may have prepared (functions, grants, ownerships).
+                    items:
+                      maxLength: 63
+                      minLength: 1
+                      pattern: ^[a-z_][a-z0-9_]*$
+                      type: string
+                    maxItems: 256
+                    type: array
+                    x-kubernetes-list-type: set
+                    x-kubernetes-validations:
+                    - message: adoptableRoles must not list postgres, pg_* or pgop_*
+                        roles
+                      rule: self.all(r, r != 'postgres' && !r.startsWith('pg_') &&
+                        !r.startsWith('pgop_'))
                   allowedAttributes:
                     description: |-
                       allowedAttributes lists the privileged attributes Roles may request.

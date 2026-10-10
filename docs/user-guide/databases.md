@@ -429,29 +429,27 @@ escalation for the writer).
 
 ### Ownership of the PostgreSQL database
 
-As for [roles](roles.md#ownership-of-the-postgresql-role), pgop marks a
-database it creates with a signed marker
-(`COMMENT ON DATABASE <db> IS 'pgop:v2:Database/<Database name>:<HMAC>'`, keyed
-by the Cluster's `<cluster>-marker-key` Secret) and only changes the owner,
-settings, grants, extensions and schemas of, or drops, a database carrying
-this Database's valid marker:
+As for [roles](roles.md#ownership-of-the-postgresql-role), pgop only changes
+the owner, settings, grants, extensions and schemas of, or drops, a database
+this Database owns: one its `status.databaseName` records, one pgop creates in
+this reconcile, or an existing one a **Cluster editor** listed in the
+Cluster's [`spec.rolePolicy.adoptableDatabases`](clusters.md#role-policy)
+(then taken over and recorded). Any other existing database (created by a
+DBA, a restore tool, another Database, or a role with `CREATEDB`) is left
+alone: reason `DatabaseNotManaged`, nothing is altered and deleting the
+Database never drops it. A database's comment never authorizes a take-over
+(its owner can set it).
 
-- an existing database without it (created by a DBA, a restore tool, another
-  Database, or carrying a copied or forged marker) is left alone: reason
-  `DatabaseNotManaged`, nothing is altered and deleting the Database never
-  drops it;
-- **hand-over:** the condition message shows the `COMMENT ON DATABASE`
-  statement with the marker. A database's owner can set its comment, so a
-  role with `CREATEDB` could create a database under a name a Database will
-  use and copy the marker onto it. A marked database pgop has not recorded is
-  therefore only taken over when it is owned by a superuser or already by the
-  Database's `owner` Role; otherwise it stays `DatabaseNotManaged`
-  (a superuser can `ALTER DATABASE <db> OWNER TO` one of those first);
+- pgop stores a signed marker
+  (`COMMENT ON DATABASE <db> IS 'pgop:v2:Database/<Database name>:<HMAC>'`,
+  keyed by the Cluster's `<cluster>-marker-key` Secret) on the databases it
+  owns; a recorded database whose comment was replaced by something unrelated
+  is left alone, and a missing, unsigned (`pgop:v1:`) or stale (lost key)
+  marker is refreshed;
 - of two Databases of a Cluster with the same PostgreSQL name only the older
   one is reconciled; the other reports `DuplicateDatabaseName`;
-- a database recorded in `status.databaseName` without a comment or with the
-  unsigned `pgop:v1:` marker of an earlier build is re-marked on the next
-  reconcile; a bare `pgop:v1:` comment without status is not trusted;
+- a Database re-created without its status reports `DatabaseNotManaged` until
+  a Cluster editor lists the database in `adoptableDatabases`;
 - a database whose owner turned connections off (`ALTER DATABASE ... WITH
   ALLOW_CONNECTIONS false`, which also locks out superusers) reports
   `DatabaseNotConnectable`: its settings and grants are still applied, its
@@ -467,9 +465,10 @@ this Database's valid marker:
 - System schema names (`pg_*`, `information_schema`) are rejected in
   `schemas`, and a Database named `postgres`, `template0` or `template1` must
   set `databaseName`.
-- Existing databases without the Database's ownership marker are no longer
-  taken over (`DatabaseNotManaged`); databases an earlier pgop created are
-  marked automatically.
+- Existing databases are no longer taken over (`DatabaseNotManaged`) unless a
+  Cluster editor lists them in `spec.rolePolicy.adoptableDatabases`;
+  databases an earlier pgop created and recorded in status keep working and
+  are marked automatically.
 - `lo_compat_privileges` is refused in `settings`.
 
 ## Schema with Grants

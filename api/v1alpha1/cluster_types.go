@@ -214,6 +214,38 @@ type RolePolicySpec struct {
 	// +kubebuilder:validation:XValidation:rule="self.all(r, r != 'postgres' && !r.startsWith('pg_') && !r.startsWith('pgop_'))",message="allowedExistingRoles must not list postgres, pg_* or pgop_* roles"
 	AllowedExistingRoles []string `json:"allowedExistingRoles,omitempty"`
 
+	// adoptableRoles lists existing PostgreSQL roles that a Role of this
+	// Cluster may take over: pgop then sets their attributes and password,
+	// hands the password out and drops the role when the Role is deleted.
+	// Without this list a Role only manages a role it created itself (or
+	// recorded in its status). Only list roles you are willing to hand to
+	// whoever can write Roles in the namespace: pgop still refuses a
+	// superuser, a role reaching forbidden roles, and privileged attributes
+	// beyond the policy, but it cannot see everything a role's previous
+	// owner may have prepared (functions, grants, ownerships).
+	// +optional
+	// +listType=set
+	// +kubebuilder:validation:MaxItems=256
+	// +kubebuilder:validation:items:MinLength=1
+	// +kubebuilder:validation:items:MaxLength=63
+	// +kubebuilder:validation:items:Pattern=`^[a-z_][a-z0-9_]*$`
+	// +kubebuilder:validation:XValidation:rule="self.all(r, r != 'postgres' && !r.startsWith('pg_') && !r.startsWith('pgop_'))",message="adoptableRoles must not list postgres, pg_* or pgop_* roles"
+	AdoptableRoles []string `json:"adoptableRoles,omitempty"`
+
+	// adoptableDatabases lists existing PostgreSQL databases that a Database
+	// of this Cluster may take over: pgop then changes their owner, settings,
+	// grants, extensions and schemas and drops the database when the Database
+	// is deleted. Without this list a Database only manages a database it
+	// created itself (or recorded in its status).
+	// +optional
+	// +listType=set
+	// +kubebuilder:validation:MaxItems=256
+	// +kubebuilder:validation:items:MinLength=1
+	// +kubebuilder:validation:items:MaxLength=63
+	// +kubebuilder:validation:items:Pattern=`^[a-z_][a-z0-9_]*$`
+	// +kubebuilder:validation:XValidation:rule="self.all(d, d != 'postgres' && !d.startsWith('template') && !d.startsWith('pg_') && !d.startsWith('pgop_'))",message="adoptableDatabases must not list postgres, template*, pg_* or pgop_* databases"
+	AdoptableDatabases []string `json:"adoptableDatabases,omitempty"`
+
 	// allowedExtensions lists extensions that Databases may install although
 	// the server does not mark them as trusted
 	// (pg_available_extension_versions.trusted). Trusted extensions are
@@ -275,6 +307,18 @@ func (p *RolePolicySpec) AllowsPredefinedRole(name string) bool {
 // none.
 func (p *RolePolicySpec) AllowsExistingRole(name string) bool {
 	return p != nil && slices.Contains(p.AllowedExistingRoles, name)
+}
+
+// AllowsAdoptingRole reports whether a Role may take over the existing role
+// name. A nil policy allows none.
+func (p *RolePolicySpec) AllowsAdoptingRole(name string) bool {
+	return p != nil && slices.Contains(p.AdoptableRoles, name)
+}
+
+// AllowsAdoptingDatabase reports whether a Database may take over the
+// existing database name. A nil policy allows none.
+func (p *RolePolicySpec) AllowsAdoptingDatabase(name string) bool {
+	return p != nil && slices.Contains(p.AdoptableDatabases, name)
 }
 
 // AllowsExtension reports whether the policy explicitly allows the untrusted

@@ -79,6 +79,13 @@ spec:
     # pg_* or pgop_*).
     allowedExistingRoles:
       - string
+    # Existing roles / databases that Roles / Databases may take over (max
+    # 256 each). Without them only objects pgop created (or recorded in the
+    # resource's status) are managed.
+    adoptableRoles:
+      - string
+    adoptableDatabases:
+      - string
     # Untrusted extensions Databases may install (max 128; trusted
     # extensions are always allowed).
     allowedExtensions:
@@ -239,9 +246,9 @@ denylisted parameter, `RolePolicyViolation` when the Role requests a
 privileged attribute the Cluster's `rolePolicy` does not allow (the role then
 has none of `createRole`, `replication`, `bypassRLS`), names an existing role
 pgop must not take over, or names a pgop-managed Secret in `passwordSecretRef`,
-`RoleNotManaged` when the PostgreSQL role exists without this Role's
-signed ownership marker (`COMMENT ON ROLE ... IS 'pgop:v2:Role/<name>:<HMAC>'`;
-the message shows the statement for a superuser hand-over),
+`RoleNotManaged` when the PostgreSQL role exists but the Role neither
+created it (`status.roleName`) nor may adopt it (the Cluster's
+`rolePolicy.adoptableRoles`), or its comment is not the Role's ownership marker,
 `DuplicateRoleName` when an older Role of the Cluster has the same
 PostgreSQL name, `MembershipNotAllowed` when a membership is refused (the others are applied;
 refused ones pgop granted before are revoked), `ReservedName` when the
@@ -337,10 +344,9 @@ The `Available` condition is `False` with reason `SettingNotAllowed` when a
 setting is refused, `ExtensionNotAllowed` when an extension is refused,
 `SchemaNotAllowed` for a system schema (the other settings, grants,
 extensions and schemas are still reconciled), `ReservedName` for a reserved
-database name, `DatabaseNotManaged` when the database exists without this
-Database's signed ownership marker (`COMMENT ON DATABASE ... IS
-'pgop:v2:Database/<name>:<HMAC>'`), or carries it but is owned by a role that
-is neither a superuser nor the Database's owner, `DatabaseNotConnectable` when
+database name, `DatabaseNotManaged` when the database exists but the Database neither
+created it (`status.databaseName`) nor may adopt it (the Cluster's
+`rolePolicy.adoptableDatabases`), `DatabaseNotConnectable` when
 the database does not allow connections, `DuplicateDatabaseName` when an older Database of
 the Cluster has the same PostgreSQL name, and `ReconcileError` for other failures, such as a grantee
 role that does not exist yet.

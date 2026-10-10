@@ -1106,6 +1106,16 @@ func (in *RolePolicySpec) DeepCopyInto(out *RolePolicySpec) {
 		*out = make([]string, len(*in))
 		copy(*out, *in)
 	}
+	if in.AdoptableRoles != nil {
+		in, out := &in.AdoptableRoles, &out.AdoptableRoles
+		*out = make([]string, len(*in))
+		copy(*out, *in)
+	}
+	if in.AdoptableDatabases != nil {
+		in, out := &in.AdoptableDatabases, &out.AdoptableDatabases
+		*out = make([]string, len(*in))
+		copy(*out, *in)
+	}
 	if in.AllowedExtensions != nil {
 		in, out := &in.AllowedExtensions, &out.AllowedExtensions
 		*out = make([]string, len(*in))

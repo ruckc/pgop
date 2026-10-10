@@ -19,9 +19,11 @@ limitations under the License.
 package e2e
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
 	"fmt"
 	"os/exec"
-	"regexp"
 	"strings"
 	"time"
 
@@ -110,7 +112,7 @@ func RegisterRolePolicyTests() {
 			}
 			_, _ = psql(`DROP DATABASE IF EXISTS pol_dbaowned`)
 			_, _ = psql(`DROP DATABASE IF EXISTS pol_squat`)
-			for _, role := range []string{"pol_dba", "pol_adopt_su", "pol_dba_app", "pol_analytics", "pol_svc", "pol_squatter"} {
+			for _, role := range []string{"pol_dba", "pol_adopt_su", "pol_dba_app", "pol_analytics", "pol_svc", "pol_w", "pol_squatter"} {
 				_, _ = psql(`DROP ROLE IF EXISTS ` + role)
 			}
 			_, _ = utils.Run(exec.Command("kubectl", "patch", clusterRes, "-n", namespace,
@@ -308,34 +310,43 @@ spec:
 			Eventually(func(g Gomega) { g.Expect(member(g, "pol_analytics")).To(Equal("1")) }).Should(Succeed())
 		})
 
-		It("only manages PostgreSQL roles and databases it created", func() {
-			passwordOf := func(g Gomega, role string) string {
-				return query(g, `SELECT coalesce(rolpassword, '') FROM pg_authid WHERE rolname = '`+role+`'`)
-			}
-			roleComment := func(g Gomega, role string) string {
-				return query(g, `SELECT coalesce(shobj_description(oid, 'pg_authid'), '') FROM pg_roles WHERE rolname = '`+role+`'`)
-			}
-			// handOver returns the COMMENT ON statement the condition message
-			// of res shows (the signed marker for that resource).
-			handOver := func(res string) string {
-				var stmt string
-				Eventually(func(g Gomega) {
-					stmt = regexp.MustCompile(`COMMENT ON (ROLE|DATABASE) \S+ IS 'pgop:v2:[^']+'`).FindString(jsonpath(g, res, availableMessage))
-					g.Expect(stmt).NotTo(BeEmpty())
-				}).Should(Succeed())
-				return stmt
-			}
-			nudge := func(res string) {
-				_, err := utils.Run(exec.Command("kubectl", "annotate", res, "-n", namespace, "--overwrite",
-					"pgop.ruck.io/nudge="+time.Now().Format("150405.000")))
-				Expect(err).NotTo(HaveOccurred())
-			}
+		// validMarker computes the Cluster's valid ownership marker for
+		// kind/name from its key Secret: what someone who copied a marker
+		// (or guessed the key) could put in a comment.
+		validMarker := func(kind, name string) string {
+			out, err := utils.Run(exec.Command("kubectl", "get", "secret", clusterName+"-marker-key", "-n", namespace,
+				"-o", "jsonpath={.data.key}"))
+			Expect(err).NotTo(HaveOccurred())
+			key, err := base64.StdEncoding.DecodeString(strings.TrimSpace(out))
+			Expect(err).NotTo(HaveOccurred())
+			mac := hmac.New(sha256.New, key)
+			mac.Write([]byte(kind + "|" + namespace + "|" + clusterName + "|" + name))
+			return "pgop:v2:" + kind + "/" + name + ":" + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+		}
+		nudge := func(res string) {
+			_, err := utils.Run(exec.Command("kubectl", "annotate", res, "-n", namespace, "--overwrite",
+				"pgop.ruck.io/nudge="+time.Now().Format("150405.000")))
+			Expect(err).NotTo(HaveOccurred())
+		}
+		passwordOf := func(g Gomega, role string) string {
+			return query(g, `SELECT coalesce(rolpassword, '') FROM pg_authid WHERE rolname = '`+role+`'`)
+		}
+		roleComment := func(g Gomega, role string) string {
+			return query(g, `SELECT coalesce(shobj_description(oid, 'pg_authid'), '') FROM pg_roles WHERE rolname = '`+role+`'`)
+		}
+		noSecret := func(name, why string) {
+			_, err := utils.Run(exec.Command("kubectl", "get", "secret", name, "-n", namespace))
+			Expect(err).To(HaveOccurred(), why)
+		}
 
-			By("leaving a DBA's existing role alone")
+		It("only takes over existing roles and databases a Cluster editor allowlists", func() {
+			By("leaving a DBA's existing role alone, even with a valid marker on it")
 			_, err := psql(`CREATE ROLE pol_dba_app LOGIN PASSWORD 'dba-secret'`)
 			Expect(err).NotTo(HaveOccurred())
 			var dbaPassword string
 			Eventually(func(g Gomega) { dbaPassword = passwordOf(g, "pol_dba_app") }).Should(Succeed())
+			_, err = psql(`COMMENT ON ROLE pol_dba_app IS '` + validMarker("Role", "pol-adopt") + `'`)
+			Expect(err).NotTo(HaveOccurred())
 			Expect(apply(`
 apiVersion: pgop.ruck.io/v1alpha1
 kind: Role
@@ -346,19 +357,12 @@ spec:
     name: example-cluster
   roleName: pol_dba_app
 `)).To(Succeed())
-			expectReason(roleRes+"pol-adopt", "RoleNotManaged", "COMMENT ON ROLE pol_dba_app IS 'pgop:v2:Role/pol-adopt:")
+			expectReason(roleRes+"pol-adopt", "RoleNotManaged", "spec.rolePolicy.adoptableRoles")
 			Consistently(func(g Gomega) { g.Expect(passwordOf(g, "pol_dba_app")).To(Equal(dbaPassword)) }, 20*time.Second, 2*time.Second).
 				Should(Succeed())
-			_, err = utils.Run(exec.Command("kubectl", "get", "secret", "example-cluster-pol-adopt-credentials", "-n", namespace))
-			Expect(err).To(HaveOccurred(), "the DBA's password must not be replaced and handed out")
+			noSecret("example-cluster-pol-adopt-credentials", "the DBA's password must not be replaced and handed out")
 
-			By("not trusting a forged (unsigned) marker")
-			_, err = psql(`COMMENT ON ROLE pol_dba_app IS 'pgop:v1:Role/pol-adopt'`)
-			Expect(err).NotTo(HaveOccurred())
-			nudge(roleRes + "pol-adopt")
-			expectReason(roleRes+"pol-adopt", "RoleNotManaged", "not this resource's valid marker")
-
-			By("refusing a superuser-member role even when a superuser hands it over")
+			By("refusing an allowlisted role that is a member of a superuser")
 			_, err = psql(`CREATE ROLE pol_adopt_su NOLOGIN IN ROLE pol_dba`)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(apply(`
@@ -372,17 +376,16 @@ spec:
   roleName: pol_adopt_su
   login: false
 `)).To(Succeed())
-			_, err = psql(handOver(roleRes + "pol-adopt-su"))
-			Expect(err).NotTo(HaveOccurred())
-			nudge(roleRes + "pol-adopt-su")
+			expectReason(roleRes+"pol-adopt-su", "RoleNotManaged", "adoptableRoles")
+			setPolicy(`{"adoptableRoles":["pol_dba_app","pol_adopt_su"]}`)
 			expectReason(roleRes+"pol-adopt-su", "RolePolicyViolation", "does not take over", "pol_dba")
 
-			By("taking a role over once a superuser hands it over with the signed marker")
-			_, err = psql(handOver(roleRes + "pol-adopt"))
-			Expect(err).NotTo(HaveOccurred())
-			nudge(roleRes + "pol-adopt")
+			By("taking over the allowlisted ordinary role")
 			waitReady(roleRes + "pol-adopt")
-			Eventually(func(g Gomega) { g.Expect(passwordOf(g, "pol_dba_app")).NotTo(Equal(dbaPassword)) }).Should(Succeed())
+			Eventually(func(g Gomega) {
+				g.Expect(passwordOf(g, "pol_dba_app")).NotTo(Equal(dbaPassword))
+				g.Expect(jsonpath(g, roleRes+"pol-adopt", "{.status.roleName}")).To(Equal("pol_dba_app"))
+			}).Should(Succeed())
 
 			By("refusing a second Role with the same PostgreSQL name")
 			Expect(apply(`
@@ -400,7 +403,7 @@ spec:
 			Expect(err).NotTo(HaveOccurred())
 			Expect(psql(`SELECT count(*) FROM pg_roles WHERE rolname = 'pol_dba_app'`)).To(Equal("1"), "deleting the duplicate must not drop the role")
 
-			By("dropping the handed-over role with its Role, but not roles it never owned")
+			By("dropping the adopted role with its Role, but not roles it never owned")
 			for _, res := range []string{roleRes + "pol-adopt", roleRes + "pol-adopt-su"} {
 				_, err = utils.Run(exec.Command("kubectl", "delete", "-n", namespace, "--wait=true", "--timeout=2m", res))
 				Expect(err).NotTo(HaveOccurred())
@@ -408,7 +411,7 @@ spec:
 			Expect(psql(`SELECT count(*) FROM pg_roles WHERE rolname IN ('pol_dba_app', 'pol_adopt_su')`)).To(Equal("1"))
 			Expect(psql(`SELECT count(*) FROM pg_roles WHERE rolname = 'pol_adopt_su'`)).To(Equal("1"))
 
-			By("re-marking a role an earlier pgop created (no comment, or an unsigned v1 marker) from its status")
+			By("re-marking a recorded role whose marker is missing or unsigned")
 			for i, legacy := range []string{`NULL`, `'pgop:v1:Role/pol-old'`} {
 				_, err = psql(`COMMENT ON ROLE pol_old IS ` + legacy)
 				Expect(err).NotTo(HaveOccurred())
@@ -417,12 +420,12 @@ spec:
 					"--type=merge", "-p", `{"spec":{"connectionLimit":`+limit+`}}`))
 				Expect(err).NotTo(HaveOccurred())
 				Eventually(func(g Gomega) {
-					g.Expect(roleComment(g, "pol_old")).To(HavePrefix("pgop:v2:Role/pol-old:"))
+					g.Expect(roleComment(g, "pol_old")).To(Equal(validMarker("Role", "pol-old")))
 					g.Expect(query(g, `SELECT rolconnlimit FROM pg_roles WHERE rolname = 'pol_old'`)).To(Equal(limit))
 				}).Should(Succeed())
 			}
 
-			By("leaving a DBA's existing database alone")
+			By("leaving a DBA's existing database alone until it is allowlisted")
 			_, err = psql(`CREATE DATABASE pol_dbaowned`)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(apply(`
@@ -436,40 +439,59 @@ spec:
   databaseName: pol_dbaowned
   owner: pol-old
 `)).To(Succeed())
-			expectReason(dbRes+"pol-dbaowned", "DatabaseNotManaged", "COMMENT ON DATABASE pol_dbaowned IS 'pgop:v2:Database/pol-dbaowned:")
+			expectReason(dbRes+"pol-dbaowned", "DatabaseNotManaged", "spec.rolePolicy.adoptableDatabases")
 			Consistently(func(g Gomega) {
 				g.Expect(query(g, `SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname = 'pol_dbaowned'`)).NotTo(Equal("pol_old"))
 			}, 15*time.Second, 3*time.Second).Should(Succeed())
+			setPolicy(`{"adoptableDatabases":["pol_dbaowned"]}`)
+			waitReady(dbRes + "pol-dbaowned")
+			Eventually(func(g Gomega) {
+				g.Expect(query(g, `SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname = 'pol_dbaowned'`)).To(Equal("pol_old"))
+			}).Should(Succeed())
 			_, err = utils.Run(exec.Command("kubectl", "delete", "-n", namespace, "--wait=true", "--timeout=2m", dbRes+"pol-dbaowned"))
 			Expect(err).NotTo(HaveOccurred())
-			Expect(psql(`SELECT count(*) FROM pg_database WHERE datname = 'pol_dbaowned'`)).To(Equal("1"), "a database pgop does not own is never dropped")
+			Expect(psql(`SELECT count(*) FROM pg_database WHERE datname = 'pol_dbaowned'`)).To(Equal("0"), "an adopted database is dropped with its Database")
 		})
 
-		It("does not let a tenant squat a database or role name with a copied marker", func() {
+		It("does not let a tenant hand itself a role or database with a copied marker", func() {
 			// psqlAs runs a query as a tenant role over the local socket.
 			psqlAs := func(user, query string) (string, error) {
 				out, err := utils.Run(exec.Command("kubectl", "exec", "-n", namespace, clusterName+"-0", "-c", "postgresql", "--",
 					"psql", "-U", user, "-d", "postgres", "-v", "ON_ERROR_STOP=1", "-tAc", query))
 				return strings.TrimSpace(out), err
 			}
-			handOver := func(res string) string {
-				var stmt string
-				Eventually(func(g Gomega) {
-					stmt = regexp.MustCompile(`COMMENT ON (ROLE|DATABASE) \S+ IS 'pgop:v2:[^']+'`).FindString(jsonpath(g, res, availableMessage))
-					g.Expect(stmt).NotTo(BeEmpty())
-				}).Should(Succeed())
-				return stmt
-			}
-			nudge := func(res string) {
-				_, err := utils.Run(exec.Command("kubectl", "annotate", res, "-n", namespace, "--overwrite",
-					"pgop.ruck.io/nudge="+time.Now().Format("150405.000")))
-				Expect(err).NotTo(HaveOccurred())
-			}
 			_, err := psql(`CREATE ROLE pol_squatter LOGIN CREATEDB CREATEROLE`)
 			Expect(err).NotTo(HaveOccurred())
 
-			By("a tenant with CREATEDB building the database first and copying the marker onto it")
+			By("a role built through a throw-away role, marked, and left without members")
+			// t creates w WITH CREATEROLE; w creates v (only w has ADMIN on v)
+			// and marks it; t drops w: v has no members and a valid marker.
+			_, err = psqlAs("pol_squatter", `CREATE ROLE pol_w CREATEROLE LOGIN`)
+			Expect(err).NotTo(HaveOccurred())
+			_, err = psqlAs("pol_w", `CREATE ROLE pol_svc LOGIN PASSWORD 'squatter-pw'`)
+			Expect(err).NotTo(HaveOccurred())
+			_, err = psqlAs("pol_w", `COMMENT ON ROLE pol_svc IS '`+validMarker("Role", "pol-svc")+`'`)
+			Expect(err).NotTo(HaveOccurred())
+			_, err = psqlAs("pol_squatter", `DROP ROLE pol_w`)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(psql(`SELECT count(*) FROM pg_auth_members WHERE roleid = 'pol_svc'::regrole`)).To(Equal("0"))
+			Expect(apply(`
+apiVersion: pgop.ruck.io/v1alpha1
+kind: Role
+metadata:
+  name: pol-svc
+spec:
+  clusterRef:
+    name: example-cluster
+  roleName: pol_svc
+`)).To(Succeed())
+			expectReason(roleRes+"pol-svc", "RoleNotManaged", "adoptableRoles")
+			noSecret("example-cluster-pol-svc-credentials", "no password may be set or handed out for the squatted role")
+
+			By("a database built by a tenant with CREATEDB and marked by its owner")
 			_, err = psqlAs("pol_squatter", `CREATE DATABASE pol_squat`)
+			Expect(err).NotTo(HaveOccurred())
+			_, err = psqlAs("pol_squatter", `COMMENT ON DATABASE pol_squat IS '`+validMarker("Database", "pol-squat")+`'`)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(apply(`
 apiVersion: pgop.ruck.io/v1alpha1
@@ -482,36 +504,33 @@ spec:
   databaseName: pol_squat
   owner: pol-old
 `)).To(Succeed())
-			expectReason(dbRes+"pol-squat", "DatabaseNotManaged")
-			_, err = psqlAs("pol_squatter", handOver(dbRes+"pol-squat"))
-			Expect(err).NotTo(HaveOccurred(), "the owner of a database can set its comment")
-			nudge(dbRes + "pol-squat")
-			expectReason(dbRes+"pol-squat", "DatabaseNotManaged", "owned by pol_squatter")
-			Expect(psql(`SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname = 'pol_squat'`)).To(Equal("pol_squatter"))
+			expectReason(dbRes+"pol-squat", "DatabaseNotManaged", "adoptableDatabases")
+			Consistently(func(g Gomega) {
+				g.Expect(query(g, `SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname = 'pol_squat'`)).To(Equal("pol_squatter"))
+			}, 15*time.Second, 3*time.Second).Should(Succeed())
 			_, err = utils.Run(exec.Command("kubectl", "delete", "-n", namespace, "--wait=true", "--timeout=2m", dbRes+"pol-squat"))
 			Expect(err).NotTo(HaveOccurred())
 			Expect(psql(`SELECT count(*) FROM pg_database WHERE datname = 'pol_squat'`)).To(Equal("1"))
+		})
 
-			By("a tenant with CREATEROLE creating the role first and copying the marker onto it")
-			_, err = psqlAs("pol_squatter", `CREATE ROLE pol_svc LOGIN PASSWORD 'squatter-pw'`)
+		It("re-marks recorded objects after the marker key is lost, and still refuses unrecorded ones", func() {
+			oldMarker := validMarker("Role", "pol-old")
+			_, err := utils.Run(exec.Command("kubectl", "delete", "secret", clusterName+"-marker-key", "-n", namespace))
 			Expect(err).NotTo(HaveOccurred())
-			Expect(apply(`
-apiVersion: pgop.ruck.io/v1alpha1
-kind: Role
-metadata:
-  name: pol-svc
-spec:
-  clusterRef:
-    name: example-cluster
-  roleName: pol_svc
-`)).To(Succeed())
-			expectReason(roleRes+"pol-svc", "RoleNotManaged")
-			_, err = psqlAs("pol_squatter", handOver(roleRes+"pol-svc"))
-			Expect(err).NotTo(HaveOccurred(), "the creator holds ADMIN on the role and can set its comment")
+			var newMarker string
+			Eventually(func(g Gomega) {
+				out, err := utils.Run(exec.Command("kubectl", "get", "secret", clusterName+"-marker-key", "-n", namespace, "-o", "name"))
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(out).NotTo(BeEmpty())
+				newMarker = validMarker("Role", "pol-old")
+				g.Expect(newMarker).NotTo(Equal(oldMarker), "the Cluster generates a new key")
+			}).Should(Succeed())
+			nudge(roleRes + "pol-old")
+			Eventually(func(g Gomega) { g.Expect(roleComment(g, "pol_old")).To(Equal(newMarker)) }).Should(Succeed())
+			waitReady(roleRes + "pol-old")
+
 			nudge(roleRes + "pol-svc")
-			expectReason(roleRes+"pol-svc", "RolePolicyViolation", "other roles are members of it (pol_squatter)")
-			_, err = utils.Run(exec.Command("kubectl", "get", "secret", "example-cluster-pol-svc-credentials", "-n", namespace))
-			Expect(err).To(HaveOccurred(), "no password may be set or handed out for the squatted role")
+			expectReason(roleRes+"pol-svc", "RoleNotManaged", "adoptableRoles")
 		})
 
 		It("installs trusted extensions and untrusted ones only when the Cluster allows them", func() {

@@ -31,6 +31,9 @@ import (
 	postgresv1alpha1 "github.com/ruckc/pgop/api/v1alpha1"
 )
 
+// reservedPrefixName is a name using the prefix reserved for the operator.
+const reservedPrefixName = "pgop_x"
+
 // CRD validation of the role privilege policy (issue #24, PR 1).
 var _ = Describe("Role policy CRD validation", func() {
 	const ns = "default"
@@ -70,7 +73,7 @@ var _ = Describe("Role policy CRD validation", func() {
 	}
 
 	Context("Role", func() {
-		for _, target := range []string{bootstrapRoleName, "pgop_operator", "pgop_replicator", "pgop_x",
+		for _, target := range []string{bootstrapRoleName, "pgop_operator", "pgop_replicator", reservedPrefixName,
 			polExecProgram, "pg_read_server_files", "pg_write_server_files"} {
 			It(fmt.Sprintf("rejects membership in %q", target), func() {
 				expectInvalid(create(newRole("m-"+suffix, postgresv1alpha1.RoleSpec{
@@ -149,6 +152,18 @@ var _ = Describe("Role policy CRD validation", func() {
 				expectInvalid(create(newCluster(&postgresv1alpha1.RolePolicySpec{AllowedExistingRoles: []string{name}})))
 			}
 			Expect(create(newCluster(&postgresv1alpha1.RolePolicySpec{AllowedExistingRoles: []string{"analytics_ro"}}))).To(Succeed())
+		})
+
+		It("validates adoptableRoles and adoptableDatabases", func() {
+			for _, name := range []string{bootstrapRoleName, "pg_x", reservedPrefixName, "Upper", `a"b`} {
+				expectInvalid(create(newCluster(&postgresv1alpha1.RolePolicySpec{AdoptableRoles: []string{name}})))
+			}
+			for _, name := range []string{bootstrapRoleName, template1Name, "template_app", "pg_x", reservedPrefixName, "Upper"} {
+				expectInvalid(create(newCluster(&postgresv1alpha1.RolePolicySpec{AdoptableDatabases: []string{name}})))
+			}
+			Expect(create(newCluster(&postgresv1alpha1.RolePolicySpec{
+				AdoptableRoles: []string{"legacy_app"}, AdoptableDatabases: []string{"legacy_db"},
+			}))).To(Succeed())
 		})
 	})
 

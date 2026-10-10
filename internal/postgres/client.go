@@ -350,51 +350,6 @@ func (c *Client) DatabaseComment(ctx context.Context, name string) (exists bool,
 	return true, comment, nil
 }
 
-// RoleMember is a role that is a member of another role.
-type RoleMember struct {
-	Name      string
-	Admin     bool
-	Superuser bool
-}
-
-// RoleMembers returns the roles that are members of name (whoever granted
-// the membership).
-func (c *Client) RoleMembers(ctx context.Context, name string) ([]RoleMember, error) {
-	rows, err := c.db.QueryContext(ctx, `SELECT u.rolname, m.admin_option, u.rolsuper
-FROM pg_catalog.pg_auth_members m
-JOIN pg_catalog.pg_roles r ON r.oid = m.roleid
-JOIN pg_catalog.pg_roles u ON u.oid = m.member
-WHERE r.rolname = $1
-ORDER BY u.rolname`, name)
-	if err != nil {
-		return nil, fmt.Errorf("failed to list members of %q: %w", name, err)
-	}
-	defer func() { _ = rows.Close() }()
-	var out []RoleMember
-	for rows.Next() {
-		var m RoleMember
-		if err := rows.Scan(&m.Name, &m.Admin, &m.Superuser); err != nil {
-			return nil, fmt.Errorf("failed to scan member: %w", err)
-		}
-		out = append(out, m)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("failed to list members of %q: %w", name, err)
-	}
-	return out, nil
-}
-
-// DatabaseOwner returns the owner of the database and whether the owner is
-// a superuser.
-func (c *Client) DatabaseOwner(ctx context.Context, name string) (owner string, superuser bool, err error) {
-	err = c.db.QueryRowContext(ctx, `SELECT r.rolname, r.rolsuper FROM pg_catalog.pg_database d
-JOIN pg_catalog.pg_roles r ON r.oid = d.datdba WHERE d.datname = $1`, name).Scan(&owner, &superuser)
-	if err != nil {
-		return "", false, fmt.Errorf("failed to look up the owner of database %q: %w", name, err)
-	}
-	return owner, superuser, nil
-}
-
 // DatabaseAllowsConnections reports whether the database accepts
 // connections (pg_database.datallowconn); false when it does not exist.
 func (c *Client) DatabaseAllowsConnections(ctx context.Context, name string) (bool, error) {

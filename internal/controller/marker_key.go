@@ -42,10 +42,9 @@ const secretKeyMarkerKey = "key"
 // key (see markerSigner). It is created by the Cluster controller, owned by
 // the Cluster, labeled as managed by pgop (so passwordSecretRef cannot read
 // it) and never mounted into any pod. If it is lost, a new key is generated
-// and existing markers stop matching: Roles and Databases then report
-// RoleNotManaged / DatabaseNotManaged until a superuser clears the comments
-// (COMMENT ON ... IS NULL), after which the objects recorded in their
-// resources' status are marked again with the new key.
+// and the objects recorded in their resources' status are re-marked on the
+// next reconcile; markers never authorize a take-over, so nothing else
+// depends on the key.
 func markerKeySecretName(cluster *postgresv1alpha1.Cluster) string {
 	return cluster.Name + "-marker-key"
 }

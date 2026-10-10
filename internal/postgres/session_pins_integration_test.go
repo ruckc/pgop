@@ -162,22 +162,14 @@ func checkCatalogHelpers(ctx context.Context, t *testing.T, admin, c *Client, db
 		t.Errorf("DatabaseComment = %t %q %v", exists, comment, err)
 	}
 
-	// Members (for the hand-over check), database owner and connectability.
+	// Connectability, and databases with schema privileges of a role.
 	exec(`CREATE ROLE pgop_pin_member`)
 	t.Cleanup(func() {
 		_, _ = admin.db.ExecContext(ctx, `DROP DATABASE IF EXISTS `+db)
 		_, _ = admin.db.ExecContext(ctx, `DROP ROLE IF EXISTS pgop_pin_member`)
 	})
-	exec(`GRANT pgop_pin_marked TO pgop_pin_member WITH ADMIN OPTION`)
 	if _, err := c.db.ExecContext(ctx, `GRANT USAGE ON SCHEMA public TO pgop_pin_member`); err != nil {
 		t.Fatal(err)
-	}
-	members, err := admin.RoleMembers(ctx, "pgop_pin_marked")
-	if err != nil || len(members) != 1 || members[0] != (RoleMember{Name: "pgop_pin_member", Admin: true}) {
-		t.Errorf("RoleMembers = %+v %v", members, err)
-	}
-	if owner, super, err := admin.DatabaseOwner(ctx, db); err != nil || owner != "pgop_pin_tenant" || super {
-		t.Errorf("DatabaseOwner = %q %t %v", owner, super, err)
 	}
 	if allow, err := admin.DatabaseAllowsConnections(ctx, db); err != nil || !allow {
 		t.Errorf("DatabaseAllowsConnections = %t %v, want true", allow, err)

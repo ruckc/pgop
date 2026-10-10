@@ -62,6 +62,8 @@ spec:
 | `rolePolicy.allowedAttributes` | []string | `[]` | Privileged attributes Roles may request: `createRole`, `replication`, `bypassRLS`. See [Role policy](#role-policy) |
 | `rolePolicy.allowedPredefinedRoles` | []string | `[]` | Predefined `pg_*` roles Roles may be members of. See [Role policy](#role-policy) |
 | `rolePolicy.allowedExistingRoles` | []string | `[]` | Roles not managed by a Role of this Cluster that Roles may be members of. See [Role policy](#role-policy) |
+| `rolePolicy.adoptableRoles` | []string | `[]` | Existing roles a Role may take over. See [Role policy](#role-policy) |
+| `rolePolicy.adoptableDatabases` | []string | `[]` | Existing databases a Database may take over. See [Role policy](#role-policy) |
 | `rolePolicy.allowedExtensions` | []string | `[]` | Untrusted extensions Databases may install (trusted ones are always allowed). See [Role policy](#role-policy) |
 
 ## Status
@@ -205,6 +207,8 @@ spec:
     allowedAttributes: [bypassRLS]          # createRole, replication, bypassRLS
     allowedPredefinedRoles: [pg_monitor]    # see the list below
     allowedExistingRoles: [analytics_ro]    # roles created outside pgop
+    adoptableRoles: [legacy_app]            # existing roles a Role may take over
+    adoptableDatabases: [legacy_db]         # existing databases a Database may take over
     allowedExtensions: [postgis, file_fdw]  # untrusted extensions
 ```
 
@@ -222,6 +226,15 @@ Without `rolePolicy` (the default):
   DBA's or a bootstrap Job's roles), unless `allowedExistingRoles` lists them.
   Roles managed by Roles of the same Cluster can always be joined: the
   Cluster's namespace is one trust domain.
+- Roles and Databases only manage roles and databases they created (or
+  recorded in their status). Taking over an existing one needs
+  `adoptableRoles` / `adoptableDatabases`: **to take over an existing role or
+  database, a Cluster editor lists it; Role and Database writers cannot.**
+  This is also how a Role or Database re-created without its status (for
+  example from Git after a restore) regains its object. Only list objects you
+  are willing to hand to the namespace's writers: pgop refuses superuser and
+  forbidden-member roles, but cannot see everything an object's previous
+  owner may have prepared (functions, grants, ownerships).
 - Databases can only install extensions the server marks as trusted (reason
   `ExtensionNotAllowed` otherwise). See
   [Databases: extension policy](databases.md#extension-policy).
@@ -245,9 +258,10 @@ Allowing `pg_monitor` also allows the roles PostgreSQL makes it a member of
 The Cluster also owns the Secret `<cluster>-marker-key`: the random key that
 signs the ownership markers pgop stores on the roles and databases it creates
 (see [Roles: ownership](roles.md#ownership-of-the-postgresql-role)). It is
-never mounted into a pod and cannot be used as a `passwordSecretRef`. Keep it
-with the Cluster's other Secrets: if it is lost, existing markers stop
-matching until a superuser clears them.
+never mounted into a pod and cannot be used as a `passwordSecretRef`. If it is
+deleted, a new key is generated and the roles and databases recorded in the
+resources' status are re-marked; the markers never authorize a take-over, so
+nothing else depends on the key.
 
 `pg_execute_server_program`, `pg_read_server_files` and
 `pg_write_server_files` give shell or file access on the server and can never
