@@ -175,7 +175,7 @@ func toObject(doc map[string]any, kind string, specFields map[string][]string) (
 		return nil, ""
 	}
 	if apiVersion, ok := doc["apiVersion"].(string); ok {
-		group := strings.Split(apiVersion, "/")[0]
+		group, _, _ := strings.Cut(apiVersion, "/")
 		if group != pgopGroup && apiVersion != "v1" {
 			return nil, "" // cert-manager, kustomize, apps: not served by envtest or not ours
 		}
