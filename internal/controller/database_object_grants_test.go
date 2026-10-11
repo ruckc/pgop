@@ -27,22 +27,28 @@ import (
 	. "github.com/onsi/gomega"
 
 	postgresv1alpha1 "github.com/ruckc/pgop/api/v1alpha1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
 	"github.com/ruckc/pgop/internal/postgres"
 )
 
 // Names used by the object grant tests.
 const (
-	ogtSchema   = "sales"
-	ogtDBOwner  = "app_owner"
-	ogtDeclared = "schema_owner"
-	ogtManaged  = "migrator"
-	ogtOutsider = "outsider"
-	ogtSuper    = "dba"
-	ogtOperator = DefaultOperatorUsername
-	ogtMarker   = "marker"
-	ogtT1       = "sales.t1"
-	ogtT1Select = "sales.t1 SELECT"
-	ogtFInt     = "sales.f(integer) EXECUTE"
+	ogtSchema    = "sales"
+	ogtDBOwner   = "app_owner"
+	ogtDeclared  = "schema_owner"
+	ogtManaged   = "migrator"
+	ogtOutsider  = "outsider"
+	ogtSuper     = "dba"
+	ogtOperator  = DefaultOperatorUsername
+	ogtMarker    = "marker"
+	ogtT1        = "sales.t1"
+	ogtT1Select  = "sales.t1 SELECT"
+	ogtFInt      = "sales.f(integer) EXECUTE"
+	ogtLegacy    = "legacy_owner"
+	ogtSigF      = "f(int4)"
+	ogtUID       = "uid-og"
+	ogtOldSchema = "oldschema"
 )
 
 // fakeObjectClient models the objects of schemas and their ACLs, and default
@@ -62,7 +68,7 @@ func newFakeObjectClient() *fakeObjectClient {
 	f := &fakeObjectClient{
 		fakeGrantClient: &fakeGrantClient{
 			superusers: map[string]bool{ogtSuper: true, ogtOperator: true},
-			comments:   map[string]string{ogtManaged: ogtMarker, grantTestRole: ogtMarker},
+			comments:   map[string]string{ogtManaged: ogtMarker, grantTestRole: ogtMarker, ogtDBOwner: ogtMarker},
 		},
 		dbOwner: ogtDBOwner,
 		oids: map[string]int64{grantTestRole: 100, ogtDBOwner: 101, ogtDeclared: 102, ogtManaged: 103, ogtOutsider: 104,
@@ -89,6 +95,25 @@ func (f *fakeObjectClient) find(kind postgres.SchemaObjectKind, schema, identity
 	for _, o := range f.objects[schema+"|"+string(kind)] {
 		if o.Identity == identity {
 			return o
+		}
+	}
+	return nil
+}
+
+// findOID finds the object of kind with OID oid in any schema, or by
+// identity in schema when oid is 0 (as the server does).
+func (f *fakeObjectClient) findOID(kind postgres.SchemaObjectKind, schema, identity string, oid int64) *postgres.SchemaObject {
+	if oid == 0 {
+		return f.find(kind, schema, identity)
+	}
+	for k, objs := range f.objects {
+		if !strings.HasSuffix(k, "|"+string(kind)) {
+			continue
+		}
+		for _, o := range objs {
+			if o.OID == oid {
+				return o
+			}
 		}
 	}
 	return nil
@@ -134,11 +159,13 @@ func (f *fakeObjectClient) ResolveRoutine(_ context.Context, schema, name, args 
 	return oid, ok, nil
 }
 
-func (f *fakeObjectClient) ResolveSchemaObject(_ context.Context, kind postgres.SchemaObjectKind, schema, identity string) (string, bool, error) {
-	if f.find(kind, schema, identity) == nil {
+func (f *fakeObjectClient) ResolveSchemaObject(_ context.Context, kind postgres.SchemaObjectKind, schema, identity string,
+	oid int64) (string, bool, error) {
+	o := f.findOID(kind, schema, identity, oid)
+	if o == nil {
 		return "", false, nil
 	}
-	return identity, true, nil
+	return o.Identity, true, nil
 }
 
 func (f *fakeObjectClient) GrantOnSchemaObject(_ context.Context, kind postgres.SchemaObjectKind, schema, identity string,
@@ -161,22 +188,25 @@ func (f *fakeObjectClient) GrantOnSchemaObject(_ context.Context, kind postgres.
 	return nil
 }
 
-func (f *fakeObjectClient) RevokeOnSchemaObject(_ context.Context, kind postgres.SchemaObjectKind, schema, identity, grantee string,
-	privileges []string, mode postgres.RevokeMode) error {
+func (f *fakeObjectClient) RevokeOnSchemaObject(_ context.Context, kind postgres.SchemaObjectKind, schema, identity string,
+	oid int64, grantee string, privileges []string, mode postgres.RevokeMode) error {
+	o := f.findOID(kind, schema, identity, oid)
+	if o != nil {
+		identity = o.Identity
+	}
 	if err := f.record(fmt.Sprintf("revoke %s on %s %s from %s optionOnly=%t", strings.Join(privileges, ","),
 		strings.ToLower(string(kind)), identity, grantee, mode.GrantOptionOnly)); err != nil {
 		return err
 	}
-	o := f.find(kind, schema, identity)
 	if o == nil {
 		return nil
 	}
-	oid := f.oids[grantee]
+	roleOID := f.oids[grantee]
 	if postgres.IsPublic(grantee) {
-		oid = 0
+		roleOID = 0
 	}
 	o.ACL = slices.DeleteFunc(o.ACL, func(a postgres.ACLItem) bool {
-		return a.Grantee == oid && slices.Contains(privileges, a.Privilege) && !mode.GrantOptionOnly
+		return a.Grantee == roleOID && slices.Contains(privileges, a.Privilege) && !mode.GrantOptionOnly
 	})
 	return nil
 }
@@ -218,7 +248,7 @@ var _ = Describe("Object grants", func() {
 	schemas := map[string]bool{ogtSchema: true}
 	checker := func(f *fakeObjectClient, deleting map[string]bool) *granteeChecker {
 		c := allowGrantees(f.fakeGrantClient, deleting, grantTestOther)
-		c.managed = managedRoles{ogtManaged: ogtMarker, grantTestRole: ogtMarker}
+		c.managed = managedRoles{ogtManaged: ogtMarker, grantTestRole: ogtMarker, ogtDBOwner: ogtMarker}
 		return c
 	}
 	newDB := func(grants ...postgresv1alpha1.ObjectGrantSpec) *postgresv1alpha1.Database {
@@ -266,7 +296,7 @@ var _ = Describe("Object grants", func() {
 			ContainSubstring("sales.extt belongs to the extension pg_trgm"),
 			ContainSubstring("sales.op TRIGGER: not granted on a table owned by the superuser pgop_operator"),
 			ContainSubstring("sales.opv is a view owned by the superuser"),
-			ContainSubstring("sales.out is owned by outsider, which is neither"),
+			ContainSubstring("sales.out is owned by outsider, which is not"),
 			ContainSubstring("sales.su is owned by the superuser dba")))
 
 		By("setting ObjectGrantsComplete to False without failing the reconcile")
@@ -290,7 +320,7 @@ var _ = Describe("Object grants", func() {
 		Expect(ok).To(BeTrue())
 		Expect(ce.reason).To(Equal(ReasonObjectGrantSkipped))
 		Expect(err.Error()).To(And(ContainSubstring("sales.su is owned by the superuser"), ContainSubstring("sales.out is owned by outsider"),
-			ContainSubstring("sales.t2 is owned by schema_owner, which is neither the database owner"),
+			ContainSubstring("sales.t2 is owned by schema_owner, which is not a role managed by a Role"),
 			ContainSubstring("sales.extt belongs to the extension"), ContainSubstring(`table "nope" does not exist`)))
 		Expect(errorReasons(err)).To(ContainElements(ReasonObjectGrantSkipped, ReasonObjectNotFound))
 		Expect(objectsOf(db)).To(Equal([]string{ogtT1Select}))
@@ -348,10 +378,10 @@ var _ = Describe("Object grants", func() {
 		f.add(postgres.SchemaFunction, "opc", "sales.opc(integer)", ogtOperator, func(o *postgres.SchemaObject) { o.Language = "c" })
 		f.add(postgres.SchemaFunction, "opsql", "sales.opsql()", ogtOperator, func(o *postgres.SchemaObject) { o.Language = "plpgsql" })
 		fs := f.objects[ogtSchema+"|"+string(postgres.SchemaFunction)]
-		f.sigs["sales.f(int4)"] = fs[0].OID
+		f.sigs["sales."+ogtSigF] = fs[0].OID
 		f.sigErr["sales.f(integer); DROP TABLE t1; --"] = true
 
-		db := newDB(og(postgresv1alpha1.ObjectGrantFunction, []string{"f(int4)"}, postgres.PrivilegeAll))
+		db := newDB(og(postgresv1alpha1.ObjectGrantFunction, []string{ogtSigF}, postgres.PrivilegeAll))
 		Expect(reconcile(f, db, pgVersion17)).To(Succeed())
 		Expect(objectsOf(db)).To(Equal([]string{ogtFInt}))
 
@@ -435,6 +465,105 @@ var _ = Describe("Object grants", func() {
 		Expect(reconcileObjectGrants(ctx, f, db, map[string]bool{}, pgVersion17, checker(f, nil), nil)).To(Succeed())
 		Expect(f.listed).To(BeZero())
 		Expect(f.calls).To(BeEmpty())
+	})
+
+	It("does not trust a database owner no Role manages", func() {
+		f := newFakeObjectClient()
+		f.dbOwner = ogtLegacy
+		f.oids[ogtLegacy] = 200
+		f.add(postgres.SchemaTable, "oldtab", "sales.oldtab", ogtLegacy)
+		db := newDB(og(postgresv1alpha1.ObjectGrantTable, []string{"oldtab"}, postgres.PrivilegeAll))
+		err := reconcile(f, db, pgVersion17)
+		Expect(errorReasons(err)).To(ConsistOf(ReasonObjectGrantSkipped))
+		Expect(err.Error()).To(ContainSubstring("sales.oldtab is owned by legacy_owner, which is not a role managed"))
+		Expect(f.calls).To(BeEmpty())
+	})
+
+	It(`finds a named signature also when "*" lists the same kind`, func() {
+		f := newFakeObjectClient()
+		f.add(postgres.SchemaFunction, "f", "sales.f(integer)", ogtDBOwner)
+		f.sigs["sales."+ogtSigF] = f.objects[ogtSchema+"|"+string(postgres.SchemaFunction)][0].OID
+		g := og(postgresv1alpha1.ObjectGrantFunction, all, postgres.PrivilegeExecute)
+		g.Role = grantTestOther
+		db := newDB(og(postgresv1alpha1.ObjectGrantFunction, []string{ogtSigF}, postgres.PrivilegeExecute), g)
+		Expect(reconcile(f, db, pgVersion17)).To(Succeed())
+		Expect(objectsOf(db)).To(ConsistOf(ogtFInt, ogtFInt))
+		Expect(db.Status.ManagedObjectGrants).To(HaveLen(2))
+	})
+
+	It("follows objects by OID: a renamed object keeps its entry, a re-created one is new", func() {
+		f := newFakeObjectClient()
+		tables(f)
+		db := newDB(og(postgresv1alpha1.ObjectGrantTable, all, postgres.PrivilegeSelect))
+		Expect(reconcile(f, db, pgVersion17)).To(Succeed())
+		t1 := f.find(postgres.SchemaTable, ogtSchema, ogtT1)
+		oid := t1.OID
+
+		By("renaming t1: nothing is revoked or granted, the entry follows")
+		t1.Identity, t1.Name = "sales.renamed", "renamed"
+		f.calls = nil
+		Expect(reconcile(f, db, pgVersion17)).To(Succeed())
+		Expect(f.calls).To(BeEmpty())
+		Expect(objectsOf(db)).To(ContainElement("sales.renamed SELECT"))
+		Expect(db.Status.ManagedObjectGrants).To(ContainElement(HaveField("OID", oid)))
+
+		By("dropping it and creating another under the old name: the old entry is forgotten, the new one granted")
+		tbl := ogtSchema + "|" + string(postgres.SchemaTable)
+		f.objects[tbl] = slices.DeleteFunc(f.objects[tbl], func(o *postgres.SchemaObject) bool { return o.OID == oid })
+		f.add(postgres.SchemaTable, "t1", ogtT1, ogtDBOwner, func(o *postgres.SchemaObject) { o.OID = 9999 })
+		f.calls = nil
+		Expect(reconcile(f, db, pgVersion17)).To(Succeed())
+		Expect(f.calls).To(Equal([]string{"grant SELECT on table sales.t1 to app wgo=false"}))
+		Expect(db.Status.ManagedObjectGrants).NotTo(ContainElement(HaveField("OID", oid)))
+	})
+
+	It("revokes what a refused grantee holds also where the objects cannot be listed", func() {
+		f := newFakeObjectClient()
+		tables(f)
+		db := newDB(og(postgresv1alpha1.ObjectGrantTable, all, postgres.PrivilegeSelect))
+		Expect(reconcile(f, db, pgVersion17)).To(Succeed())
+		for i := range maxObjectsPerKind {
+			f.add(postgres.SchemaTable, fmt.Sprintf("n%d", i), fmt.Sprintf("sales.n%d", i), ogtDBOwner)
+		}
+		By("the grantee's Role no longer manages it: refused")
+		delete(f.comments, grantTestRole)
+		f.calls = nil
+		c := checker(f, nil)
+		c.policy = &postgresv1alpha1.RolePolicySpec{}
+		err := reconcileObjectGrants(ctx, f, db, schemas, pgVersion17, c, nil)
+		Expect(errorReasons(err)).To(ConsistOf(ReasonTooManyObjects))
+		Expect(f.calls).To(ConsistOf("revoke SELECT on table sales.op from app optionOnly=false",
+			"revoke SELECT on table sales.t1 from app optionOnly=false", "revoke SELECT on table sales.t3 from app optionOnly=false"))
+		Expect(db.Status.ManagedObjectGrants).To(BeEmpty())
+	})
+
+	It("skips identities too long to record and refuses a ledger past its byte budget", func() {
+		f := newFakeObjectClient()
+		long := "sales." + strings.Repeat("x", maxIdentityLength)
+		f.add(postgres.SchemaTable, "long", long, ogtDBOwner)
+		db := newDB(og(postgresv1alpha1.ObjectGrantTable, all, postgres.PrivilegeSelect))
+		Expect(reconcile(f, db, pgVersion17)).To(Succeed())
+		Expect(db.Status.ObjectGrants[0].Skipped).To(BeEquivalentTo(1))
+		Expect(f.calls).To(BeEmpty())
+
+		big := make([]privilegeGrant, 0, 3000)
+		for i := range 3000 {
+			big = append(big, desiredGrant(objectTarget(postgres.SchemaTable, ogtSchema, fmt.Sprintf("sales.%0200d", i), int64(i+1),
+				grantTestRole), []string{postgres.PrivilegeSelect}, false))
+		}
+		Expect(errorReasons(overBudget(big, nil, nil))).To(ConsistOf(ReasonTooManyGrants))
+		Expect(overBudget(big[:10], nil, nil)).To(Succeed())
+	})
+
+	It("counts as granted only objects with a grant to an allowed grantee", func() {
+		f := newFakeObjectClient()
+		tables(f)
+		g := og(postgresv1alpha1.ObjectGrantTable, []string{"t1"}, postgres.PrivilegeSelect)
+		g.Role = ogtOutsider
+		db := newDB(g)
+		Expect(errorReasons(reconcile(f, db, pgVersion17))).To(ConsistOf(ReasonGranteeNotAllowed))
+		Expect(db.Status.ObjectGrants).To(HaveLen(1))
+		Expect(db.Status.ObjectGrants[0].Granted).To(BeZero())
 	})
 
 	It("records the intended grants before granting", func() {
@@ -587,19 +716,51 @@ var _ = Describe("Object grant helpers", func() {
 		f.add(postgres.SchemaTable, "x1", "sales.x1", ogtDBOwner, func(o *postgres.SchemaObject) {
 			o.ACL = []postgres.ACLItem{{Grantee: 100, Privilege: postgres.PrivilegeSelect}}
 		})
-		rec := &recordedObjectAccess{
-			objects: []postgresv1alpha1.ManagedObjectGrant{{Schema: ogtSchema, Kind: postgresv1alpha1.ObjectGrantTable, Object: ogtT1,
-				Role: grantTestRole, Privileges: []string{postgres.PrivilegeSelect}, GrantOptions: []string{postgres.PrivilegeUpdate}}},
-			defaults: []postgresv1alpha1.ManagedDefaultPrivilege{{Schema: ogtSchema, ForRole: ogtManaged,
-				Kind: postgresv1alpha1.DefaultPrivilegeTable, Role: grantTestRole, Privileges: []string{postgres.PrivilegeSelect}}},
+		cluster := &postgresv1alpha1.Cluster{ObjectMeta: metav1.ObjectMeta{Name: "c", UID: ogtUID}}
+		db := postgresv1alpha1.Database{
+			Spec: postgresv1alpha1.DatabaseSpec{ClusterRef: postgresv1alpha1.ClusterReference{Name: "c"}},
+			Status: postgresv1alpha1.DatabaseStatus{DatabaseName: "d", ClusterUID: ogtUID,
+				ManagedObjectGrants: []postgresv1alpha1.ManagedObjectGrant{
+					{Schema: ogtSchema, Kind: postgresv1alpha1.ObjectGrantTable, Object: ogtT1, Role: grantTestRole,
+						Privileges: []string{postgres.PrivilegeSelect}, GrantOptions: []string{postgres.PrivilegeUpdate}},
+					{Schema: "pg_catalog", Kind: postgresv1alpha1.ObjectGrantTable, Object: "pg_catalog.pg_authid", Role: grantTestRole,
+						Privileges: []string{postgres.PrivilegeSelect}},
+				},
+				ManagedDefaultPrivileges: []postgresv1alpha1.ManagedDefaultPrivilege{{Schema: ogtSchema, ForRole: ogtManaged,
+					Kind: postgresv1alpha1.DefaultPrivilegeTable, Role: grantTestRole, Privileges: []string{postgres.PrivilegeSelect}}}},
 		}
-		Expect(revokeRecordedObjectAccess(context.Background(), f, grantTestRole, rec)).To(Succeed())
+		other := db
+		other.Status.DatabaseName, other.Status.ClusterUID = "elsewhere", "another-cluster"
+		recorded := recordedObjectAccessFrom([]postgresv1alpha1.Database{db, other}, cluster, grantTestRole)
+		Expect(recorded).To(HaveLen(1))
+		Expect(recorded["d"].objects).To(HaveLen(1), "entries in system schemas are ignored")
+		Expect(revokeRecordedObjectAccess(context.Background(), f, grantTestRole, recorded["d"])).To(Succeed())
 		Expect(f.calls).To(Equal([]string{
 			"revoke SELECT on table sales.t1 from app optionOnly=false",
 			"revoke UPDATE on table sales.t1 from app optionOnly=true",
 			"default revoke SELECT on tables in sales for migrator from app cascade=true",
 			"revoke SELECT on table sales.m1 from app optionOnly=false",
 		}))
+	})
+
+	It("revokes what default privileges gave a role also once the Database dropped them from its ledger", func() {
+		f := newFakeObjectClient()
+		f.add(postgres.SchemaTable, "m1", "sales.m1", ogtManaged, func(o *postgres.SchemaObject) {
+			o.ACL = []postgres.ACLItem{{Grantee: 100, Privilege: postgres.PrivilegeSelect}}
+		})
+		cluster := &postgresv1alpha1.Cluster{ObjectMeta: metav1.ObjectMeta{Name: "c", UID: ogtUID}}
+		// The Database paused the entry (the Role is being deleted) and
+		// revoked the default privileges first: only the spec names them.
+		db := postgresv1alpha1.Database{
+			Spec: postgresv1alpha1.DatabaseSpec{ClusterRef: postgresv1alpha1.ClusterReference{Name: "c"},
+				Schemas: []postgresv1alpha1.SchemaSpec{{Name: ogtSchema, DefaultPrivileges: []postgresv1alpha1.DefaultPrivilegeSpec{
+					{ForRole: ogtManaged, Role: grantTestRole, Kind: postgresv1alpha1.DefaultPrivilegeTable,
+						Privileges: []string{postgres.PrivilegeAll}}}}}},
+			Status: postgresv1alpha1.DatabaseStatus{DatabaseName: "d", ClusterUID: ogtUID},
+		}
+		recorded := recordedObjectAccessFrom([]postgresv1alpha1.Database{db}, cluster, grantTestRole)
+		Expect(revokeRecordedObjectAccess(context.Background(), f, grantTestRole, recorded["d"])).To(Succeed())
+		Expect(f.calls).To(Equal([]string{"revoke SELECT on table sales.m1 from app optionOnly=false"}))
 	})
 })
 

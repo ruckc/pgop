@@ -524,8 +524,10 @@ revokes:
   and `status.managedDefaultPrivileges`), in each such database: the
   privileges pgop granted the role on tables, sequences, functions and types,
   the default privileges pgop set for the role (as `forRole`) or to it (as
-  grantee), and the privileges those default privileges gave the role on the
-  objects their `forRole` created since,
+  grantee), and the privileges default privileges to the role (recorded in a
+  ledger, or still declared in a Database's spec, also when the Database
+  already paused and revoked them) gave it on the objects their `forRole`
+  owns in the schema,
 
 all with `CASCADE` (privileges the role passed on go with it, as with
 `DROP OWNED`). Only database, schema and extension-object privileges are

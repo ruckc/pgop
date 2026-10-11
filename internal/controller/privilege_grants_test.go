@@ -392,21 +392,22 @@ var _ = Describe("Privilege grants", func() {
 			Expect(ledger).To(Equal([]pg{{Target: tgt("a"), Privileges: connect}, {Target: tgt("c"), Privileges: connect}}))
 		})
 
-		It("refuses to grow the ledger past its limit without changing anything", func() {
+		It("grants nothing past the ledger's limit but still revokes", func() {
 			f := &fakeGrantClient{}
 			managed := []pg{{Target: tgt("a"), Privileges: connect}, {Target: tgt("b"), Privileges: connect}}
-			desired := []pg{desiredGrant(tgt("c"), connect, false), desiredGrant(tgt("d"), connect, false)}
+			desired := []pg{desiredGrant(tgt("c"), connect, false), desiredGrant(tgt("d"), connect, false),
+				desiredGrant(tgt("b"), connect, false)}
 			ledger, err := applyPrivilegeGrants(ctx, desired, managed, executorOps(f, nil), 3, nil)
 			ce, ok := errors.AsType[*conditionError](err)
 			Expect(ok).To(BeTrue(), "expected a conditionError, got %v", err)
 			Expect(ce.reason).To(Equal(ReasonTooManyGrants))
-			Expect(f.calls).To(BeEmpty())
-			Expect(ledger).To(Equal(managed))
+			Expect(f.calls).To(Equal([]string{callRevokeConnectA}))
+			Expect(ledger).To(Equal(managed[1:]))
 
 			By("applying once the union fits")
 			ledger, err = applyPrivilegeGrants(ctx, desired, managed, executorOps(f, nil), 4, nil)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(ledger).To(HaveLen(2))
+			Expect(ledger).To(HaveLen(3))
 		})
 	})
 
@@ -951,7 +952,7 @@ var _ = Describe("Privilege grants", func() {
 				{Name: "ext"}, {Name: grantTestOther}, {Name: recordedSchema}, {Name: "su_owned", Owner: polDBA}, {Name: "pg_catalog"},
 			}}}
 			db.Status.CreatedSchemas = []string{recordedSchema}
-			managed, refused, err := reconcileSchemas(ctx, s, db)
+			managed, refused, err := reconcileSchemas(ctx, s, db, grantTestAdmin)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(managed).To(Equal([]string{"fresh", "fresh_owned", ownedByDBSchema, declaredSchema, publicSchemaName, recordedSchema}))
 			Expect(s.calls).To(Equal([]string{
@@ -969,6 +970,21 @@ var _ = Describe("Privilege grants", func() {
 			Expect(reasons).To(Equal(map[string]bool{ReasonSchemaNotAllowed: true, ReasonSchemaNotManaged: true}))
 		})
 
+		It("does not manage a schema of a database owner no declared owner Role stands for", func() {
+			s := &fakeSchemaClient{dbOwner: ogtLegacy, owners: map[string]string{ogtOldSchema: ogtLegacy}}
+			db := &postgresv1alpha1.Database{Spec: postgresv1alpha1.DatabaseSpec{Schemas: []postgresv1alpha1.SchemaSpec{
+				{Name: ogtOldSchema}}}}
+			managed, refused, err := reconcileSchemas(ctx, s, db, "")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(managed).To(BeEmpty())
+			Expect(refused).To(MatchError(ContainSubstring(ogtOldSchema + " (owned by legacy_owner)")))
+
+			By("managing it once the Database declares that owner")
+			managed, _, err = reconcileSchemas(ctx, s, db, ogtLegacy)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(managed).To(Equal([]string{ogtOldSchema}))
+		})
+
 		It("manages a schema public owned by the bootstrap superuser for grants only", func() {
 			s := &fakeSchemaClient{
 				dbOwner:    grantTestAdmin,
@@ -980,7 +996,7 @@ var _ = Describe("Privilege grants", func() {
 				{Name: publicSchemaName, Owner: grantTestRole},
 			}}}
 			db.Status.CreatedSchemas = []string{publicSchemaName}
-			managed, refused, err := reconcileSchemas(ctx, s, db)
+			managed, refused, err := reconcileSchemas(ctx, s, db, "")
 			Expect(err).NotTo(HaveOccurred())
 			Expect(refused).NotTo(HaveOccurred())
 			Expect(managed).To(Equal([]string{publicSchemaName}))

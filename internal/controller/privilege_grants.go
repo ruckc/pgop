@@ -83,11 +83,19 @@ type grantTarget struct {
 	// ForRole is, for default privileges, the role whose future objects
 	// they apply to (Name is the schema). It is part of the key.
 	ForRole string
+	// OID is, for object grants, the object's OID. When set it replaces
+	// Name in the key: an object keeps its entry when it is renamed, and an
+	// object dropped and created again under the same name gets a new one.
+	OID int64
 }
 
 // key returns the target's stable, unambiguous ledger key.
 func (t grantTarget) key() string {
-	k := string(t.Kind) + "|" + strconv.Quote(t.Name) + "|" + strconv.Quote(t.Grantee)
+	name := strconv.Quote(t.Name)
+	if t.OID != 0 {
+		name = "#" + strconv.FormatInt(t.OID, 10)
+	}
+	k := string(t.Kind) + "|" + name + "|" + strconv.Quote(t.Grantee)
 	if t.ForRole != "" {
 		k += "|" + strconv.Quote(t.ForRole)
 	}
@@ -251,15 +259,20 @@ func applyPrivilegeGrants(ctx context.Context, desired, managed []privilegeGrant
 	for _, d := range desired {
 		want[d.key()] = d
 	}
+	var errs []error
+	// Over the limit nothing is granted (the ledger could not record it),
+	// but revokes still run: they only shrink the ledger, and a privilege
+	// whose grantee the policy refuses must never stay granted.
+	grantable := desired
 	if n := len(union(slices.Collect(maps.Keys(tracked)), slices.Collect(maps.Keys(want)))); limit > 0 && n > int(limit) {
-		return sortedGrants(tracked), &conditionError{reason: ReasonTooManyGrants, err: fmt.Errorf(
+		errs = append(errs, &conditionError{reason: ReasonTooManyGrants, err: fmt.Errorf(
 			"the grants declared and those pgop still tracks add up to %d entries; pgop tracks at most %d. "+
-				"Nothing was granted or revoked: remove grants from the spec", n, limit)}
+				"Nothing was granted (removed grants are still revoked): remove grants from the spec", n, limit)})
+		grantable = nil
 	}
 
-	var errs []error
 	var plan []plannedGrant
-	for _, d := range desired {
+	for _, d := range grantable {
 		p, err := planMissing(ctx, d, ops)
 		if err != nil {
 			errs = append(errs, err)

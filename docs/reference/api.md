@@ -382,8 +382,8 @@ spec:
             - string       # USAGE, CREATE, ALL or ALL PRIVILEGES (any case; max 8)
           withGrantOption: boolean   # not allowed for PUBLIC
       # Privileges on existing objects of the schema (max 32). Only objects
-      # owned by the database owner, a role of the Cluster's Roles (no
-      # superuser) or the operator are granted on, and no
+      # owned by a role of the Cluster's Roles (no superuser; also for the
+      # database and schema owners) or the operator are granted on, and no
       # extension members; the operator's SECURITY DEFINER/non-SQL functions,
       # views and TRIGGER/MAINTAIN on its tables are skipped too (reason
       # ObjectGrantSkipped). Tracked per object in
@@ -529,10 +529,11 @@ status:
       kind: string         # schema, tables, sequences or functions
       schema: string       # The extension's schema (kind schema)
       privileges: [string] # Added on at least one object; revoked from every object of the kind
-  managedObjectGrants:     # max 4096, one entry per object and grantee
+  managedObjectGrants:     # max 4096 (and about 512 KiB), one entry per object and grantee
     - schema: string
       kind: string         # table, sequence, function, procedure or type
-      object: string       # As PostgreSQL renders it (app."Orders", app.f(integer))
+      object: string       # As PostgreSQL renders it (app."Orders", app.f(integer)), max 1024
+      oid: integer         # The object's OID: followed across renames; gone once dropped
       role: string         # Role name or PUBLIC
       privileges: [string]
       grantOptions: [string]

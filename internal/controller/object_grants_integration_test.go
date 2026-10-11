@@ -271,6 +271,25 @@ func ogITTables(it *ogIT) {
 		t.Fatalf("ledger = %v", l)
 	}
 
+	t.Log("a renamed object keeps its entry (by OID); revoking follows the object")
+	named := it.database.Spec.Schemas[0].ObjectGrants
+	it.setGrants(postgresv1alpha1.ObjectGrantSpec{Role: ogApp, Kind: postgresv1alpha1.ObjectGrantTable,
+		Objects: []string{selectAll}, Privileges: []string{postgres.PrivilegeSelect}})
+	it.mustReconcile()
+	before := len(it.ledger())
+	it.as(ogOwner, `ALTER TABLE app.t1 RENAME TO t1_renamed`)
+	it.mustReconcile()
+	if l := it.ledger(); len(l) != before || !slices.ContainsFunc(l, func(s string) bool { return strings.Contains(s, "t1_renamed") }) ||
+		!it.has("has_table_privilege", "app.t1_renamed", "SELECT") {
+		t.Fatalf("ledger = %v", l)
+	}
+	it.as(ogOwner, `ALTER TABLE app.t1_renamed RENAME TO t1`)
+	it.setGrants(named...)
+	it.mustReconcile()
+	if it.has("has_table_privilege", "app.v1", "SELECT") || len(it.ledger()) != 2 {
+		t.Fatalf("narrowing again: %v", it.ledger())
+	}
+
 	t.Log("named objects of untrusted owners are refused; missing names are reported; names are never SQL")
 	it.setGrants(postgresv1alpha1.ObjectGrantSpec{Role: ogApp, Kind: postgresv1alpha1.ObjectGrantTable,
 		Objects: []string{"t1", "su_t", "out_t", "x'); DROP TABLE app.t1; --"}, Privileges: []string{postgres.PrivilegeSelect}})
@@ -307,7 +326,7 @@ func ogITRoutinesAndTypes(it *ogIT) {
 	t := it.t
 	t.Log("a signature selects one overload; quotes in names are data")
 	it.setGrants(postgresv1alpha1.ObjectGrantSpec{Role: ogApp, Kind: postgresv1alpha1.ObjectGrantFunction,
-		Objects: []string{"f(int4)", `q"uote(integer)`}, Privileges: []string{postgres.PrivilegeExecute}})
+		Objects: []string{ogtSigF, `q"uote(integer)`}, Privileges: []string{postgres.PrivilegeExecute}})
 	it.mustReconcile()
 	if l := it.ledger(); !slices.Equal(l, []string{`function app."q""uote"(integer) og_app EXECUTE`,
 		"function app.f(integer) og_app EXECUTE"}) {
@@ -417,9 +436,6 @@ func ogITDefaultPrivileges(it *ogIT) {
 	if !it.has("has_table_privilege", "app.m3", "SELECT") {
 		t.Fatal("default privileges not applied")
 	}
-	// m1 got SELECT from the default privileges while they were declared
-	// before; pgop no longer tracks that one.
-	it.exec(`REVOKE SELECT ON app.m1 FROM ` + ogApp)
 }
 
 // ogITRoleCleanup checks that the ledger-based cleanup lets og_app be
@@ -432,8 +448,25 @@ func ogITRoleCleanup(it *ogIT, admin *sql.DB) {
 	if _, err := admin.ExecContext(it.ctx, `DROP ROLE `+ogApp); err == nil {
 		t.Fatal("DROP ROLE should fail while og_app holds privileges")
 	}
-	rec := &recordedObjectAccess{objects: it.database.Status.ManagedObjectGrants,
-		defaults: it.database.Status.ManagedDefaultPrivileges}
+	t.Log("the Database pauses og_app first (its Role is being deleted) and revokes its ledger entries")
+	paused := it.checker()
+	paused.deleting = map[string]bool{ogApp: true}
+	schemas := map[string]bool{ogSchema: true}
+	_ = reconcileObjectGrants(it.ctx, it.pg, it.database, schemas, it.version, paused, nil)
+	_ = reconcileDefaultPrivileges(it.ctx, it.pg, it.database, schemas, it.version, paused, nil)
+	if len(it.database.Status.ManagedObjectGrants) != 0 || len(it.database.Status.ManagedDefaultPrivileges) != 0 {
+		t.Fatalf("paused entries not revoked: %v %+v", it.ledger(), it.database.Status.ManagedDefaultPrivileges)
+	}
+	t.Log("the Role cleanup still revokes what the default privileges gave og_app on m1 and m3")
+	cluster := &postgresv1alpha1.Cluster{}
+	cluster.Name, cluster.UID = "c", ogtUID
+	db := it.database.DeepCopy()
+	db.Spec.ClusterRef.Name = cluster.Name
+	db.Status.DatabaseName, db.Status.ClusterUID = ogDB, ogtUID
+	rec := recordedObjectAccessFrom([]postgresv1alpha1.Database{*db}, cluster, ogApp)[ogDB]
+	if rec == nil {
+		t.Fatal("nothing recorded for og_app")
+	}
 	if err := revokeRecordedObjectAccess(it.ctx, it.pg, ogApp, rec); err != nil {
 		t.Fatal(err)
 	}

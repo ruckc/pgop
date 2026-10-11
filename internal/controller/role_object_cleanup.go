@@ -45,17 +45,37 @@ import (
 type recordedObjectAccess struct {
 	objects  []postgresv1alpha1.ManagedObjectGrant
 	defaults []postgresv1alpha1.ManagedDefaultPrivilege
+	// created lists default privileges to the role, recorded in a ledger or
+	// declared in a spec: the privileges they gave the role on the objects
+	// their forRole created are revoked too. The spec is consulted because
+	// a Database pausing the entry of a Role being deleted (or a spec change
+	// before) removes it from the ledger while those privileges remain.
+	created []createdObjectsGrant
+}
+
+// createdObjectsGrant is what default privileges gave a grantee on the
+// objects of one kind forRole creates in schema.
+type createdObjectsGrant struct {
+	schema, forRole string
+	kind            defaultKindInfo
+	privileges      []string
 }
 
 // recordedObjectAccessOf returns, per PostgreSQL database of cluster, the
 // object grants to role and the default privileges for or to role that the
-// Databases of the Cluster record.
+// Databases of the Cluster record or declare.
 func recordedObjectAccessOf(ctx context.Context, c client.Reader, cluster *postgresv1alpha1.Cluster, role string) (
 	map[string]*recordedObjectAccess, error) {
 	databases := &postgresv1alpha1.DatabaseList{}
 	if err := c.List(ctx, databases, client.InNamespace(cluster.Namespace)); err != nil {
 		return nil, fmt.Errorf("failed to list Databases: %w", err)
 	}
+	return recordedObjectAccessFrom(databases.Items, cluster, role), nil
+}
+
+// recordedObjectAccessFrom is recordedObjectAccessOf on a list of Databases.
+// Entries in system schemas are ignored (pgop never grants there).
+func recordedObjectAccessFrom(databases []postgresv1alpha1.Database, cluster *postgresv1alpha1.Cluster, role string) map[string]*recordedObjectAccess {
 	out := map[string]*recordedObjectAccess{}
 	at := func(db string) *recordedObjectAccess {
 		if out[db] == nil {
@@ -63,30 +83,55 @@ func recordedObjectAccessOf(ctx context.Context, c client.Reader, cluster *postg
 		}
 		return out[db]
 	}
-	for i := range databases.Items {
-		db := &databases.Items[i]
-		if db.Spec.ClusterRef.Name != cluster.Name || db.Status.ClusterUID != string(cluster.UID) || db.Status.DatabaseName == "" {
+	for i := range databases {
+		db := &databases[i]
+		name := db.Status.DatabaseName
+		if db.Spec.ClusterRef.Name != cluster.Name || db.Status.ClusterUID != string(cluster.UID) || name == "" {
 			continue
 		}
 		for _, g := range db.Status.ManagedObjectGrants {
-			if g.Role == role {
-				at(db.Status.DatabaseName).objects = append(at(db.Status.DatabaseName).objects, g)
+			if g.Role == role && validLedgerSchema(g.Schema) {
+				at(name).objects = append(at(name).objects, g)
 			}
 		}
+		seen := map[string]bool{}
+		addCreated := func(schema, forRole string, kind defaultKindInfo, privileges []string) {
+			k := schema + "|" + forRole + "|" + string(kind.api)
+			if !validLedgerSchema(schema) || forRole == "" || len(privileges) == 0 || seen[k] {
+				return
+			}
+			seen[k] = true
+			at(name).created = append(at(name).created, createdObjectsGrant{schema, forRole, kind, privileges})
+		}
 		for _, d := range db.Status.ManagedDefaultPrivileges {
-			if d.Role == role || d.ForRole == role {
-				at(db.Status.DatabaseName).defaults = append(at(db.Status.DatabaseName).defaults, d)
+			if (d.Role != role && d.ForRole != role) || !validLedgerSchema(d.Schema) {
+				continue
+			}
+			at(name).defaults = append(at(name).defaults, d)
+			if ki, ok := defaultKindOf(d.Kind); ok && d.Role == role {
+				addCreated(d.Schema, d.ForRole, ki, union(d.Privileges, d.GrantOptions))
+			}
+		}
+		for _, s := range db.Spec.Schemas {
+			for _, d := range s.DefaultPrivileges {
+				ki, ok := defaultKindOf(d.Kind)
+				if !ok || postgres.CanonicalGrantee(d.Role) != role {
+					continue
+				}
+				if privs, err := normalizeObjectPrivileges(ki.object, d.Privileges); err == nil {
+					addCreated(s.Name, d.ForRole, ki, privs)
+				}
 			}
 		}
 	}
-	return out, nil
+	return out
 }
 
 // objectAccessRevoker is the subset of *postgres.Client used to revoke
 // recorded object grants and default privileges.
 type objectAccessRevoker interface {
-	RevokeOnSchemaObject(ctx context.Context, kind postgres.SchemaObjectKind, schema, identity, grantee string,
-		privileges []string, mode postgres.RevokeMode) error
+	RevokeOnSchemaObject(ctx context.Context, kind postgres.SchemaObjectKind, schema, identity string, oid int64,
+		grantee string, privileges []string, mode postgres.RevokeMode) error
 	RevokeDefaultPrivileges(ctx context.Context, t postgres.DefaultPrivilegesTarget, grantee string, privileges []string,
 		mode postgres.RevokeMode) error
 	RoleOIDs(ctx context.Context, names []string) (map[string]int64, error)
@@ -96,14 +141,14 @@ type objectAccessRevoker interface {
 
 var _ objectAccessRevoker = (*postgres.Client)(nil)
 
-// revokeRecordedObjectAccess revokes what rec lists, with CASCADE (the role
-// is about to be dropped, so what it passed on goes with it, as with the
-// other privileges pgop revokes before DROP ROLE). Default privileges for
-// the role are revoked from their grantee; that removes the pg_default_acl
-// entry once it is empty. Default privileges to the role are revoked, and so
-// are the privileges they gave the role on the objects their forRole created
-// in the schema since (what PostgreSQL copied from them into the objects'
-// ACLs).
+// revokeRecordedObjectAccess revokes what rec lists from role, with CASCADE
+// (the role is about to be dropped, so what it passed on goes with it, as
+// with the other privileges pgop revokes before DROP ROLE). Default
+// privileges for the role are revoked from their grantee; that removes the
+// pg_default_acl entry once it is empty. Default privileges to the role are
+// revoked, and so are the privileges default privileges gave the role on the
+// objects their forRole created in the schema (what PostgreSQL copied from
+// them into the objects' ACLs).
 func revokeRecordedObjectAccess(ctx context.Context, pg objectAccessRevoker, role string, rec *recordedObjectAccess) error {
 	var errs []error
 	for _, g := range rec.objects {
@@ -112,7 +157,7 @@ func revokeRecordedObjectAccess(ctx context.Context, pg objectAccessRevoker, rol
 			continue
 		}
 		errs = append(errs, revokeRecorded(g.Privileges, g.GrantOptions, func(privs []string, mode postgres.RevokeMode) error {
-			return pg.RevokeOnSchemaObject(ctx, ki.pg, g.Schema, g.Object, g.Role, privs, mode)
+			return pg.RevokeOnSchemaObject(ctx, ki.pg, g.Schema, g.Object, g.OID, g.Role, privs, mode)
 		}))
 	}
 	for _, d := range rec.defaults {
@@ -124,37 +169,32 @@ func revokeRecordedObjectAccess(ctx context.Context, pg objectAccessRevoker, rol
 		errs = append(errs, revokeRecorded(d.Privileges, d.GrantOptions, func(privs []string, mode postgres.RevokeMode) error {
 			return pg.RevokeDefaultPrivileges(ctx, t, d.Role, privs, mode)
 		}))
-		if d.Role == role {
-			errs = append(errs, revokeFromCreatedObjects(ctx, pg, d, ki))
-		}
+	}
+	for _, c := range rec.created {
+		errs = append(errs, revokeFromCreatedObjects(ctx, pg, role, c))
 	}
 	return errors.Join(errs...)
 }
 
-// revokeFromCreatedObjects revokes the privileges the default privileges d
-// recorded from d.Role on the objects of the kind d.ForRole owns in d.Schema.
-func revokeFromCreatedObjects(ctx context.Context, pg objectAccessRevoker, d postgresv1alpha1.ManagedDefaultPrivilege,
-	ki defaultKindInfo) error {
-	privs := union(d.Privileges, d.GrantOptions)
-	if len(privs) == 0 {
-		return nil
-	}
-	oids, err := pg.RoleOIDs(ctx, []string{d.Role, d.ForRole})
+// revokeFromCreatedObjects revokes c's privileges from role on the objects
+// of c's kind that c.forRole owns in c.schema (not those of an extension).
+func revokeFromCreatedObjects(ctx context.Context, pg objectAccessRevoker, role string, c createdObjectsGrant) error {
+	oids, err := pg.RoleOIDs(ctx, []string{role, c.forRole})
 	if err != nil {
 		return err
 	}
-	grantee, ok := oids[d.Role]
-	owner, ownerExists := oids[d.ForRole]
+	grantee, ok := oids[role]
+	owner, ownerExists := oids[c.forRole]
 	if !ok || !ownerExists {
 		return nil
 	}
-	kinds := []postgres.SchemaObjectKind{ki.object}
-	if ki.object == postgres.SchemaFunction {
+	kinds := []postgres.SchemaObjectKind{c.kind.object}
+	if c.kind.object == postgres.SchemaFunction {
 		kinds = append(kinds, postgres.SchemaProcedure) // ON FUNCTIONS covers procedures
 	}
 	var errs []error
 	for _, kind := range kinds {
-		objects, err := pg.ListSchemaObjects(ctx, d.Schema, kind, postgres.SchemaObjectSelector{All: true})
+		objects, err := pg.ListSchemaObjects(ctx, c.schema, kind, postgres.SchemaObjectSelector{All: true})
 		if err != nil {
 			errs = append(errs, err)
 			continue
@@ -164,8 +204,8 @@ func revokeFromCreatedObjects(ctx context.Context, pg objectAccessRevoker, d pos
 				continue
 			}
 			held, _ := o.Held(grantee)
-			if revoke := intersect(privs, held); len(revoke) > 0 {
-				errs = append(errs, pg.RevokeOnSchemaObject(ctx, kind, d.Schema, o.Identity, d.Role, revoke,
+			if revoke := intersect(c.privileges, held); len(revoke) > 0 {
+				errs = append(errs, pg.RevokeOnSchemaObject(ctx, kind, c.schema, o.Identity, o.OID, role, revoke,
 					postgres.RevokeMode{Cascade: true}))
 			}
 		}

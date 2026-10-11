@@ -581,9 +581,9 @@ spec:
                         tables (also views, materialized views and foreign tables), sequences,
                         functions, procedures and types (also domains). Objects are named, or
                         selected with "*" (every object of the kind in the schema, re-evaluated
-                        on every reconcile). pgop only grants on objects owned by the database
-                        owner, a role managed by a Role of the same Cluster (neither a
-                        superuser), or the operator; objects owned by another role or a
+                        on every reconcile). pgop only grants on objects owned by a role managed
+                        by a Role of the same Cluster (not a superuser; this applies to the
+                        database owner too), or the operator; objects owned by another role or a
                         superuser, objects that belong to an extension (see
                         spec.extensions[].grants) and, among the operator's objects, SECURITY
                         DEFINER functions, functions not written in SQL or PL/pgSQL, views,
@@ -953,12 +953,15 @@ spec:
                     forRole:
                       description: forRole is the role whose future objects get the
                         privileges.
+                      maxLength: 63
                       type: string
                     grantOptions:
                       description: grantOptions are the privileges whose grant option
                         pgop added.
                       items:
+                        maxLength: 16
                         type: string
+                      maxItems: 8
                       type: array
                       x-kubernetes-list-type: set
                     kind:
@@ -974,15 +977,19 @@ spec:
                         privileges are the default privileges pgop added. Only these are
                         removed once they leave the spec.
                       items:
+                        maxLength: 16
                         type: string
+                      maxItems: 8
                       type: array
                       x-kubernetes-list-type: set
                     role:
                       description: 'role is the grantee: a PostgreSQL role, or PUBLIC.'
+                      maxLength: 63
                       type: string
                     schema:
                       description: schema is the schema the default privileges apply
                         in.
+                      maxLength: 63
                       type: string
                   required:
                   - forRole
@@ -1110,7 +1117,9 @@ spec:
                         grantOptions are the privileges whose grant option pgop added.
                         Revoking them cascades to what the grantee passed on.
                       items:
+                        maxLength: 16
                         type: string
+                      maxItems: 8
                       type: array
                       x-kubernetes-list-type: set
                     kind:
@@ -1125,21 +1134,35 @@ spec:
                     object:
                       description: |-
                         object is the object as PostgreSQL renders it (schema-qualified and
-                        quoted, with argument types for functions and procedures).
+                        quoted, with argument types for functions and procedures), as last
+                        seen.
+                      maxLength: 1024
                       type: string
+                    oid:
+                      description: |-
+                        oid is the object's OID. pgop follows the object by it: a renamed
+                        object keeps its entry, and once no object of the kind has this OID the
+                        entry is forgotten (the object was dropped; one created again under
+                        the same name is another object).
+                      format: int64
+                      type: integer
                     privileges:
                       description: |-
                         privileges are the privileges pgop added (normalized, ALL expanded).
                         Only these are revoked once no entry selects the object.
                       items:
+                        maxLength: 16
                         type: string
+                      maxItems: 8
                       type: array
                       x-kubernetes-list-type: set
                     role:
                       description: 'role is the grantee: a PostgreSQL role, or PUBLIC.'
+                      maxLength: 63
                       type: string
                     schema:
                       description: schema is the schema the object is in.
+                      maxLength: 63
                       type: string
                   required:
                   - kind
@@ -1249,6 +1272,7 @@ spec:
                         skippedExamples names up to five skipped objects and why they were
                         skipped.
                       items:
+                        maxLength: 2048
                         type: string
                       maxItems: 5
                       type: array

@@ -411,10 +411,11 @@ The same rules hold for `grants`, `schemas[].grants`, `schemas[].objectGrants`,
 - The ledgers are bounded (`managedGrants` 512 entries, `managedSchemaGrants`
   2048, `managedExtensionGrants` 1024, `managedObjectGrants` 4096 (one entry
   per object and grantee), `managedDefaultPrivileges` 2048,
-  `managedParameterGrants` 512). A change whose declared grants plus the
-  grants pgop still tracks would exceed that is refused as a whole with reason
-  `TooManyGrants`; nothing of that kind is granted or revoked until grants are
-  removed from the spec, and nothing tracked is lost.
+  `managedParameterGrants` 512). When the declared grants plus the grants pgop
+  still tracks would exceed that, nothing of that kind is granted (reason
+  `TooManyGrants`) until grants are removed from the spec; revokes of grants
+  removed from the spec, or whose grantee the policy no longer allows, still
+  run, so the ledger only shrinks and nothing tracked is lost.
 - The first reconcile of a Database without a ledger records what it adds
   without revoking anything. If the status is lost (the Database is
   re-created, or restored without status), grants removed in the meantime are
@@ -434,8 +435,10 @@ A Database changes the owner of, and grants on, only schemas it manages:
 - schemas it created (recorded in `status.createdSchemas`); a schema without
   a declared `owner` is created owned by the database's owner; and
 - existing schemas owned by a role that is not a superuser and is the
-  schema's declared `owner`, the database's owner, or `pg_database_owner`
-  (the owner of `public` since PostgreSQL 15); and
+  schema's declared `owner`, the database's owner when the Database declares
+  it in `owner` (a database adopted without `owner` may keep an owner no Role
+  manages, whose schemas are not taken over), or `pg_database_owner` (the
+  owner of `public` since PostgreSQL 15); and
 - the schema `public` of a database created by PostgreSQL 14 or older, owned
   by the bootstrap superuser: it is managed for grants only, and its owner is
   never changed (a declared `owner` is ignored for it).
@@ -498,13 +501,17 @@ spec:
   (without parentheses) selects every overload.
 - `["*"]` selects every object of the kind in the schema at the time of the
   reconcile, listed again on every reconcile. At most 5000 objects per kind
-  and schema: beyond that pgop grants and revokes nothing for that kind and
-  schema and reports `TooManyObjects`.
-- Reconciles are event-driven (a spec change, a change of a Role the
-  Database names, the periodic resync): a table created by a migration is
-  granted on by `"*"` at the next reconcile, not immediately. Pair `"*"` with
-  [default privileges](#default-privileges) for objects created later, or
-  touch the Database (an annotation) after a migration.
+  and schema: beyond that pgop grants nothing for that kind and schema and
+  reports `TooManyObjects`; what it granted there stays, except grants to a
+  grantee the policy no longer allows, which are revoked.
+- **`"*"` is evaluated when the Database reconciles, not when objects are
+  created.** Reconciles are event-driven: a change of the Database, a change
+  of a Role the Database names, and the controller's periodic resync (about
+  every 10 hours by default). A table created by a migration is therefore
+  granted on by `"*"` only at the next reconcile. Pair `"*"` with
+  [default privileges](#default-privileges), which apply the moment the
+  object is created, or touch the Database after a migration, for example
+  `kubectl annotate database <name> pgop.ruck.io/reconcile="$(date +%s)" --overwrite`.
 - A named object that does not exist (yet) is reported with reason
   `ObjectNotFound` and retried; the other grants are still applied.
 - pgop reads each kind of each schema with one catalog query per reconcile.
@@ -521,12 +528,14 @@ the Cluster's trust domain. An object is granted on only when:
 - it does not belong to an extension (`pg_depend` type `e`): grant on
   extension objects with [`extensions[].grants`](#grants-on-extension-objects),
   which has its own safety rules; and
-- its owner is the database owner or a role managed by a Role of the same
-  Cluster (neither of them a superuser), or the operator itself. The schema's
-  declared `owner` counts only when it is such a role: a Database writer can
-  declare any existing role the `owner` of an existing schema that role owns
-  (see [Which schemas a Database manages](#which-schemas-a-database-manages)),
-  and that must not open up the role's tables.
+- its owner is a role managed by a Role of the same Cluster (not a
+  superuser), or the operator itself. The database owner and the schema's
+  declared `owner` count only when they are such a role: a database adopted
+  without `owner` may keep a legacy owner no Role manages, and a Database
+  writer can declare any existing role the `owner` of an existing schema that
+  role owns (see
+  [Which schemas a Database manages](#which-schemas-a-database-manages));
+  neither must open up that role's objects.
 
 Objects the operator owns (created by a bootstrap Job with the Cluster
 credentials, for example) act with superuser privileges where they act as
@@ -539,9 +548,20 @@ table that superuser jobs write to would run code as that superuser).
 
 Everything else is skipped: objects owned by another superuser or by a role
 outside the Cluster's Roles (including roles listed in
-`allowedExistingRoles`), extension members, and the operator's objects above.
-A `SECURITY DEFINER` function owned by a managed (non-superuser) role is fine:
-it runs as that role.
+`allowedExistingRoles`), extension members, the operator's objects above, and
+objects whose rendered name is longer than 1024 characters (pgop could not
+record it). A `SECURITY DEFINER` function owned by a managed (non-superuser)
+role is fine: it runs as that role.
+
+!!! warning "`TRIGGER` runs the grantee's code as whoever writes"
+    `TRIGGER` lets the grantee create triggers on the table, and a trigger
+    function runs as the role that inserts, updates or deletes, not as the
+    trigger's creator. pgop only grants `TRIGGER` on tables a managed role
+    owns (never on the operator's), so only roles of the Cluster's trust
+    domain can be affected through pgop. Still, grant it only when every role
+    that writes to the table (the owner, the application, a DBA's jobs)
+    trusts the grantee: a superuser writing to the table would run the
+    grantee's code as a superuser.
 
 - Objects selected with `"*"` that are skipped are counted in
   `status.objectGrants[]` (`skipped`, with up to five `skippedExamples`
@@ -560,18 +580,22 @@ it runs as that role.
   object with the declared privileges and grants only what is missing, as
   for the other grants (see [What pgop tracks](#what-pgop-tracks)).
 - `status.managedObjectGrants` records, **per object and grantee**, the
-  privileges and grant options pgop added (written before the `GRANT`). An
-  object that an entry no longer selects (the entry or a name was removed, a
-  `"*"` became a list, the object no longer qualifies) has exactly those
-  revoked; privileges granted by hand or held before are never revoked.
-- An object that was dropped is forgotten. So is one that was renamed or
-  moved to another schema (the privileges stay on it; pgop no longer tracks
-  them, and a `"*"` that selects it again finds them held and does not record
-  them).
-- The ledger holds at most 4096 entries (one per object and grantee): a
-  change that would exceed it is refused as a whole (`TooManyGrants`). For
-  large schemas, grant to one group role and make the application roles
-  members of it.
+  privileges and grant options pgop added (written before the `GRANT`), with
+  the object's OID. An object that an entry no longer selects (the entry or a
+  name was removed, a `"*"` became a list, the object no longer qualifies)
+  has exactly those revoked; privileges granted by hand or held before are
+  never revoked.
+- pgop follows an object by its OID: a renamed object keeps its entry (the
+  recorded name is updated), and the revoke reaches it wherever it is now. A
+  dropped object is forgotten; a new object created under the same name is
+  another object, with an entry of its own.
+- The ledger holds at most 4096 entries (one per object and grantee) and
+  about 512 KiB. A change that would exceed either grants nothing new
+  (`TooManyGrants`); revokes still run. For large schemas, grant to one
+  group role and make the application roles members of it.
+- `status.objectGrants[].granted` counts the objects with a grant to an
+  allowed grantee; a kind and schema whose objects could not be listed is
+  left out of `status.objectGrants`.
 - Grantees follow the [grantee policy](#grantee-policy); grants to a Role
   being deleted are paused and revoked (see
   [Roles: deletion](roles.md#deletion)).
@@ -630,9 +654,10 @@ spec:
   privileges they were created with (PostgreSQL copies them into the
   object's own ACL); revoke them with `objectGrants` removal or by hand.
 - Deleting the `forRole`'s or the grantee's Role pauses the entry and
-  removes what pgop set. The grantee's Role deletion also revokes what the
-  default privileges gave it on the objects `forRole` created (see
-  [Roles: deletion](roles.md#deletion)).
+  removes what pgop set. The grantee's Role deletion also revokes the
+  privileges the entry's default privileges gave it on the objects `forRole`
+  owns in the schema, for entries still declared in a Database's spec or
+  recorded in its ledger (see [Roles: deletion](roles.md#deletion)).
 
 ## Grantee policy
 
@@ -1179,9 +1204,8 @@ the server:
   or C functions, privileges on views, or `TRIGGER` (see
   [Grants on extension objects](#grants-on-extension-objects));
 - object grants only reach objects in schemas the Database manages whose
-  owner is in the Cluster's trust domain (the database owner or a role of the
-  Cluster's Roles, neither a superuser, or the operator under the extension
-  rules); objects of other superusers or
+  owner is in the Cluster's trust domain (a role of the Cluster's Roles that
+  is not a superuser, or the operator under the extension rules); objects of other superusers or
   outside roles, extension members, and the operator's `SECURITY DEFINER`
   and C functions, views and `TRIGGER`/`MAINTAIN` on its tables are refused
   (see [Which objects pgop grants on](#which-objects-pgop-grants-on)).

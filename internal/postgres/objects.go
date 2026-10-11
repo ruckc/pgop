@@ -298,25 +298,46 @@ JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace
 WHERE t.oid = pg_catalog.to_regtype($1) AND n.nspname = $2`,
 }
 
-// ResolveSchemaObject looks up the object identity (as rendered by
-// ListSchemaObjects) of kind in schema and returns the server's current
-// rendering of it, or found false when it no longer exists there (dropped,
-// renamed, or moved to another schema).
-func (c *Client) ResolveSchemaObject(ctx context.Context, kind SchemaObjectKind, schema, identity string) (canonical string, found bool, err error) {
-	canonical, _, found, err = c.resolveSchemaObject(ctx, kind, schema, identity)
+// resolveOIDQueries render the object with OID $1 of a kind as the server
+// does (NULL when no object of the kind has that OID).
+var resolveOIDQueries = map[SchemaObjectKind]string{
+	SchemaTable: `SELECT c.oid::int8, c.oid::pg_catalog.regclass::text FROM pg_catalog.pg_class c
+WHERE c.oid = $1::int8::oid AND c.relkind IN ('r', 'p', 'v', 'm', 'f')`,
+	SchemaSequence: `SELECT c.oid::int8, c.oid::pg_catalog.regclass::text FROM pg_catalog.pg_class c
+WHERE c.oid = $1::int8::oid AND c.relkind = 'S'`,
+	SchemaFunction: `SELECT p.oid::int8, p.oid::pg_catalog.regprocedure::text FROM pg_catalog.pg_proc p
+WHERE p.oid = $1::int8::oid AND p.prokind IN ('f', 'a', 'w')`,
+	SchemaProcedure: `SELECT p.oid::int8, p.oid::pg_catalog.regprocedure::text FROM pg_catalog.pg_proc p
+WHERE p.oid = $1::int8::oid AND p.prokind = 'p'`,
+	SchemaType: `SELECT t.oid::int8, t.oid::pg_catalog.regtype::text FROM pg_catalog.pg_type t
+WHERE t.oid = $1::int8::oid`,
+}
+
+// ResolveSchemaObject returns the server's current rendering of an object
+// of kind. With oid set (as recorded by pgop) the object is looked up by
+// OID, wherever it is now and whatever its name: found is false once it was
+// dropped. Without, the identity (as rendered by ListSchemaObjects) is looked
+// up in schema: found is false when it no longer exists there.
+func (c *Client) ResolveSchemaObject(ctx context.Context, kind SchemaObjectKind, schema, identity string, oid int64) (
+	canonical string, found bool, err error) {
+	canonical, _, found, err = c.resolveSchemaObject(ctx, kind, schema, identity, oid)
 	return canonical, found, err
 }
 
-func (c *Client) resolveSchemaObject(ctx context.Context, kind SchemaObjectKind, schema, identity string) (
+func (c *Client) resolveSchemaObject(ctx context.Context, kind SchemaObjectKind, schema, identity string, byOID int64) (
 	canonical string, oid int64, found bool, err error) {
 	query, ok := resolveObjectQueries[kind]
 	if !ok {
 		return "", 0, false, fmt.Errorf("unsupported object kind %q", kind)
 	}
-	if identity == "" {
+	args := []any{identity, schema}
+	switch {
+	case byOID != 0:
+		query, args = resolveOIDQueries[kind], []any{byOID}
+	case identity == "":
 		return "", 0, false, nil
 	}
-	err = c.db.QueryRowContext(ctx, query, identity, schema).Scan(&oid, &canonical)
+	err = c.db.QueryRowContext(ctx, query, args...).Scan(&oid, &canonical)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", 0, false, nil
 	}
@@ -368,7 +389,7 @@ func buildSchemaObjectPrivilegesQuery(grant bool, kind SchemaObjectKind, canonic
 // since it listed it).
 func (c *Client) GrantOnSchemaObject(ctx context.Context, kind SchemaObjectKind, schema, identity string, oid int64,
 	grantee string, privileges []string, withGrantOption bool) error {
-	canonical, resolved, found, err := c.resolveSchemaObject(ctx, kind, schema, identity)
+	canonical, resolved, found, err := c.resolveSchemaObject(ctx, kind, schema, identity, 0)
 	if err != nil {
 		return err
 	}
@@ -385,12 +406,13 @@ func (c *Client) GrantOnSchemaObject(ctx context.Context, kind SchemaObjectKind,
 	return nil
 }
 
-// RevokeOnSchemaObject revokes privileges (or their grant option) on the
-// object identity of kind in schema from grantee. An object that no longer
+// RevokeOnSchemaObject revokes privileges (or their grant option) on an
+// object of kind from grantee: the object with OID oid when set (wherever it
+// is now), otherwise the object identity in schema. An object that no longer
 // exists holds nothing to revoke.
-func (c *Client) RevokeOnSchemaObject(ctx context.Context, kind SchemaObjectKind, schema, identity, grantee string,
-	privileges []string, mode RevokeMode) error {
-	canonical, found, err := c.ResolveSchemaObject(ctx, kind, schema, identity)
+func (c *Client) RevokeOnSchemaObject(ctx context.Context, kind SchemaObjectKind, schema, identity string, oid int64,
+	grantee string, privileges []string, mode RevokeMode) error {
+	canonical, found, err := c.ResolveSchemaObject(ctx, kind, schema, identity, oid)
 	if err != nil || !found {
 		return err
 	}

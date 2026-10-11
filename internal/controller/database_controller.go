@@ -204,7 +204,7 @@ func (r *DatabaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	// role can write to), then apply the schema and extension grants.
 	// Refused schemas, extensions and grants are reported once the rest is
 	// done.
-	createdSchemas, refusedErr, err := reconcileSchemas(ctx, dbClient, database)
+	createdSchemas, refusedErr, err := reconcileSchemas(ctx, dbClient, database, ownerPGName)
 	if err != nil {
 		log.Error(err, "Failed to reconcile schemas")
 		return r.updateStatus(ctx, database, false, createdSchemas, err)
@@ -258,7 +258,9 @@ const pgDatabaseOwnerRole = "pg_database_owner"
 // schema is managed when the Database created it (it is recorded in
 // status.createdSchemas) or, for an existing schema, when it is owned by a
 // role that is not a superuser and is the schema's declared owner, the
-// database's owner, or pg_database_owner. Any other existing schema (one an
+// database's owner when it is the owner Role the Database declares
+// (ownerPGName; a database adopted without spec.owner may keep an owner no
+// Role manages), or pg_database_owner. Any other existing schema (one an
 // extension script, the operator or another role created) is left alone:
 // its owner is not changed and no grants are applied on it (reason
 // SchemaNotManaged), except the schema public owned by the bootstrap
@@ -267,7 +269,8 @@ const pgDatabaseOwnerRole = "pg_database_owner"
 // without a declared owner is created owned by the database's owner. It
 // returns the managed schemas, an error listing the refused ones (nil when
 // none) and the error that stopped it.
-func reconcileSchemas(ctx context.Context, pg schemaClient, database *postgresv1alpha1.Database) (managed []string, refusedErr, err error) {
+func reconcileSchemas(ctx context.Context, pg schemaClient, database *postgresv1alpha1.Database, ownerPGName string) (
+	managed []string, refusedErr, err error) {
 	recorded := map[string]bool{}
 	for _, s := range database.Status.CreatedSchemas {
 		recorded[s] = true
@@ -321,7 +324,8 @@ func reconcileSchemas(ctx context.Context, pg schemaClient, database *postgresv1
 			continue
 		}
 		allowed := recorded[schema.Name]
-		if !allowed && (owner == schema.Owner || owner == dbOwner || owner == pgDatabaseOwnerRole) {
+		ownedByDeclaredDBOwner := owner == dbOwner && ownerPGName != "" && dbOwner == ownerPGName
+		if !allowed && (owner == schema.Owner || ownedByDeclaredDBOwner || owner == pgDatabaseOwnerRole) {
 			r, err := pg.LookupRole(ctx, owner)
 			if err != nil {
 				return keepRecorded(i), nil, err

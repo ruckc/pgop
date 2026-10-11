@@ -44,11 +44,12 @@ import (
 //     system schema),
 //   - it does not belong to an extension (pg_depend deptype 'e'; those are
 //     granted on through spec.extensions[].grants, with its own rules), and
-//   - its owner is the database owner or a role managed by a Role of the
-//     same Cluster (neither a superuser), or the operator itself. The
-//     schema's declared owner counts only as such a role: a Database writer
-//     can declare any existing role the owner of an existing schema it owns
-//     (see reconcileSchemas), which must not reach that role's objects.
+//   - its owner is a role managed by a Role of the same Cluster (not a
+//     superuser), or the operator itself. The database owner and the
+//     schema's declared owner count only as such a role: an adopted database
+//     can keep a legacy owner no Role manages, and a Database writer can
+//     declare any existing role the owner of an existing schema it owns (see
+//     reconcileSchemas); neither must reach that role's objects.
 //
 // Objects the operator owns run with superuser privileges where they act as
 // their owner, so the extension-grant rules apply to them: EXECUTE only on
@@ -79,6 +80,13 @@ const (
 	maxSkippedExamples = 5
 	// selectAll is the objects entry that selects every object of a kind.
 	selectAll = "*"
+	// maxIdentityLength is the maxLength of status.managedObjectGrants[].object:
+	// longer identities (functions with very many arguments) are skipped.
+	maxIdentityLength = 1024
+	// objectLedgerByteBudget bounds the estimated size of
+	// status.managedObjectGrants, well below etcd's object size limit
+	// together with the other ledgers.
+	objectLedgerByteBudget = 512 * 1024
 )
 
 // Routine languages whose functions run with the caller's privileges and
@@ -150,8 +158,17 @@ func dropMaintain(privs []string, serverVersion int) ([]string, bool) {
 }
 
 // objectTarget is the ledger target of privileges on one schema object.
-func objectTarget(kind postgres.SchemaObjectKind, schema, identity, grantee string) grantTarget {
-	return grantTarget{Kind: postgres.ObjectKind(kind), Name: identity, Schema: schema, Grantee: postgres.CanonicalGrantee(grantee)}
+func objectTarget(kind postgres.SchemaObjectKind, schema, identity string, oid int64, grantee string) grantTarget {
+	return grantTarget{Kind: postgres.ObjectKind(kind), Name: identity, Schema: schema, OID: oid,
+		Grantee: postgres.CanonicalGrantee(grantee)}
+}
+
+// objectKey identifies the object of an object grant target.
+func objectKey(t grantTarget) string {
+	if t.OID != 0 {
+		return fmt.Sprintf("%s|#%d", t.Kind, t.OID)
+	}
+	return string(t.Kind) + "|" + t.Name
 }
 
 // parseRoutineName splits a routine entry of objects into its name and
@@ -176,11 +193,11 @@ type objectGrantClient interface {
 	ListSchemaObjects(ctx context.Context, schema string, kind postgres.SchemaObjectKind,
 		sel postgres.SchemaObjectSelector) ([]postgres.SchemaObject, error)
 	ResolveRoutine(ctx context.Context, schema, name, args string) (int64, bool, error)
-	ResolveSchemaObject(ctx context.Context, kind postgres.SchemaObjectKind, schema, identity string) (string, bool, error)
+	ResolveSchemaObject(ctx context.Context, kind postgres.SchemaObjectKind, schema, identity string, oid int64) (string, bool, error)
 	GrantOnSchemaObject(ctx context.Context, kind postgres.SchemaObjectKind, schema, identity string, oid int64,
 		grantee string, privileges []string, withGrantOption bool) error
-	RevokeOnSchemaObject(ctx context.Context, kind postgres.SchemaObjectKind, schema, identity, grantee string,
-		privileges []string, mode postgres.RevokeMode) error
+	RevokeOnSchemaObject(ctx context.Context, kind postgres.SchemaObjectKind, schema, identity string, oid int64,
+		grantee string, privileges []string, mode postgres.RevokeMode) error
 	HeldDefaultPrivileges(ctx context.Context, t postgres.DefaultPrivilegesTarget, grantee string) ([]string, []string, error)
 	GrantDefaultPrivileges(ctx context.Context, t postgres.DefaultPrivilegesTarget, grantee string, privileges []string,
 		withGrantOption bool) error
@@ -219,7 +236,8 @@ func groupKey(schema string, kind postgres.SchemaObjectKind) string {
 	return schema + "|" + string(kind)
 }
 
-// objectStats counts the selected objects of one group.
+// objectStats counts the selected objects of one group. granted is filled
+// once the grantee policy has been applied.
 type objectStats struct {
 	granted, skipped map[string]bool
 	examples         map[string]string // identity -> why skipped
@@ -263,7 +281,6 @@ type objectPlanner struct {
 	database      *postgresv1alpha1.Database
 	checker       *granteeChecker
 	serverVersion int
-	dbOwner       string
 
 	groups  map[string]*objectGroup
 	order   []string // group keys in spec order
@@ -356,25 +373,26 @@ func (p *objectPlanner) list(ctx context.Context, g *objectGroup) {
 	sel := postgres.SchemaObjectSelector{All: g.all}
 	if g.all {
 		sel.Limit = maxObjectsPerKind + 1
-	} else {
-		for _, n := range slices.Compact(slices.Sorted(slices.Values(g.names))) {
-			name, args, sig := parseRoutineName(n)
-			if !g.kind.isRoutine() || !sig {
-				sel.Names = append(sel.Names, n)
-				continue
-			}
-			oid, found, err := p.pg.ResolveRoutine(ctx, g.schema, name, args)
-			if err != nil {
-				// A malformed signature (older servers raise an error): reported
-				// once, here, not again as a name that matches nothing.
-				p.notFound = append(p.notFound, fmt.Sprintf("%s %s in schema %s: %v", g.kind.api, n, g.schema, err))
-				g.badSigs[n] = true
-				continue
-			}
-			if found {
-				g.sigs[n] = oid
-				sel.OIDs = append(sel.OIDs, oid)
-			}
+	}
+	// Signatures are resolved also when "*" lists every object, so a named
+	// entry of the same kind and schema still finds its routine.
+	for _, n := range slices.Compact(slices.Sorted(slices.Values(g.names))) {
+		name, args, sig := parseRoutineName(n)
+		if !g.kind.isRoutine() || !sig {
+			sel.Names = append(sel.Names, n)
+			continue
+		}
+		oid, found, err := p.pg.ResolveRoutine(ctx, g.schema, name, args)
+		if err != nil {
+			// A malformed signature (older servers raise an error): reported
+			// once, here, not again as a name that matches nothing.
+			p.notFound = append(p.notFound, fmt.Sprintf("%s %s in schema %s: %v", g.kind.api, n, g.schema, err))
+			g.badSigs[n] = true
+			continue
+		}
+		if found {
+			g.sigs[n] = oid
+			sel.OIDs = append(sel.OIDs, oid)
 		}
 	}
 	objects, err := p.pg.ListSchemaObjects(ctx, g.schema, g.kind.pg, sel)
@@ -432,15 +450,15 @@ func (p *objectPlanner) ownerProblem(ctx context.Context, kind objectKindInfo, o
 		return problem, denied, nil
 	case o.OwnerSuperuser:
 		return "is owned by the superuser " + o.Owner, nil, nil
-	case o.Owner == p.dbOwner:
-		return "", nil, nil
 	}
+	// The database owner counts only as a managed role too: a database a
+	// Cluster editor let a Database adopt can keep a legacy owner no Role
+	// manages, and its objects must not be opened up by a Database writer.
 	managed, err := p.checker.managesRole(ctx, o.Owner)
 	if err != nil || managed {
 		return "", nil, err
 	}
-	return fmt.Sprintf("is owned by %s, which is neither the database owner nor a role managed by a Role of this Cluster",
-		o.Owner), nil, nil
+	return fmt.Sprintf("is owned by %s, which is not a role managed by a Role of this Cluster", o.Owner), nil, nil
 }
 
 // relkindNames names the relation kinds a table entry selects.
@@ -469,6 +487,9 @@ func (p *objectPlanner) add(ctx context.Context, e objectEntry, o postgres.Schem
 	if err != nil {
 		return err
 	}
+	if problem == "" && len(o.Identity) > maxIdentityLength {
+		problem = fmt.Sprintf("has a name longer than %d characters, which pgop cannot record", maxIdentityLength)
+	}
 	privs := e.privileges
 	if problem != "" {
 		privs = nil // the whole object is skipped
@@ -485,8 +506,7 @@ func (p *objectPlanner) add(ctx context.Context, e objectEntry, o postgres.Schem
 	if len(privs) == 0 {
 		return nil
 	}
-	st.granted[o.Identity] = true
-	t := objectTarget(e.kind.pg, e.schema, o.Identity, e.grantee)
+	t := objectTarget(e.kind.pg, e.schema, o.Identity, o.OID, e.grantee)
 	d := desiredGrant(t, privs, e.withGrantOption)
 	k := t.key()
 	if prev, ok := p.desired[k]; ok {
@@ -495,7 +515,7 @@ func (p *objectPlanner) add(ctx context.Context, e objectEntry, o postgres.Schem
 		p.byField[e.field] = append(p.byField[e.field], k)
 	}
 	p.desired[k] = d
-	p.objects[string(t.Kind)+"|"+t.Name] = o
+	p.objects[objectKey(t)] = o
 	return nil
 }
 
@@ -527,18 +547,19 @@ func (p *objectPlanner) plan(ctx context.Context, managedSchemas map[string]bool
 	return nil
 }
 
-// status returns status.objectGrants: the counts of the groups listed now,
-// and the previous counts of the groups that could not be listed.
-func (p *objectPlanner) status() []postgresv1alpha1.ObjectGrantStatus {
+// status returns status.objectGrants: the counts of the groups listed now
+// (granted: objects with at least one grant to an allowed grantee). Groups
+// that could not be listed are left out: their counts are unknown.
+func (p *objectPlanner) status(desired []privilegeGrant) []postgresv1alpha1.ObjectGrantStatus {
+	for _, d := range desired {
+		if st := p.stats[groupKey(d.Target.Schema, postgres.SchemaObjectKind(d.Target.Kind))]; st != nil {
+			st.granted[d.Target.Name] = true
+		}
+	}
 	var out []postgresv1alpha1.ObjectGrantStatus
 	for _, k := range p.order {
 		g := p.groups[k]
 		if g.failed {
-			if i := slices.IndexFunc(p.database.Status.ObjectGrants, func(s postgresv1alpha1.ObjectGrantStatus) bool {
-				return s.Schema == g.schema && s.Kind == g.kind.api
-			}); i >= 0 {
-				out = append(out, p.database.Status.ObjectGrants[i])
-			}
 			continue
 		}
 		st := p.stats[k]
@@ -576,15 +597,26 @@ func (p *objectPlanner) errs() []error {
 	return errs
 }
 
-// objectLedger converts status.managedObjectGrants to ledger entries.
+// validLedgerSchema reports whether a status ledger entry's schema can be
+// one pgop granted in: never empty or a system schema. Every other schema of
+// the Database's own PostgreSQL database is the Database's (no other Database
+// manages that database), so revoking there only takes back what pgop
+// recorded. The status is written by pgop alone; this guards against a
+// tampered or corrupted one.
+func validLedgerSchema(schema string) bool {
+	return schema != "" && !systemSchemaName(schema)
+}
+
+// objectLedger converts status.managedObjectGrants to ledger entries,
+// ignoring entries that cannot be pgop's.
 func objectLedger(managed []postgresv1alpha1.ManagedObjectGrant) []privilegeGrant {
 	out := make([]privilegeGrant, 0, len(managed))
 	for _, m := range managed {
 		ki, ok := objectKindOf(m.Kind)
-		if !ok {
+		if !ok || !validLedgerSchema(m.Schema) || m.Object == "" {
 			continue
 		}
-		out = append(out, privilegeGrant{Target: objectTarget(ki.pg, m.Schema, m.Object, m.Role),
+		out = append(out, privilegeGrant{Target: objectTarget(ki.pg, m.Schema, m.Object, m.OID, m.Role),
 			Privileges: m.Privileges, GrantOptions: m.GrantOptions})
 	}
 	return out
@@ -602,8 +634,11 @@ func objectLedgerStatus(ledger []privilegeGrant) []postgresv1alpha1.ManagedObjec
 			continue
 		}
 		out = append(out, postgresv1alpha1.ManagedObjectGrant{Schema: g.Target.Schema, Kind: ki.api, Object: g.Target.Name,
-			Role: g.Target.Grantee, Privileges: g.Privileges, GrantOptions: g.GrantOptions})
+			OID: g.Target.OID, Role: g.Target.Grantee, Privileges: g.Privileges, GrantOptions: g.GrantOptions})
 	}
+	slices.SortFunc(out, func(a, b postgresv1alpha1.ManagedObjectGrant) int {
+		return strings.Compare(string(a.Kind)+"|"+a.Object+"|"+a.Role, string(b.Kind)+"|"+b.Object+"|"+b.Role)
+	})
 	return out
 }
 
@@ -613,7 +648,7 @@ func objectGrantOps(pg objectGrantClient, objects map[string]postgres.SchemaObje
 	roleIsGone := roleGone(pg)
 	return privilegeOps{
 		held: func(_ context.Context, t grantTarget) ([]string, []string, error) {
-			o, ok := objects[string(t.Kind)+"|"+t.Name]
+			o, ok := objects[objectKey(t)]
 			if !ok {
 				return nil, nil, nil
 			}
@@ -627,7 +662,7 @@ func objectGrantOps(pg objectGrantClient, objects map[string]postgres.SchemaObje
 		grant: func(ctx context.Context, t grantTarget, privileges []string, withGrantOption bool) error {
 			// The OID the owner rules were checked on: a name that now stands
 			// for another object is not granted on.
-			oid := objects[string(t.Kind)+"|"+t.Name].OID
+			oid := objects[objectKey(t)].OID
 			err := pg.GrantOnSchemaObject(ctx, postgres.SchemaObjectKind(t.Kind), t.Schema, t.Name, oid, t.Grantee,
 				privileges, withGrantOption)
 			if errors.Is(err, postgres.ErrObjectGone) {
@@ -636,13 +671,16 @@ func objectGrantOps(pg objectGrantClient, objects map[string]postgres.SchemaObje
 			return err
 		},
 		revoke: func(ctx context.Context, t grantTarget, privileges []string, mode postgres.RevokeMode) error {
-			return pg.RevokeOnSchemaObject(ctx, postgres.SchemaObjectKind(t.Kind), t.Schema, t.Name, t.Grantee, privileges, mode)
+			return pg.RevokeOnSchemaObject(ctx, postgres.SchemaObjectKind(t.Kind), t.Schema, t.Name, t.OID, t.Grantee,
+				privileges, mode)
 		},
 		gone: func(ctx context.Context, t grantTarget) (bool, error) {
 			if gone, err := roleIsGone(ctx, t); err != nil || gone {
 				return gone, err
 			}
-			_, found, err := pg.ResolveSchemaObject(ctx, postgres.SchemaObjectKind(t.Kind), t.Schema, t.Name)
+			// Looked up by OID when recorded: a renamed object is still there,
+			// a dropped one is gone even if another took its name.
+			_, found, err := pg.ResolveSchemaObject(ctx, postgres.SchemaObjectKind(t.Kind), t.Schema, t.Name, t.OID)
 			return !found, err
 		},
 	}
@@ -669,28 +707,16 @@ func granteeOIDs(ctx context.Context, pg objectGrantClient, desired []privilegeG
 // managedSchemas are the schemas the Database manages (see reconcileSchemas).
 func reconcileObjectGrants(ctx context.Context, pg objectGrantClient, database *postgresv1alpha1.Database,
 	managedSchemas map[string]bool, serverVersion int, checker *granteeChecker, save statusSaver) error {
-	dbOwner, err := pg.CurrentDatabaseOwner(ctx)
-	if err != nil {
-		return err
-	}
-	p := &objectPlanner{pg: pg, database: database, checker: checker, serverVersion: serverVersion, dbOwner: dbOwner,
+	p := &objectPlanner{pg: pg, database: database, checker: checker, serverVersion: serverVersion,
 		groups: map[string]*objectGroup{}, stats: map[string]*objectStats{},
 		desired: map[string]privilegeGrant{}, objects: map[string]postgres.SchemaObject{}, byField: map[string][]string{}}
 	if err := p.plan(ctx, managedSchemas); err != nil {
 		return err
 	}
-	database.Status.ObjectGrants = p.status()
-
-	// Ledger entries of groups that could not be listed are kept as they
-	// are: their objects are unknown, so nothing is granted or revoked there.
-	var kept []privilegeGrant
-	managed := slices.DeleteFunc(objectLedger(database.Status.ManagedObjectGrants), func(g privilegeGrant) bool {
-		if gr := p.groups[groupKey(g.Target.Schema, postgres.SchemaObjectKind(g.Target.Kind))]; gr != nil && gr.failed {
-			kept = append(kept, g)
-			return true
-		}
-		return false
-	})
+	kept, managed, err := p.splitLedger(ctx)
+	if err != nil {
+		return err
+	}
 	withKept := func(ledger []privilegeGrant) []postgresv1alpha1.ManagedObjectGrant {
 		m := map[string]privilegeGrant{}
 		for _, g := range slices.Concat(ledger, kept) {
@@ -712,14 +738,22 @@ func reconcileObjectGrants(ctx context.Context, pg objectGrantClient, database *
 		}
 		desired = append(desired, allowed...)
 	}
+	database.Status.ObjectGrants = p.status(desired)
 	errs := p.errs()
+	if over := overBudget(desired, managed, kept); over != nil {
+		// Grant nothing new; what is tracked is still revoked when removed.
+		errs = append(errs, over)
+		desired = slices.DeleteFunc(desired, func(d privilegeGrant) bool {
+			return !slices.ContainsFunc(managed, func(m privilegeGrant) bool { return m.key() == d.key() })
+		})
+	}
 	if len(desired) > 0 || len(managed) > 0 {
 		oids, err := granteeOIDs(ctx, pg, desired)
 		if err != nil {
 			return err
 		}
 		persist := func(ctx context.Context, ledger []privilegeGrant) error {
-			database.Status.ManagedObjectGrants = withKept(ledger)
+			database.Status.ManagedObjectGrants = withKept(refreshIdentities(ledger, desired))
 			if save == nil {
 				return nil
 			}
@@ -727,10 +761,83 @@ func reconcileObjectGrants(ctx context.Context, pg objectGrantClient, database *
 		}
 		after, err := applyPrivilegeGrants(ctx, desired, managed, objectGrantOps(pg, p.objects, oids),
 			max(objectGrantLedgerLimit-ledgerLimit(len(kept)), 1), persist)
-		database.Status.ManagedObjectGrants = withKept(after)
+		database.Status.ManagedObjectGrants = withKept(refreshIdentities(after, desired))
 		errs = append([]error{err}, errs...)
 	}
 	return errors.Join(append(errs, held.err())...)
+}
+
+// splitLedger splits status.managedObjectGrants into the entries to leave
+// alone (kept) and those the engine reconciles (managed). Entries of groups
+// that could not be listed are kept, since their objects are unknown, unless
+// the grantee policy no longer allows the grantee: what pgop granted a
+// refused, missing or paused grantee is always revoked.
+func (p *objectPlanner) splitLedger(ctx context.Context) (kept, managed []privilegeGrant, err error) {
+	for _, g := range objectLedger(p.database.Status.ManagedObjectGrants) {
+		gr := p.groups[groupKey(g.Target.Schema, postgres.SchemaObjectKind(g.Target.Kind))]
+		if gr == nil || !gr.failed {
+			managed = append(managed, g)
+			continue
+		}
+		res, err := p.checker.check(ctx, g.Target.Grantee)
+		if err != nil {
+			return nil, nil, err
+		}
+		if res.verdict == granteeAllowed {
+			kept = append(kept, g)
+		} else {
+			managed = append(managed, g)
+		}
+	}
+	return kept, managed, nil
+}
+
+// refreshIdentities sets the identity of ledger entries to the current one
+// of the desired grant with the same key (an object renamed since pgop
+// recorded it keeps its entry, found by OID).
+func refreshIdentities(ledger, desired []privilegeGrant) []privilegeGrant {
+	names := make(map[string]grantTarget, len(desired))
+	for _, d := range desired {
+		names[d.key()] = d.Target
+	}
+	for i, g := range ledger {
+		if t, ok := names[g.key()]; ok {
+			ledger[i].Target.Name, ledger[i].Target.Schema = t.Name, t.Schema
+		}
+	}
+	return ledger
+}
+
+// ledgerEntryBytes estimates the size of one status.managedObjectGrants
+// entry in JSON.
+func ledgerEntryBytes(g privilegeGrant) int {
+	n := 96 + len(g.Target.Schema) + len(g.Target.Name) + len(g.Target.Grantee)
+	for _, p := range slices.Concat(g.Privileges, g.GrantOptions) {
+		n += len(p) + 3
+	}
+	return n
+}
+
+// overBudget returns a TooManyGrants error when the ledger could grow past
+// objectLedgerByteBudget with the declared grants (each estimated with all
+// its privileges), nil otherwise.
+func overBudget(desired, managed, kept []privilegeGrant) error {
+	seen := map[string]bool{}
+	total := 0
+	for _, g := range slices.Concat(managed, kept, desired) {
+		if seen[g.key()] {
+			continue
+		}
+		seen[g.key()] = true
+		total += ledgerEntryBytes(g)
+	}
+	if total <= objectLedgerByteBudget {
+		return nil
+	}
+	return &conditionError{reason: ReasonTooManyGrants, err: fmt.Errorf(
+		"the object grants declared and those pgop still tracks would need about %d KiB of status; pgop records at "+
+			"most %d KiB. Nothing new was granted (removed grants are still revoked): grant to fewer roles or "+
+			"objects, for example to one group role", total/1024, objectLedgerByteBudget/1024)}
 }
 
 // setObjectGrantsCondition sets the ObjectGrantsComplete condition from
@@ -901,7 +1008,7 @@ func defaultLedger(managed []postgresv1alpha1.ManagedDefaultPrivilege) []privile
 	out := make([]privilegeGrant, 0, len(managed))
 	for _, m := range managed {
 		ki, ok := defaultKindOf(m.Kind)
-		if !ok {
+		if !ok || !validLedgerSchema(m.Schema) || m.ForRole == "" {
 			continue
 		}
 		out = append(out, privilegeGrant{Target: defaultTarget(ki, m.Schema, m.ForRole, m.Role),

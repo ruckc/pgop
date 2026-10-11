@@ -473,9 +473,9 @@ type SchemaSpec struct {
 	// tables (also views, materialized views and foreign tables), sequences,
 	// functions, procedures and types (also domains). Objects are named, or
 	// selected with "*" (every object of the kind in the schema, re-evaluated
-	// on every reconcile). pgop only grants on objects owned by the database
-	// owner, a role managed by a Role of the same Cluster (neither a
-	// superuser), or the operator; objects owned by another role or a
+	// on every reconcile). pgop only grants on objects owned by a role managed
+	// by a Role of the same Cluster (not a superuser; this applies to the
+	// database owner too), or the operator; objects owned by another role or a
 	// superuser, objects that belong to an extension (see
 	// spec.extensions[].grants) and, among the operator's objects, SECURITY
 	// DEFINER functions, functions not written in SQL or PL/pgSQL, views,
@@ -644,54 +644,76 @@ type DefaultPrivilegeSpec struct {
 // a role.
 type ManagedObjectGrant struct {
 	// schema is the schema the object is in.
+	// +kubebuilder:validation:MaxLength=63
 	Schema string `json:"schema"`
 
 	// kind is the kind of object.
 	Kind ObjectGrantKind `json:"kind"`
 
 	// object is the object as PostgreSQL renders it (schema-qualified and
-	// quoted, with argument types for functions and procedures).
+	// quoted, with argument types for functions and procedures), as last
+	// seen.
+	// +kubebuilder:validation:MaxLength=1024
 	Object string `json:"object"`
 
+	// oid is the object's OID. pgop follows the object by it: a renamed
+	// object keeps its entry, and once no object of the kind has this OID the
+	// entry is forgotten (the object was dropped; one created again under
+	// the same name is another object).
+	// +optional
+	OID int64 `json:"oid,omitempty"`
+
 	// role is the grantee: a PostgreSQL role, or PUBLIC.
+	// +kubebuilder:validation:MaxLength=63
 	Role string `json:"role"`
 
 	// privileges are the privileges pgop added (normalized, ALL expanded).
 	// Only these are revoked once no entry selects the object.
 	// +optional
 	// +listType=set
+	// +kubebuilder:validation:MaxItems=8
+	// +kubebuilder:validation:items:MaxLength=16
 	Privileges []string `json:"privileges,omitempty"`
 
 	// grantOptions are the privileges whose grant option pgop added.
 	// Revoking them cascades to what the grantee passed on.
 	// +optional
 	// +listType=set
+	// +kubebuilder:validation:MaxItems=8
+	// +kubebuilder:validation:items:MaxLength=16
 	GrantOptions []string `json:"grantOptions,omitempty"`
 }
 
 // ManagedDefaultPrivilege records default privileges pgop set.
 type ManagedDefaultPrivilege struct {
 	// schema is the schema the default privileges apply in.
+	// +kubebuilder:validation:MaxLength=63
 	Schema string `json:"schema"`
 
 	// forRole is the role whose future objects get the privileges.
+	// +kubebuilder:validation:MaxLength=63
 	ForRole string `json:"forRole"`
 
 	// kind is the kind of future objects.
 	Kind DefaultPrivilegeKind `json:"kind"`
 
 	// role is the grantee: a PostgreSQL role, or PUBLIC.
+	// +kubebuilder:validation:MaxLength=63
 	Role string `json:"role"`
 
 	// privileges are the default privileges pgop added. Only these are
 	// removed once they leave the spec.
 	// +optional
 	// +listType=set
+	// +kubebuilder:validation:MaxItems=8
+	// +kubebuilder:validation:items:MaxLength=16
 	Privileges []string `json:"privileges,omitempty"`
 
 	// grantOptions are the privileges whose grant option pgop added.
 	// +optional
 	// +listType=set
+	// +kubebuilder:validation:MaxItems=8
+	// +kubebuilder:validation:items:MaxLength=16
 	GrantOptions []string `json:"grantOptions,omitempty"`
 }
 
@@ -717,6 +739,7 @@ type ObjectGrantStatus struct {
 	// skipped.
 	// +optional
 	// +kubebuilder:validation:MaxItems=5
+	// +kubebuilder:validation:items:MaxLength=2048
 	SkippedExamples []string `json:"skippedExamples,omitempty"`
 }
 
