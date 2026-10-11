@@ -20,7 +20,8 @@ The Role controller:
 7. Cleans up the role on deletion, revoking its privileges first (see [Deletion](#deletion))
 
 See [Security model](#security-model) for what a Role writer can and cannot
-obtain.
+obtain, and [Users and access patterns](access-patterns.md) for complete
+setups of login and group roles with the Database grants they need.
 
 ## Example
 
@@ -86,6 +87,7 @@ derived from `clusterRef.name` and the Role's own name — so you can reference 
 from other manifests (including a Helm chart at template time) **before**
 `status.secretName` is populated.
 
+<!-- pgop-validate: skip (Secret data) -->
 ```yaml
 data:
   username: app-user                          # = the PostgreSQL role name
@@ -334,6 +336,9 @@ fields; the API server rejects such a Role. To migrate, move each entry:
 # before
 memberOf:
   - app_read_role
+```
+
+```yaml
 # after
 memberships:
   - role: app_read_role
@@ -552,27 +557,68 @@ database), after which the finalizer is removed.
 
 ## Role Types
 
-### Application User
+A Role is either a **login role** (a user: `login: true`, the default) or a
+**group role** (`login: false`). Privileges are usually granted to group
+roles, and login roles become members of them. See
+[Users and access patterns](access-patterns.md) for complete setups (owner,
+migrator, application, read-only, reporting and monitoring roles) with the
+Database grants that go with them.
+
+### Login role (application user)
+
+```yaml
+spec:
+  clusterRef:
+    name: my-cluster
+  roleName: app_user        # optional: PostgreSQL name with underscores
+  login: true
+  connectionLimit: 50
+  memberships:
+    - role: app_rw          # privileges come from the group role
+  settings:
+    statement_timeout: 30s
+```
+
+A login role gets a password (generated, from
+[`passwordSecretRef`](#password-source), optionally
+[rotated](#password-rotation)) and the
+[credentials Secret](#credentials-secret) `<cluster>-<role>-credentials`.
+
+### Group role (NOLOGIN)
+
+```yaml
+spec:
+  clusterRef:
+    name: my-cluster
+  roleName: app_ro
+  login: false              # a group role: no password, no credentials Secret
+```
+
+A group role cannot log in, so pgop generates no password and creates no
+credentials Secret for it (a Secret left over from when the role had `login:
+true` is not deleted). Grant it privileges in a [Database](databases.md)
+(`grants`, `schemas[].grants`, `objectGrants`, `defaultPrivileges`) and make
+login roles members of it with `memberships`. A group role can also own
+databases and objects: see the
+[NOLOGIN owner pattern](access-patterns.md#nologin-owner-and-a-migrator-that-uses-set-role).
+
+`inherit` (default `true`) decides whether a role uses the privileges of the
+roles it is a member of without `SET ROLE`. Per-membership `inherit` and `set`
+options (PostgreSQL 16+) override it for one membership.
+
+### Monitoring role
 
 ```yaml
 spec:
   clusterRef:
     name: my-cluster
   login: true
-  connectionLimit: 50
+  connectionLimit: 3
+  memberships:
+    - role: pg_monitor      # needs rolePolicy.allowedPredefinedRoles: [pg_monitor]
 ```
 
-### Read-Only Role
-
-```yaml
-spec:
-  clusterRef:
-    name: my-cluster
-  login: false  # Group role, not a login
-  inherit: true
-```
-
-### Admin Role
+### Admin role
 
 ```yaml
 spec:
@@ -588,6 +634,20 @@ spec:
 PostgreSQL 15 and older, `CREATEROLE` lets the role grant itself membership
 in any non-superuser role, including `pg_execute_server_program`, so it is
 close to superuser there; PostgreSQL 16 limits it to roles the role created.
+
+There is no superuser Role: `spec.superuser` was removed, and the API server
+rejects it:
+
+<!-- pgop-validate: invalid -->
+```yaml
+spec:
+  clusterRef:
+    name: my-cluster
+  superuser: true    # rejected: unknown field (strict validation) or dropped
+```
+
+Use the Cluster's operator credentials (`<cluster>-credentials`) for
+superuser work.
 
 ## Security model
 
@@ -622,7 +682,9 @@ every database of the Cluster (for example `pg_read_all_data`).
 
 ## Upgrade / breaking changes
 
-This release changes the Role API (v1alpha1, no compatibility shims):
+All breaking changes, by release, are collected in the
+[Upgrade Notes](../upgrading.md). v0.15.0 changed the Role API (v1alpha1, no
+compatibility shims):
 
 - **`spec.superuser` is removed.** The API server rejects it (or, with lax
   field validation, drops it). Every role pgop manages is `NOSUPERUSER`; a role

@@ -36,9 +36,9 @@ kubectl get cluster my-cluster
 
 Output:
 
-```
-NAME         READY   ENDPOINT                        AGE
-my-cluster   true    my-cluster.default.svc:5432     1m
+```console
+NAME         READY   INSTANCES   READY INSTANCES   ENDPOINT                                    AGE
+my-cluster   true    1           1                 my-cluster.default.svc.cluster.local:5432   1m
 ```
 
 ## Access Credentials
@@ -53,11 +53,16 @@ The secret contains:
 
 | Key | Description |
 |-----|-------------|
-| `username` | Superuser username (pgop_operator) |
+| `username` | Superuser username (`pgop_operator`) |
 | `password` | Superuser password |
 | `host` | Service hostname |
 | `port` | PostgreSQL port |
-| `database` | Default database (postgres) |
+| `database` | Default database (`postgres`) |
+| `sslmode` | `disable`, or `verify-full` once [TLS](../user-guide/clusters.md#tls) is active |
+| `uri` | Ready-made `postgresql://` URI |
+
+Use it for administration only; applications get their own Role and Database
+credentials below.
 
 ## Create a Role
 
@@ -76,11 +81,16 @@ spec:
   connectionLimit: 10
 ```
 
-The operator auto-generates credentials and stores them in a secret:
+The operator generates a password and stores the credentials in the Secret
+`<cluster>-<role>-credentials`:
 
 ```bash
-kubectl get secret app-user-credentials -o yaml
+kubectl get secret my-cluster-app-user-credentials -o yaml
 ```
+
+`login: false` would make a group role instead (no password, no Secret), to
+grant privileges to and make users members of; see
+[Roles](../user-guide/roles.md#role-types).
 
 ## Create a Database
 
@@ -100,9 +110,11 @@ spec:
     - name: uuid-ossp
     - name: pg_trgm
   schemas:
-    - name: app
-      owner: app-user
+    - name: app             # owned by app-user, the database owner
 ```
+
+The Database's connection Secret `myapp-app-user-credentials` has everything
+an application needs, including `database: myapp` and a `uri`.
 
 ## Connect to PostgreSQL
 
@@ -121,6 +133,8 @@ psql -h localhost -U pgop_operator -d postgres
 
 ## Next Steps
 
-- [Learn about Clusters](../user-guide/clusters.md)
-- [Manage Roles](../user-guide/roles.md)
-- [Create Databases](../user-guide/databases.md)
+- [Learn about Clusters](../user-guide/clusters.md): replicas, TLS, parameters, role policy
+- [Users and access patterns](../user-guide/access-patterns.md): owner, application, read-only, reporting and monitoring roles end to end
+- [Manage Roles](../user-guide/roles.md) and [Databases](../user-guide/databases.md)
+- [Backups](../user-guide/backups.md) and [Restores](../user-guide/restores.md)
+- Upgrading? Read the [Upgrade Notes](../upgrading.md)

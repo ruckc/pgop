@@ -37,11 +37,13 @@ nav:
     - Replication: user-guide/replication.md
     - Roles: user-guide/roles.md
     - Databases: user-guide/databases.md
+    - Users and Access Patterns: user-guide/access-patterns.md
     - Backups: user-guide/backups.md
     - Restores: user-guide/restores.md
   - Reference:
     - API Reference: reference/api.md
     - Configuration: reference/configuration.md
+  - Upgrade Notes: upgrading.md
   - Contributing: contributing.md
 
 markdown_extensions:

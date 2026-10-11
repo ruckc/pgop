@@ -27,6 +27,7 @@ The operator requires the following permissions:
 
 ### Cluster-scoped
 
+<!-- pgop-validate: skip (operator configuration, not a pgop manifest) -->
 ```yaml
 - apiGroups: ["pgop.ruck.io"]
   resources: ["clusters", "roles", "databases"]
@@ -38,6 +39,7 @@ The operator requires the following permissions:
 
 ### Namespaced
 
+<!-- pgop-validate: skip (operator configuration, not a pgop manifest) -->
 ```yaml
 - apiGroups: [""]
   resources: ["secrets", "services"]
@@ -54,6 +56,7 @@ The operator requires the following permissions:
 
 Recommended resource limits for the operator:
 
+<!-- pgop-validate: skip (operator configuration, not a pgop manifest) -->
 ```yaml
 resources:
   limits:
@@ -89,6 +92,7 @@ Key metrics:
 
 Create an overlay to customize the deployment:
 
+<!-- pgop-validate: skip (operator configuration, not a pgop manifest) -->
 ```yaml
 # kustomization.yaml
 apiVersion: kustomize.config.k8s.io/v1beta1
@@ -110,6 +114,7 @@ patches:
 
 Enable leader election for running multiple replicas:
 
+<!-- pgop-validate: skip (operator configuration, not a pgop manifest) -->
 ```yaml
 spec:
   replicas: 2

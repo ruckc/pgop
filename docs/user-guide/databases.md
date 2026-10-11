@@ -191,6 +191,7 @@ For each Database, the operator emits a deterministic Secret named
 **`<database-name>-<owner>-credentials`** (e.g. `myapp-app-user-credentials`)
 containing everything an app needs to connect to that specific database:
 
+<!-- pgop-validate: skip (Secret data) -->
 ```yaml
 data:
   username: app-user       # the owner Role's PostgreSQL name
@@ -219,8 +220,12 @@ enabled; a Database without an owner (or owned by a NOLOGIN group role) gets no
 connection Secret.
 
 !!! note
-    There is no `uri`/DSN key — build the connection string from the keys above,
-    e.g. `postgres://$username:$password@$host:$port/$database`.
+    `uri` is a ready-made `postgresql://` URI for this database. A URI cannot
+    carry the CA file: with `sslmode=verify-full`, also set `PGSSLROOTCERT`
+    (or `sslrootcert`) to the mounted `ca.crt`. Roles that are not the owner
+    use their own [Role credentials Secret](roles.md#credentials-secret) with
+    the database name set by the client (see
+    [Users and access patterns](access-patterns.md#connecting-the-workloads)).
 
 ## PostgreSQL Database Name
 
@@ -1278,6 +1283,9 @@ Database never drops it. A database's comment never authorizes a take-over
   extensions and schemas wait until connections are allowed again.
 
 ### Upgrade / breaking changes
+
+All breaking changes, by release, are collected in the
+[Upgrade Notes](../upgrading.md). For Databases:
 
 - Untrusted extensions are no longer installed unless the Cluster lists them
   in `spec.rolePolicy.allowedExtensions` (reason `ExtensionNotAllowed`).

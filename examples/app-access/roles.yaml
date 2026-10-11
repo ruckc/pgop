@@ -1,0 +1,112 @@
+# Roles of the "shop" application. Kubernetes names use dashes; the
+# PostgreSQL names (spec.roleName) use underscores. Memberships, grants and
+# defaultPrivileges always name PostgreSQL roles (shop_rw), Database.owner
+# names a Role resource (shop-owner).
+#
+#   shop_owner      LOGIN   owns the database and schema app, runs migrations
+#   shop_rw         NOLOGIN group: read/write on app's tables
+#   shop_ro         NOLOGIN group: read-only on app's tables
+#   shop_app        LOGIN   the application, member of shop_rw
+#   shop_reporting  LOGIN   BI tool, member of shop_ro, password from a Secret
+#   shop_monitoring LOGIN   metrics exporter, member of pg_monitor
+---
+apiVersion: pgop.ruck.io/v1alpha1
+kind: Role
+metadata:
+  name: shop-owner
+spec:
+  clusterRef:
+    name: shop-db
+  roleName: shop_owner
+  login: true
+  connectionLimit: 5
+  # Generated password, rotated every 90 days. The Secrets
+  # shop-db-shop-owner-credentials and shop-shop-owner-credentials (the
+  # Database's) are updated; existing sessions stay connected.
+  passwordRotation:
+    every: 2160h
+---
+apiVersion: pgop.ruck.io/v1alpha1
+kind: Role
+metadata:
+  name: shop-rw
+spec:
+  clusterRef:
+    name: shop-db
+  roleName: shop_rw
+  # A group role: no password, no credentials Secret.
+  login: false
+---
+apiVersion: pgop.ruck.io/v1alpha1
+kind: Role
+metadata:
+  name: shop-ro
+spec:
+  clusterRef:
+    name: shop-db
+  roleName: shop_ro
+  login: false
+---
+apiVersion: pgop.ruck.io/v1alpha1
+kind: Role
+metadata:
+  name: shop-app
+spec:
+  clusterRef:
+    name: shop-db
+  roleName: shop_app
+  login: true
+  connectionLimit: 50
+  memberships:
+    - role: shop_rw          # inherits shop_rw's privileges
+  # Defaults for shop_app's own sessions (ALTER ROLE ... SET).
+  settings:
+    statement_timeout: 15s
+    idle_in_transaction_session_timeout: 60s
+---
+# The reporting password comes from a Secret you manage (for example synced by
+# external-secrets). pgop reads it, sets it in PostgreSQL and copies it into
+# shop-db-shop-reporting-credentials; it never modifies this Secret.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: shop-reporting-password
+type: Opaque
+stringData:
+  password: change-me-from-your-secret-manager
+---
+apiVersion: pgop.ruck.io/v1alpha1
+kind: Role
+metadata:
+  name: shop-reporting
+spec:
+  clusterRef:
+    name: shop-db
+  roleName: shop_reporting
+  login: true
+  connectionLimit: 10
+  passwordSecretRef:
+    name: shop-reporting-password
+    key: password
+  memberships:
+    - role: shop_ro
+  settings:
+    default_transaction_read_only: "on"
+  # Only in the database shop: a longer timeout for reports.
+  databaseSettings:
+    - database: shop
+      settings:
+        statement_timeout: 5min
+---
+apiVersion: pgop.ruck.io/v1alpha1
+kind: Role
+metadata:
+  name: shop-monitoring
+spec:
+  clusterRef:
+    name: shop-db
+  roleName: shop_monitoring
+  login: true
+  connectionLimit: 3
+  memberships:
+    - role: pg_monitor       # needs rolePolicy.allowedPredefinedRoles: [pg_monitor]

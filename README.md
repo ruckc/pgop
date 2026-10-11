@@ -140,9 +140,11 @@ spec:
 
 Roles are never superusers. Privileged attributes (`createRole`, `replication`, `bypassRLS`), memberships in predefined `pg_*` roles and untrusted extensions are only available when the Cluster opts in with `spec.rolePolicy`, so RBAC to create Roles or Databases does not make anyone superuser-equivalent (see [Clusters: role policy](docs/user-guide/clusters.md#role-policy)).
 
+`login: false` makes a group role (no password, no Secret); `memberships` puts login roles into groups, and `settings` / `databaseSettings` set per-user session defaults. [Users and access patterns](docs/user-guide/access-patterns.md) walks through owner, migrator, application, read-only, reporting and monitoring roles end to end; the manifests are in [`examples/`](examples/).
+
 ### Database
 
-Creates a PostgreSQL database owned by a `Role`, declaratively manages schema grants, and writes a `<database>-<role>-credentials` Secret with everything an application needs to connect — no post-provisioning SQL scripts or credential hand-off required.
+Creates a PostgreSQL database owned by a `Role`, declaratively manages database, schema and object grants, default privileges, `PUBLIC`'s default privileges, settings and extensions, and writes a `<database>-<role>-credentials` Secret with everything an application needs to connect — no post-provisioning SQL scripts or credential hand-off required.
 
 ```yaml
 apiVersion: pgop.ruck.io/v1alpha1
@@ -198,7 +200,7 @@ spec:
   schedule: "0 2 * * *"      # cron — daily at 02:00
   retention:
     disabled: true
-  backupRunTTL: "168h"        # keep job pods for 7 days
+  backupRunTTL: "168h"        # keep BackupRun records for 7 days
   destination:
     type: s3
     s3:
@@ -245,7 +247,10 @@ See [Backups](docs/user-guide/backups.md) and [Restores](docs/user-guide/restore
 ### Prerequisites
 
 - Kubernetes v1.27+ (needed for `storage.retainPolicy: Delete`)
+- PostgreSQL 16, 17 or 18 (the tested majors)
 - `kubectl`
+
+Upgrading from an earlier pgop release? Read the [upgrade notes](docs/upgrading.md): the `v1alpha1` API still changes between releases.
 
 ### Installation
 

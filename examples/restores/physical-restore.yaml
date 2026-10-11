@@ -1,0 +1,26 @@
+# Point-in-time restore of the whole Cluster from its physical Backup
+# (examples/backups/physical-backup.yaml). Nothing happens until the Cluster
+# confirms it, which needs permission to change the Cluster:
+#
+#   kubectl annotate cluster shop-db pgop.ruck.io/allow-restore=shop-db-pitr
+#
+# After the Cluster's first physical restore only the <name>/<uid> form
+# confirms a new one:
+#
+#   kubectl annotate cluster shop-db --overwrite \
+#     pgop.ruck.io/allow-restore=shop-db-pitr/$(kubectl get restore shop-db-pitr -o jsonpath='{.metadata.uid}')
+#
+# Never commit the annotation to git (see docs/user-guide/restores.md).
+apiVersion: pgop.ruck.io/v1alpha1
+kind: Restore
+metadata:
+  name: shop-db-pitr
+spec:
+  type: physical
+  # Any Succeeded BackupRun of the Backup selects the repository; with
+  # targetTime pgBackRest picks the newest backup taken before that time.
+  backupRunRef:
+    name: shop-db-backup-full-29342160
+  clusterRef:
+    name: shop-db              # must be the Backup's Cluster
+  targetTime: "2026-10-01T06:00:00Z"

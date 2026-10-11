@@ -32,3 +32,11 @@ spec:
   #   allowedExtensions: [postgis]
   #   # Custom setting namespaces Database/Role settings may set (myapp.*).
   #   allowedSettingPrefixes: [myapp]
+  #   # Roles created outside pgop that Roles may join and Databases grant to.
+  #   allowedExistingRoles: [dba_readonly]
+  #   # Existing roles/databases a Role/Database may take over.
+  #   adoptableRoles: [legacy_app]
+  #   adoptableDatabases: [legacy]
+  # Optional server TLS: {} = self-managed CA; or issuerRef (cert-manager) or
+  # secretName (your own kubernetes.io/tls Secret).
+  # tls: {}

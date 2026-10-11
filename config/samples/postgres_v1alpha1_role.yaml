@@ -40,5 +40,18 @@ spec:
   #   - database: app_db
   #     settings:
   #       work_mem: 64MB
-  # Password is auto-generated and stored in a Secret named: <cluster-name>-<role-name>-credentials
-  # The secret contains keys: username, password, host, port
+  # Optional: take the password from a Secret you manage (mutually exclusive
+  # with passwordRotation). The plaintext password, not a hash.
+  # passwordSecretRef:
+  #   name: app-user-password
+  #   key: password
+  # Optional: rotate the generated password (Go duration, minimum 1h).
+  # passwordRotation:
+  #   every: 720h
+  # The password (generated unless passwordSecretRef is set) is stored in the
+  # Secret <cluster-name>-<role-name>-credentials, here
+  # example-cluster-app-user-credentials, with the keys username, password,
+  # host, port, sslmode, uri (and ca.crt while the Cluster's TLS is active).
+  # A NOLOGIN role (login: false) gets no password and no Secret.
+  # More complete examples: examples/ in the repository and
+  # docs/user-guide/access-patterns.md.

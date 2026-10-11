@@ -33,9 +33,26 @@ spec:
 ```
 
 The operator creates the CronJobs `<backup>-schema` and `<backup>-data`. Each
-Job runs `pg_dump -Fc` against the primary and uploads the dump with the AWS
-CLI. See [Clusters → Backups and restores](clusters.md#backups-and-restores)
-for how the Jobs connect over TLS.
+Job runs `pg_dump -Fc` (`--schema-only` or `--data-only`) against the primary
+as the operator's superuser and uploads the dump with the AWS CLI to
+`s3://<bucket>/<prefix>/schema/<time>.dump` and
+`s3://<bucket>/<prefix>/data/<time>.dump` (`<time>` is `YYYYMMDDTHHMMSS`, UTC
+in the Job's container). The `s3-upload` container logs the location
+(`Uploaded to s3://...`). See
+[Clusters → Backups and restores](clusters.md#backups-and-restores) for how
+the Jobs connect over TLS.
+
+Things to know about logical backups:
+
+- Only `s3` destinations are implemented; `endpoint` may be `http://` (for
+  example an in-cluster MinIO or RustFS).
+- `retention` and `encryption` are not applied: dumps are never expired or
+  encrypted by pgop. Use bucket lifecycle rules and server-side encryption.
+- The Jobs do **not** record `BackupRun`s. To restore a dump, create a
+  `BackupRun` for it by hand (see
+  [Restores: logical](restores.md#logical-restore-pg_restore)).
+- Take a dump now with
+  `kubectl create job myapp-data-now --from=cronjob/myapp-backup-data`.
 
 ## Physical backups (pgBackRest)
 

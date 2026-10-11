@@ -1,0 +1,53 @@
+# Bringing a role and a database that already exist (created by a DBA, a
+# migration from another platform, or a restore) under pgop's management.
+# Only a Cluster editor can allow this: Role and Database writers can never
+# take over objects pgop did not create for them.
+---
+apiVersion: pgop.ruck.io/v1alpha1
+kind: Cluster
+metadata:
+  name: legacy-db
+spec:
+  image: postgres:17
+  storage:
+    size: 50Gi
+  rolePolicy:
+    # pgop may take these over: it then sets their attributes and password,
+    # hands the password out and drops them when the resource is deleted.
+    adoptableRoles: [legacy_app]
+    adoptableDatabases: [legacy]
+    # Roles pgop does not manage that Roles may join and Databases may grant to.
+    allowedExistingRoles: [dba_readonly]
+---
+apiVersion: pgop.ruck.io/v1alpha1
+kind: Role
+metadata:
+  name: legacy-app
+spec:
+  clusterRef:
+    name: legacy-db
+  roleName: legacy_app       # the existing role
+  login: true
+  # pgop generates a new password for the adopted role (or use
+  # passwordSecretRef to keep the one the application already has).
+---
+apiVersion: pgop.ruck.io/v1alpha1
+kind: Database
+metadata:
+  name: legacy
+spec:
+  clusterRef:
+    name: legacy-db
+  databaseName: legacy       # the existing database
+  # Declare the owner: pgop then makes legacy_app the owner, and the schemas
+  # legacy_app owns count as managed. Without owner, existing schemas owned
+  # by a role no Role manages report SchemaNotManaged.
+  owner: legacy-app
+  grants:
+    - role: dba_readonly     # listed in allowedExistingRoles
+      privileges: [CONNECT]
+  schemas:
+    - name: public           # existing schema: managed for grants
+      grants:
+        - role: dba_readonly
+          privileges: [USAGE]

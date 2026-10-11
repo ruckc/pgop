@@ -1,0 +1,22 @@
+# Logical (pg_dump) backups of one Database: a schema dump and a data dump
+# every night, uploaded to S3 or S3-compatible storage. Uses the
+# s3-credentials Secret from physical-backup.yaml.
+apiVersion: pgop.ruck.io/v1alpha1
+kind: Backup
+metadata:
+  name: shop-logical
+spec:
+  type: logical
+  databaseRef:
+    name: shop                         # the Database resource
+  schedule: "30 1 * * *"               # schema and data dumps share it
+  backupRunTTL: "168h"
+  destination:
+    type: s3
+    s3:
+      bucket: pgop-backups
+      prefix: logical/shop             # dumps go to s3://pgop-backups/logical/shop/{schema,data}/
+      region: us-east-1
+      # endpoint: http://minio.minio.svc:9000   # S3-compatible storage (http allowed for logical)
+      credentialsSecretRef:
+        name: s3-credentials

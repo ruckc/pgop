@@ -1,0 +1,53 @@
+# The three ways to give a Cluster a server certificate. Once TLSReady is
+# True, every credentials Secret switches to sslmode=verify-full and carries
+# ca.crt. See docs/user-guide/clusters.md#tls.
+---
+# 1. Self-managed CA: the operator generates a CA and a server certificate,
+#    renews and rotates them. Nothing else is needed.
+apiVersion: pgop.ruck.io/v1alpha1
+kind: Cluster
+metadata:
+  name: tls-selfmanaged
+spec:
+  storage:
+    size: 5Gi
+  tls: {}
+---
+# 2. cert-manager: the operator creates and owns Certificate
+#    tls-certmanager-server, issued by this Issuer (cert-manager must be
+#    installed; the issuer must populate ca.crt).
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: pg-ca-issuer
+spec:
+  ca:
+    secretName: pg-ca-key-pair
+---
+apiVersion: pgop.ruck.io/v1alpha1
+kind: Cluster
+metadata:
+  name: tls-certmanager
+spec:
+  storage:
+    size: 5Gi
+  tls:
+    issuerRef:
+      name: pg-ca-issuer
+      kind: Issuer
+    minProtocolVersion: TLSv1.3
+---
+# 3. Your own kubernetes.io/tls Secret (tls.crt, tls.key, ca.crt), valid for
+#    tls-ownsecret.<namespace>.svc.cluster.local (and the -ro name with
+#    replicas > 1). requireTLS: false still accepts plaintext TCP connections,
+#    for example during a migration of the clients.
+apiVersion: pgop.ruck.io/v1alpha1
+kind: Cluster
+metadata:
+  name: tls-ownsecret
+spec:
+  storage:
+    size: 5Gi
+  tls:
+    secretName: tls-ownsecret-server
+    requireTLS: false
