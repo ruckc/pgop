@@ -42,6 +42,10 @@ import (
 // domain; roles created outside pgop (by a DBA, a bootstrap Job, another
 // Cluster's restore) are another, which only a Cluster editor can open up.
 
+// problemSuperuser explains that a role is refused because it is a
+// superuser.
+const problemSuperuser = "is a superuser"
+
 // granteeVerdict is what pgop does with grants to a grantee.
 type granteeVerdict int
 
@@ -81,7 +85,7 @@ func granteeProblem(r postgres.ReachableRole, policy *postgresv1alpha1.RolePolic
 		return p
 	}
 	if r.Superuser {
-		return "is a superuser"
+		return problemSuperuser
 	}
 	if managed.manages(r) || policy.AllowsExistingRole(r.Name) {
 		return ""
@@ -114,6 +118,77 @@ type granteeChecker struct {
 	// revoke them and drop the role.
 	deleting map[string]bool
 	cache    map[string]granteeResult
+	// forRoles and owners cache checkForRole and managesRole.
+	forRoles map[string]granteeResult
+	owners   map[string]bool
+}
+
+// managesRole reports whether name is a non-superuser role managed by a Role
+// of the Cluster (recorded in its status, carrying its marker). Object grants
+// use it to decide whether an object's owner is in the Cluster's trust
+// domain.
+func (c *granteeChecker) managesRole(ctx context.Context, name string) (bool, error) {
+	if v, ok := c.owners[name]; ok {
+		return v, nil
+	}
+	managed := false
+	if _, listed := c.managed[name]; listed && granteeNameProblem(name) == "" && !postgres.IsPublic(name) {
+		r, err := c.pg.LookupRole(ctx, name)
+		if err != nil {
+			return false, err
+		}
+		managed = r != nil && !r.Superuser && c.managed.manages(*r)
+	}
+	if c.owners == nil {
+		c.owners = map[string]bool{}
+	}
+	c.owners[name] = managed
+	return managed, nil
+}
+
+// checkForRole returns the decision for the forRole of default privileges:
+// it must be a non-superuser role managed by a Role of the Cluster
+// (allowedExistingRoles does not count: default privileges act on objects
+// the role creates later, so the role must be in the Cluster's trust
+// domain). Default privileges of a Role being deleted are paused.
+func (c *granteeChecker) checkForRole(ctx context.Context, name string) (granteeResult, error) {
+	if res, ok := c.forRoles[name]; ok {
+		return res, nil
+	}
+	res, err := c.decideForRole(ctx, name)
+	if err != nil {
+		return granteeResult{}, err
+	}
+	if c.forRoles == nil {
+		c.forRoles = map[string]granteeResult{}
+	}
+	c.forRoles[name] = res
+	return res, nil
+}
+
+func (c *granteeChecker) decideForRole(ctx context.Context, name string) (granteeResult, error) {
+	if postgres.IsPublic(name) {
+		return granteeResult{verdict: granteeRefused, problem: "is PUBLIC, not a role"}, nil
+	}
+	if p := granteeNameProblem(name); p != "" {
+		return granteeResult{verdict: granteeRefused, problem: p}, nil
+	}
+	if c.deleting[name] {
+		return granteeResult{verdict: granteePaused}, nil
+	}
+	r, err := c.pg.LookupRole(ctx, name)
+	if err != nil {
+		return granteeResult{}, err
+	}
+	switch {
+	case r == nil:
+		return granteeResult{verdict: granteeMissing}, nil
+	case r.Superuser:
+		return granteeResult{verdict: granteeRefused, problem: problemSuperuser}, nil
+	case !c.managed.manages(*r):
+		return granteeResult{verdict: granteeRefused, problem: "is not managed by a Role of this Cluster"}, nil
+	}
+	return granteeResult{verdict: granteeAllowed}, nil
 }
 
 // check returns the decision for grantee.

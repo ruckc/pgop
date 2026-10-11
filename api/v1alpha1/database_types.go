@@ -468,6 +468,279 @@ type SchemaSpec struct {
 	// +listMapKey=role
 	// +kubebuilder:validation:MaxItems=16
 	Grants []GrantSpec `json:"grants,omitempty"`
+
+	// objectGrants grants privileges on objects that exist in this schema:
+	// tables (also views, materialized views and foreign tables), sequences,
+	// functions, procedures and types (also domains). Objects are named, or
+	// selected with "*" (every object of the kind in the schema, re-evaluated
+	// on every reconcile). pgop only grants on objects owned by a role managed
+	// by a Role of the same Cluster (not a superuser; this applies to the
+	// database owner too), or the operator; objects owned by another role or a
+	// superuser, objects that belong to an extension (see
+	// spec.extensions[].grants) and, among the operator's objects, SECURITY
+	// DEFINER functions, functions not written in SQL or PL/pgSQL, views,
+	// materialized views and foreign tables are skipped (reason
+	// ObjectGrantSkipped, counted in status.objectGrants). Only schemas the
+	// Database manages (status.createdSchemas) are granted on. Privileges
+	// pgop added are tracked per object (status.managedObjectGrants) and
+	// revoked once no entry selects the object any more; privileges granted
+	// outside pgop are never revoked. Grantees follow the same policy as
+	// grants.
+	// +optional
+	// +kubebuilder:validation:MaxItems=32
+	ObjectGrants []ObjectGrantSpec `json:"objectGrants,omitempty"`
+
+	// defaultPrivileges sets privileges for objects that a role creates in
+	// this schema later (ALTER DEFAULT PRIVILEGES FOR ROLE ... IN SCHEMA ...
+	// GRANT), typically the role that runs the migrations. Privileges pgop
+	// added are tracked (status.managedDefaultPrivileges) and removed (ALTER
+	// DEFAULT PRIVILEGES ... REVOKE) once they leave the spec. They only
+	// apply to objects created after they were set: use objectGrants for the
+	// existing ones.
+	// +optional
+	// +listType=map
+	// +listMapKey=forRole
+	// +listMapKey=role
+	// +listMapKey=kind
+	// +kubebuilder:validation:MaxItems=32
+	DefaultPrivileges []DefaultPrivilegeSpec `json:"defaultPrivileges,omitempty"`
+}
+
+// ObjectGrantKind is the kind of schema object an object grant is on.
+// +kubebuilder:validation:Enum=table;sequence;function;procedure;type
+type ObjectGrantKind string
+
+// Object grant kinds.
+const (
+	ObjectGrantTable     ObjectGrantKind = "table"
+	ObjectGrantSequence  ObjectGrantKind = "sequence"
+	ObjectGrantFunction  ObjectGrantKind = "function"
+	ObjectGrantProcedure ObjectGrantKind = "procedure"
+	ObjectGrantType      ObjectGrantKind = "type"
+)
+
+// ObjectGrantSpec grants privileges on objects of one kind in the schema to
+// a role.
+// +kubebuilder:validation:XValidation:rule="self.role != 'PUBLIC' || !has(self.withGrantOption) || !self.withGrantOption",message="the grant option cannot be granted to PUBLIC"
+// +kubebuilder:validation:XValidation:rule="!self.objects.exists(o, o == '*') || size(self.objects) == 1",message="\"*\" selects every object of the kind and must be the only entry of objects"
+// +kubebuilder:validation:XValidation:rule="self.kind != 'table' || self.privileges.all(p, p in ['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER', 'MAINTAIN', 'ALL'])",message="table privileges are SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER, MAINTAIN or ALL"
+// +kubebuilder:validation:XValidation:rule="self.kind != 'sequence' || self.privileges.all(p, p in ['USAGE', 'SELECT', 'UPDATE', 'ALL'])",message="sequence privileges are USAGE, SELECT, UPDATE or ALL"
+// +kubebuilder:validation:XValidation:rule="!(self.kind in ['function', 'procedure']) || self.privileges.all(p, p in ['EXECUTE', 'ALL'])",message="function and procedure privileges are EXECUTE or ALL"
+// +kubebuilder:validation:XValidation:rule="self.kind != 'type' || self.privileges.all(p, p in ['USAGE', 'ALL'])",message="type privileges are USAGE or ALL"
+type ObjectGrantSpec struct {
+	// role is the grantee: the PostgreSQL name of a role (a raw PostgreSQL
+	// role name, not a Role resource name), or PUBLIC (upper case) for every
+	// role. It follows the same grantee policy as spec.grants (reason
+	// GranteeNotAllowed).
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:XValidation:rule="self == 'PUBLIC' || self.lowerAscii() != 'public'",message="write the PUBLIC pseudo-role in upper case"
+	// +kubebuilder:validation:XValidation:rule="self != 'postgres' && !self.startsWith('pgop_') && !self.startsWith('pg_') && self.lowerAscii() != 'none'",message="role must not be postgres, none, a pgop_* role or a predefined pg_* role"
+	Role string `json:"role"`
+
+	// kind is the kind of object: table (also views, materialized views and
+	// foreign tables), sequence, function (also aggregates), procedure or
+	// type (also domains, enums and ranges).
+	// +kubebuilder:validation:Required
+	Kind ObjectGrantKind `json:"kind"`
+
+	// objects selects the objects, by their name in the schema as stored
+	// in PostgreSQL (case-sensitive, without quotes or schema), or "*" alone
+	// for every object of the kind in the schema at reconcile time (at most
+	// 5000 per kind and schema). A function or procedure is named with its
+	// argument types, as in name(integer, text) (types resolved by the
+	// server, written schema-qualified when they are not in pg_catalog), or
+	// without parentheses for all functions of that name. A named object
+	// that does not exist is reported (reason ObjectNotFound) and retried.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=64
+	// +kubebuilder:validation:items:MinLength=1
+	// +kubebuilder:validation:items:MaxLength=255
+	Objects []string `json:"objects"`
+
+	// privileges lists the privileges to grant. Tables: SELECT, INSERT,
+	// UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER, MAINTAIN (PostgreSQL 17
+	// and later) or ALL (all of these but MAINTAIN). Sequences: USAGE,
+	// SELECT, UPDATE or ALL. Functions and procedures: EXECUTE (or ALL).
+	// Types: USAGE (or ALL).
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=9
+	// +kubebuilder:validation:items:Enum=SELECT;INSERT;UPDATE;DELETE;TRUNCATE;REFERENCES;TRIGGER;MAINTAIN;USAGE;EXECUTE;ALL
+	Privileges []string `json:"privileges"`
+
+	// withGrantOption allows the grantee to grant the same privileges to
+	// others. Turning it off for a grant pgop made revokes the grant option.
+	// +optional
+	WithGrantOption bool `json:"withGrantOption,omitempty"`
+}
+
+// DefaultPrivilegeKind is the kind of future objects default privileges
+// apply to.
+// +kubebuilder:validation:Enum=table;sequence;function;type
+type DefaultPrivilegeKind string
+
+// Default privilege kinds.
+const (
+	DefaultPrivilegeTable    DefaultPrivilegeKind = "table"
+	DefaultPrivilegeSequence DefaultPrivilegeKind = "sequence"
+	DefaultPrivilegeFunction DefaultPrivilegeKind = "function"
+	DefaultPrivilegeType     DefaultPrivilegeKind = "type"
+)
+
+// DefaultPrivilegeSpec sets privileges on objects forRole creates in the
+// schema later.
+// +kubebuilder:validation:XValidation:rule="self.role != 'PUBLIC' || !has(self.withGrantOption) || !self.withGrantOption",message="the grant option cannot be granted to PUBLIC"
+// +kubebuilder:validation:XValidation:rule="self.kind != 'table' || self.privileges.all(p, p in ['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER', 'MAINTAIN', 'ALL'])",message="table privileges are SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER, MAINTAIN or ALL"
+// +kubebuilder:validation:XValidation:rule="self.kind != 'sequence' || self.privileges.all(p, p in ['USAGE', 'SELECT', 'UPDATE', 'ALL'])",message="sequence privileges are USAGE, SELECT, UPDATE or ALL"
+// +kubebuilder:validation:XValidation:rule="self.kind != 'function' || self.privileges.all(p, p in ['EXECUTE', 'ALL'])",message="function privileges are EXECUTE or ALL"
+// +kubebuilder:validation:XValidation:rule="self.kind != 'type' || self.privileges.all(p, p in ['USAGE', 'ALL'])",message="type privileges are USAGE or ALL"
+type DefaultPrivilegeSpec struct {
+	// forRole is the PostgreSQL role whose future objects get the
+	// privileges (ALTER DEFAULT PRIVILEGES FOR ROLE). It must be managed by a
+	// Role of the same Cluster (created or adopted by it, recorded in its
+	// status) and must not be a superuser; postgres, pgop_* and pg_* roles
+	// are never accepted (reason DefaultPrivilegeNotAllowed). The role must
+	// exist; the entry is retried until it does.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:XValidation:rule="self != 'postgres' && !self.startsWith('pgop_') && !self.startsWith('pg_') && !(self.lowerAscii() in ['none', 'public'])",message="forRole must not be postgres, none, PUBLIC, a pgop_* role or a predefined pg_* role"
+	ForRole string `json:"forRole"`
+
+	// role is the grantee: the PostgreSQL name of a role, or PUBLIC (upper
+	// case) for every role. It follows the same grantee policy as
+	// spec.grants (reason GranteeNotAllowed).
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:XValidation:rule="self == 'PUBLIC' || self.lowerAscii() != 'public'",message="write the PUBLIC pseudo-role in upper case"
+	// +kubebuilder:validation:XValidation:rule="self != 'postgres' && !self.startsWith('pgop_') && !self.startsWith('pg_') && self.lowerAscii() != 'none'",message="role must not be postgres, none, a pgop_* role or a predefined pg_* role"
+	Role string `json:"role"`
+
+	// kind is the kind of future objects: table (also views, materialized
+	// views and foreign tables), sequence, function (also procedures) or
+	// type (also domains).
+	// +kubebuilder:validation:Required
+	Kind DefaultPrivilegeKind `json:"kind"`
+
+	// privileges lists the privileges to grant, as for objectGrants of the
+	// same kind.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=9
+	// +kubebuilder:validation:items:Enum=SELECT;INSERT;UPDATE;DELETE;TRUNCATE;REFERENCES;TRIGGER;MAINTAIN;USAGE;EXECUTE;ALL
+	Privileges []string `json:"privileges"`
+
+	// withGrantOption allows the grantee to grant the same privileges to
+	// others. Turning it off for an entry pgop set removes the grant option.
+	// +optional
+	WithGrantOption bool `json:"withGrantOption,omitempty"`
+}
+
+// ManagedObjectGrant records privileges pgop granted on one schema object to
+// a role.
+type ManagedObjectGrant struct {
+	// schema is the schema the object is in.
+	// +kubebuilder:validation:MaxLength=63
+	Schema string `json:"schema"`
+
+	// kind is the kind of object.
+	Kind ObjectGrantKind `json:"kind"`
+
+	// object is the object as PostgreSQL renders it (schema-qualified and
+	// quoted, with argument types for functions and procedures), as last
+	// seen.
+	// +kubebuilder:validation:MaxLength=1024
+	Object string `json:"object"`
+
+	// oid is the object's OID. pgop follows the object by it: a renamed
+	// object keeps its entry, and once no object of the kind has this OID the
+	// entry is forgotten (the object was dropped; one created again under
+	// the same name is another object).
+	// +optional
+	OID int64 `json:"oid,omitempty"`
+
+	// role is the grantee: a PostgreSQL role, or PUBLIC.
+	// +kubebuilder:validation:MaxLength=63
+	Role string `json:"role"`
+
+	// privileges are the privileges pgop added (normalized, ALL expanded).
+	// Only these are revoked once no entry selects the object.
+	// +optional
+	// +listType=set
+	// +kubebuilder:validation:MaxItems=8
+	// +kubebuilder:validation:items:MaxLength=16
+	Privileges []string `json:"privileges,omitempty"`
+
+	// grantOptions are the privileges whose grant option pgop added.
+	// Revoking them cascades to what the grantee passed on.
+	// +optional
+	// +listType=set
+	// +kubebuilder:validation:MaxItems=8
+	// +kubebuilder:validation:items:MaxLength=16
+	GrantOptions []string `json:"grantOptions,omitempty"`
+}
+
+// ManagedDefaultPrivilege records default privileges pgop set.
+type ManagedDefaultPrivilege struct {
+	// schema is the schema the default privileges apply in.
+	// +kubebuilder:validation:MaxLength=63
+	Schema string `json:"schema"`
+
+	// forRole is the role whose future objects get the privileges.
+	// +kubebuilder:validation:MaxLength=63
+	ForRole string `json:"forRole"`
+
+	// kind is the kind of future objects.
+	Kind DefaultPrivilegeKind `json:"kind"`
+
+	// role is the grantee: a PostgreSQL role, or PUBLIC.
+	// +kubebuilder:validation:MaxLength=63
+	Role string `json:"role"`
+
+	// privileges are the default privileges pgop added. Only these are
+	// removed once they leave the spec.
+	// +optional
+	// +listType=set
+	// +kubebuilder:validation:MaxItems=8
+	// +kubebuilder:validation:items:MaxLength=16
+	Privileges []string `json:"privileges,omitempty"`
+
+	// grantOptions are the privileges whose grant option pgop added.
+	// +optional
+	// +listType=set
+	// +kubebuilder:validation:MaxItems=8
+	// +kubebuilder:validation:items:MaxLength=16
+	GrantOptions []string `json:"grantOptions,omitempty"`
+}
+
+// ObjectGrantStatus counts, for one schema and kind of object, the objects
+// spec.schemas[].objectGrants select.
+type ObjectGrantStatus struct {
+	// schema is the schema.
+	Schema string `json:"schema"`
+
+	// kind is the kind of object.
+	Kind ObjectGrantKind `json:"kind"`
+
+	// granted counts the selected objects pgop grants on.
+	// +optional
+	Granted int32 `json:"granted,omitempty"`
+
+	// skipped counts the selected objects pgop does not grant on (reason
+	// ObjectGrantSkipped), or the privileges it does not grant there.
+	// +optional
+	Skipped int32 `json:"skipped,omitempty"`
+
+	// skippedExamples names up to five skipped objects and why they were
+	// skipped.
+	// +optional
+	// +kubebuilder:validation:MaxItems=5
+	// +kubebuilder:validation:items:MaxLength=2048
+	SkippedExamples []string `json:"skippedExamples,omitempty"`
 }
 
 // GrantSpec defines privileges to grant to a role
@@ -595,6 +868,40 @@ type DatabaseStatus struct {
 	// +listMapKey=role
 	// +kubebuilder:validation:MaxItems=2048
 	ManagedSchemaGrants []ManagedSchemaGrant `json:"managedSchemaGrants,omitempty"`
+
+	// managedObjectGrants lists the privileges pgop has granted on schema
+	// objects (spec.schemas[].objectGrants), per object and grantee. Only
+	// these are revoked once no entry selects the object any more; an object
+	// that was dropped or renamed is forgotten.
+	// +optional
+	// +listType=map
+	// +listMapKey=kind
+	// +listMapKey=object
+	// +listMapKey=role
+	// +kubebuilder:validation:MaxItems=4096
+	ManagedObjectGrants []ManagedObjectGrant `json:"managedObjectGrants,omitempty"`
+
+	// managedDefaultPrivileges lists the default privileges pgop has set
+	// (spec.schemas[].defaultPrivileges). Only these are removed once they
+	// leave the spec.
+	// +optional
+	// +listType=map
+	// +listMapKey=schema
+	// +listMapKey=forRole
+	// +listMapKey=kind
+	// +listMapKey=role
+	// +kubebuilder:validation:MaxItems=2048
+	ManagedDefaultPrivileges []ManagedDefaultPrivilege `json:"managedDefaultPrivileges,omitempty"`
+
+	// objectGrants counts per schema and kind the objects
+	// spec.schemas[].objectGrants select: those pgop grants on and those it
+	// skips, with examples.
+	// +optional
+	// +listType=map
+	// +listMapKey=schema
+	// +listMapKey=kind
+	// +kubebuilder:validation:MaxItems=320
+	ObjectGrants []ObjectGrantStatus `json:"objectGrants,omitempty"`
 
 	// revokedPublicPrivileges lists the default PUBLIC privileges pgop has
 	// revoked for spec.publicPrivileges. Only these are granted back to

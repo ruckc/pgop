@@ -214,6 +214,29 @@ const (
 	// the Database neither created nor owns (for example one an extension or
 	// another role created). pgop does not change its owner or its grants.
 	ReasonSchemaNotManaged = "SchemaNotManaged"
+	// ReasonObjectGrantSkipped: Database.spec.schemas[].objectGrants names an
+	// object pgop does not grant on (owned by a superuser or a role outside
+	// the Cluster's Roles, part of an extension, or a superuser's SECURITY
+	// DEFINER or non-SQL function). Also the reason of the
+	// ObjectGrantsComplete condition when "*" skipped objects.
+	ReasonObjectGrantSkipped = "ObjectGrantSkipped"
+	// ReasonObjectNotFound: an object named in
+	// Database.spec.schemas[].objectGrants does not exist (yet); retried.
+	ReasonObjectNotFound = "ObjectNotFound"
+	// ReasonTooManyObjects: "*" in Database.spec.schemas[].objectGrants
+	// selects more objects of a kind in a schema than pgop grants on.
+	ReasonTooManyObjects = "TooManyObjects"
+	// ReasonDefaultPrivilegeNotAllowed: Database.spec.schemas[].
+	// defaultPrivileges names a forRole that is not a non-superuser role
+	// managed by a Role of the same Cluster.
+	ReasonDefaultPrivilegeNotAllowed = "DefaultPrivilegeNotAllowed"
+	// ReasonAllObjectsGranted: the ObjectGrantsComplete condition is true:
+	// no object the object grants select was skipped.
+	ReasonAllObjectsGranted = "AllObjectsGranted"
+	// ConditionTypeObjectGrantsComplete reports whether the objects
+	// Database.spec.schemas[].objectGrants select with "*" were all granted
+	// on (skipped ones do not make the Database unavailable).
+	ConditionTypeObjectGrantsComplete = "ObjectGrantsComplete"
 
 	DefaultPostgresImage    = "postgres:18"
 	DefaultOperatorUsername = "pgop_operator"

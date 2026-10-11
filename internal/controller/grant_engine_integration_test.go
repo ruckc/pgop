@@ -212,7 +212,7 @@ func checkPublicSchemaIntegration(ctx context.Context, t *testing.T, pg *postgre
 	t.Helper()
 	database.Spec.Schemas = []postgresv1alpha1.SchemaSpec{{Name: publicSchemaName, Owner: engOwner}}
 	database.Status.CreatedSchemas = nil
-	managed, refused, err := reconcileSchemas(ctx, pg, database)
+	managed, refused, err := reconcileSchemas(ctx, pg, database, "")
 	if err != nil {
 		t.Fatal(err)
 	}

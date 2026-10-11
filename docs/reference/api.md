@@ -381,6 +381,37 @@ spec:
           privileges:
             - string       # USAGE, CREATE, ALL or ALL PRIVILEGES (any case; max 8)
           withGrantOption: boolean   # not allowed for PUBLIC
+      # Privileges on existing objects of the schema (max 32). Only objects
+      # owned by a role of the Cluster's Roles (no superuser; also for the
+      # database and schema owners) or the operator are granted on, and no
+      # extension members; the operator's SECURITY DEFINER/non-SQL functions,
+      # views and TRIGGER/MAINTAIN on its tables are skipped too (reason
+      # ObjectGrantSkipped). Tracked per object in
+      # status.managedObjectGrants: revoked once no entry selects the object.
+      objectGrants:
+        - role: string     # Grantee (same rules as grants[].role below)
+          kind: string     # table, sequence, function, procedure or type
+          objects:         # 1-64 names (max 255 chars each), or ["*"] alone:
+            - string       # every object of the kind (max 5000, TooManyObjects).
+                           # Routines: name(argtypes) for one, name for all overloads.
+                           # Missing names: ObjectNotFound (retried).
+          privileges:      # table: SELECT INSERT UPDATE DELETE TRUNCATE REFERENCES
+            - string       # TRIGGER MAINTAIN(17+) ALL; sequence: USAGE SELECT UPDATE ALL;
+                           # function/procedure: EXECUTE ALL; type: USAGE ALL
+          withGrantOption: boolean   # not allowed for PUBLIC
+      # Default privileges for objects forRole creates in the schema later
+      # (ALTER DEFAULT PRIVILEGES FOR ROLE ... IN SCHEMA ... GRANT), max 32,
+      # each forRole/role/kind at most once. Tracked in
+      # status.managedDefaultPrivileges and revoked when removed.
+      defaultPrivileges:
+        - forRole: string  # A non-superuser role managed by a Role of this
+                           # Cluster (DefaultPrivilegeNotAllowed otherwise);
+                           # never postgres, pgop_*, pg_* or PUBLIC
+          role: string     # Grantee (same rules as grants[].role below)
+          kind: string     # table, sequence, function (also procedures) or type
+          privileges:
+            - string       # As for objectGrants of the same kind
+          withGrantOption: boolean   # not allowed for PUBLIC
 
   # Database-level privileges (GRANT ... ON DATABASE). pgop-granted
   # privileges removed from the spec are revoked (with CASCADE when they were
@@ -428,8 +459,15 @@ extension's script would run in a schema other roles can write to,
 `ExtensionDowngradeNotAllowed`, `ExtensionSchemaMismatch`,
 `ExtensionNotManaged`, `ExtensionDropBlocked` and `ExtensionGrantNotAllowed`
 (see [Databases: Extensions](../user-guide/databases.md#extensions)),
-`SchemaNotAllowed` for a system schema, `GranteeNotAllowed` when a grantee
-in `grants` or `schemas[].grants` is not allowed (grants to it are not
+`SchemaNotAllowed` for a system schema, `ObjectGrantSkipped` when an object
+named in `schemas[].objectGrants` is not granted on, `ObjectNotFound` when it
+does not exist (yet), `TooManyObjects` when `"*"` selects more than 5000
+objects of a kind in a schema, `DefaultPrivilegeNotAllowed` when a
+`defaultPrivileges` `forRole` is not allowed (see
+[Databases: Object Grants](../user-guide/databases.md#object-grants)),
+`GranteeNotAllowed` when a grantee
+in `grants`, `schemas[].grants`, `objectGrants`, `defaultPrivileges` or
+`extensions[].grants` is not allowed (grants to it are not
 applied, and revoked if pgop granted them), `PublicPrivilegeConflict` when
 `publicPrivileges` revokes what a `PUBLIC` grant grants, `TooManyGrants` when
 the declared grants plus those pgop still tracks exceed the status ledger,
@@ -444,6 +482,12 @@ created it (`status.databaseName`) nor may adopt it (the Cluster's
 the database does not allow connections, `DuplicateDatabaseName` when an older Database of
 the Cluster has the same PostgreSQL name, and `ReconcileError` for other failures, such as a grantee
 role that does not exist yet.
+
+The `ObjectGrantsComplete` condition (only on Databases with object grants)
+is `True` (reason `AllObjectsGranted`) when every object the object grants
+select is granted on, and `False` (reason `ObjectGrantSkipped`, with counts
+and examples) when some are skipped; skipped objects selected with `"*"` do
+not make the Database unavailable.
 
 ### DatabaseStatus
 
@@ -485,6 +529,27 @@ status:
       kind: string         # schema, tables, sequences or functions
       schema: string       # The extension's schema (kind schema)
       privileges: [string] # Added on at least one object; revoked from every object of the kind
+  managedObjectGrants:     # max 4096 (and about 512 KiB), one entry per object and grantee
+    - schema: string
+      kind: string         # table, sequence, function, procedure or type
+      object: string       # As PostgreSQL renders it (app."Orders", app.f(integer)), max 1024
+      oid: integer         # The object's OID: followed across renames; gone once dropped
+      role: string         # Role name or PUBLIC
+      privileges: [string]
+      grantOptions: [string]
+  managedDefaultPrivileges: # max 2048
+    - schema: string
+      forRole: string
+      kind: string         # table, sequence, function or type
+      role: string         # Role name or PUBLIC
+      privileges: [string]
+      grantOptions: [string]
+  objectGrants:            # Per schema and kind selected by objectGrants
+    - schema: string
+      kind: string
+      granted: integer     # Selected objects pgop grants on
+      skipped: integer     # Selected objects (or privileges on them) pgop skips
+      skippedExamples: [string]  # Up to 5: "<object> <why>"
   revokedPublicPrivileges: # Default PUBLIC privileges pgop revoked (granted back when no longer requested)
     - string               # connect, temporary, publicSchemaUsage, publicSchemaCreate
   managedSettings:         # Lowercased parameter names pgop set (reset when removed)

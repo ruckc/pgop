@@ -333,8 +333,9 @@ func backoffDelay(attempt int, jitter float64) time.Duration {
 // dropPostgresRole drops the Role's PostgreSQL role during deletion. Privileges
 // held by the role block DROP ROLE, so it first revokes the parameter grants
 // pgop made and every database and schema privilege, and every privilege on
-// objects that belong to an extension, the role holds on the cluster (with
-// CASCADE: the role is going away). Anything else that still depends on the
+// objects that belong to an extension, the role holds on the cluster, and
+// the object grants and default privileges the Databases' ledgers record
+// for it (with CASCADE: the role is going away). Anything else that still depends on the
 // role (objects it owns, privileges on other tables) is reported as an
 // Available=False condition with reason RoleDropBlocked and PostgreSQL's
 // list of dependents, and the drop is retried periodically. A non-zero
@@ -414,12 +415,19 @@ func (r *RoleReconciler) dropPostgresRole(ctx context.Context, cluster *postgres
 			skipped = append(skipped, db.Name+" ("+err.Error()+")")
 		}
 	}
+	// Object grants and default privileges: only what the Databases'
+	// ledgers record (see role_object_cleanup.go).
+	objectSkipped, err := revokeRecordedObjectAccessFor(ctx, r.Client, cluster, pgName)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	skipped = append(skipped, objectSkipped...)
 
 	err = pgClient.DropRole(ctx, pgName)
 	if depErr, ok := errors.AsType[*postgres.DependentObjectsError](err); ok {
 		msg := depErr.Error()
 		if len(skipped) > 0 {
-			msg += "; schema or extension object privileges could not be revoked in: " + strings.Join(skipped, ", ")
+			msg += "; schema, extension object or object privileges could not be revoked in: " + strings.Join(skipped, ", ")
 		}
 		log.Info("Role cannot be dropped yet", "reason", msg)
 		meta.SetStatusCondition(&role.Status.Conditions, metav1.Condition{
