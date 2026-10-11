@@ -32,3 +32,6 @@ spec:
     allowedPredefinedRoles: [pg_monitor]
     # The Database sets shop.region (a custom placeholder parameter).
     allowedSettingPrefixes: [shop]
+    # pg_stat_statements is not a trusted extension; the Database installs
+    # it (into an operator-owned schema) for the metrics exporter.
+    allowedExtensions: [pg_stat_statements]

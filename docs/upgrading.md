@@ -214,8 +214,10 @@ they get needs the Cluster's `spec.rolePolicy`. See
 
 - `Cluster.spec.parameters`: adding the first parameter (or removing the last
   one) restarts the pod once; Clusters without parameters are untouched.
-  `archive_*`, `restore_command`, listen/port/file and `ssl*` parameters are
-  reserved.
+  `archive_mode`, `archive_command`, `archive_library`, `restore_command`,
+  the listen, port and file-location parameters, the include directives, and
+  `ssl`, `ssl_cert_file`, `ssl_key_file` and `ssl_min_protocol_version` are
+  reserved (other `ssl_*` settings, such as `ssl_ciphers`, may be set).
 - `Role.status.passwordHash` is deprecated and cleared; the password
   fingerprint lives in the `pgop.ruck.io/password-fingerprint` annotation of
   the credentials Secret. Passwords are sent as SCRAM-SHA-256 verifiers. A

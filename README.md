@@ -198,9 +198,7 @@ spec:
   databaseRef:
     name: myapp
   schedule: "0 2 * * *"      # cron — daily at 02:00
-  retention:
-    disabled: true
-  backupRunTTL: "168h"        # keep BackupRun records for 7 days
+  # retention, encryption and backupRunTTL only apply to physical backups
   destination:
     type: s3
     s3:

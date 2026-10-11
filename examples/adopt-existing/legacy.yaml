@@ -46,8 +46,15 @@ spec:
   grants:
     - role: dba_readonly     # listed in allowedExistingRoles
       privileges: [CONNECT]
+  # An existing schema only counts as managed when it is owned by
+  # pg_database_owner (public on PostgreSQL 15+), by the declared owner
+  # (legacy_app) or by its declared schema owner (a non-superuser), or is the
+  # public schema of a PostgreSQL 14 database owned by the bootstrap
+  # superuser. A legacy public schema owned by any other role (for example a
+  # "postgres" role that is not the bootstrap superuser) reports
+  # SchemaNotManaged and gets no grants.
   schemas:
-    - name: public           # existing schema: managed for grants
+    - name: public           # owned by pg_database_owner here: managed
       grants:
         - role: dba_readonly
           privileges: [USAGE]

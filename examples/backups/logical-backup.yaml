@@ -10,7 +10,10 @@ spec:
   databaseRef:
     name: shop                         # the Database resource
   schedule: "30 1 * * *"               # schema and data dumps share it
-  backupRunTTL: "168h"
+  # retention, encryption and backupRunTTL only apply to physical backups:
+  # pgop never expires dumps (use bucket lifecycle rules) and logical Jobs
+  # record no BackupRuns. Find dumps with:
+  #   aws s3 ls s3://pgop-backups/logical/shop/data/
   destination:
     type: s3
     s3:

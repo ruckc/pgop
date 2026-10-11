@@ -23,6 +23,11 @@ spec:
       privileges: [CONNECT, TEMPORARY]
     - role: shop_ro
       privileges: [CONNECT]
+    # pg_monitor's per-database statistics (pg_stat_user_tables,
+    # pg_statio_*, pg_stat_statements) are only visible from inside the
+    # database, so the exporter needs CONNECT here too.
+    - role: shop_monitoring
+      privileges: [CONNECT]
   settings:
     # The YAML quotes are only quoting: the value is "$user", app
     search_path: '"$user", app'
@@ -30,6 +35,14 @@ spec:
   extensions:
     - name: pg_trgm          # trusted: installed into public
     - name: citext
+    # Untrusted (rolePolicy.allowedExtensions), so it needs a schema only
+    # superusers can write to: pgop creates "monitoring", owned by the
+    # operator. The library is preloaded by the Cluster's parameters.
+    - name: pg_stat_statements
+      schema: monitoring
+      grants:
+        - role: shop_monitoring
+          schema: [USAGE]      # the view itself is granted to PUBLIC by the extension
   schemas:
     - name: app
       owner: shop_owner      # the default (the database owner), spelled out

@@ -1,0 +1,27 @@
+# Step 1 of a logical restore (step 2: logical-restore.yaml).
+# Logical backup Jobs do not record BackupRuns, so record the dump to restore
+# by hand. Find it in the bucket (the backup Jobs, and their logs, are deleted
+# 5 minutes after they finish):
+#
+#   aws s3 ls s3://pgop-backups/logical/shop/data/
+#
+# Apply this BackupRun, then set its location on the status subresource:
+#
+#   kubectl patch backuprun shop-data-20261001 --subresource=status --type=merge \
+#     -p '{"status":{"location":"s3://pgop-backups/logical/shop/data/20261001T013000.dump"}}'
+#
+# Only apply logical-restore.yaml once the location is set: a Restore whose
+# BackupRun has no location fails at once and cannot be retried (its spec is
+# immutable; delete and re-create it).
+#
+# Security: the restore runs the dump's SQL as the operator's superuser, and
+# the location may name any object the Backup's credentials can read. Only
+# record dumps you trust (see docs/user-guide/restores.md).
+apiVersion: pgop.ruck.io/v1alpha1
+kind: BackupRun
+metadata:
+  name: shop-data-20261001
+spec:
+  backupRef:
+    name: shop-logical         # provides the bucket, endpoint and credentials
+  type: data

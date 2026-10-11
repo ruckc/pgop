@@ -18,7 +18,7 @@ directory, and every manifest on this page is validated against the CRDs by
 | A PostgreSQL name with underscores | Role `spec.roleName`, Database `spec.databaseName` | Immutable. Kubernetes references (`owner`, Secret names) keep using `metadata.name` |
 | Membership in a group | Role `spec.memberships` | Raw PostgreSQL role names. Removed entries are revoked |
 | The password from your secret manager | Role `spec.passwordSecretRef` | pgop copies it into the credentials Secret and follows changes |
-| Regular password changes | Role `spec.passwordRotation.every` or the `pgop.ruck.io/rotate-password` annotation | Not combined with `passwordSecretRef` |
+| Regular password changes | Role `spec.passwordRotation.every` or the `pgop.ruck.io/rotate-password` annotation | `passwordRotation` cannot be combined with `passwordSecretRef`; the annotation works with both (with `passwordSecretRef` it sets the referenced password again) |
 | Per-user session defaults | Role `spec.settings`, `spec.databaseSettings` | `ALTER ROLE ... [IN DATABASE ...] SET` |
 | Who owns a database | Database `spec.owner` (a Role resource name) | The owner has full DDL; its credentials go to `<database>-<owner>-credentials` |
 | Who may connect | Database `spec.grants` (`CONNECT`) and `publicPrivileges.connect: false` | PostgreSQL lets every role connect by default |
@@ -81,7 +81,8 @@ setup for an application called *shop*:
 ### The Cluster
 
 The Cluster editor decides what the Roles and the Database may obtain. Here:
-membership in `pg_monitor`, and custom settings in the `shop.*` namespace.
+membership in `pg_monitor`, custom settings in the `shop.*` namespace, and
+the untrusted extension `pg_stat_statements`.
 
 ```yaml
 apiVersion: pgop.ruck.io/v1alpha1
@@ -100,11 +101,12 @@ spec:
   rolePolicy:
     allowedPredefinedRoles: [pg_monitor]
     allowedSettingPrefixes: [shop]
+    allowedExtensions: [pg_stat_statements]   # not a trusted extension
 ```
 
 Without these entries the monitoring Role reports `MembershipNotAllowed`
-and the Database reports `SettingNotAllowed` for `shop.region`; everything
-else still works. See [Clusters: Role Policy](clusters.md#role-policy).
+and the Database reports `SettingNotAllowed` for `shop.region` and
+`ExtensionNotAllowed` for `pg_stat_statements`; everything else still works. See [Clusters: Role Policy](clusters.md#role-policy).
 
 ### The Roles
 
@@ -220,12 +222,19 @@ spec:
       privileges: [CONNECT, TEMPORARY]
     - role: shop_ro
       privileges: [CONNECT]
+    - role: shop_monitoring       # per-database statistics need a connection
+      privileges: [CONNECT]
   settings:
     search_path: '"$user", app'
     shop.region: eu-west-1
   extensions:
     - name: pg_trgm
     - name: citext
+    - name: pg_stat_statements    # untrusted: an operator-owned schema
+      schema: monitoring
+      grants:
+        - role: shop_monitoring
+          schema: [USAGE]
   schemas:
     - name: app
       owner: shop_owner
@@ -270,9 +279,13 @@ What each piece does:
   (with `database: shop`) for the migration Job.
 - **`publicPrivileges`** revokes the `CONNECT` and `TEMPORARY` every role has
   on a new database. `shop_reporting` and `shop_app` can still connect through
-  their groups' `CONNECT` grants; `shop_monitoring` cannot (it does not need
-  to: `pg_monitor`'s statistics views are readable from the `postgres`
-  database). See [Default PUBLIC privileges](databases.md#default-public-privileges).
+  their groups' `CONNECT` grants, and `shop_monitoring` through its own. A
+  monitoring role needs `CONNECT` on every database it should report on:
+  some of `pg_monitor`'s views are cluster-wide (`pg_stat_database`,
+  `pg_stat_activity`, readable from the `postgres` database), but
+  `pg_stat_user_tables`, the `pg_statio_*` views and `pg_stat_statements`
+  only show the database the session is connected to. See
+  [Default PUBLIC privileges](databases.md#default-public-privileges).
 - **Schema `grants`**: `USAGE` lets the groups see the objects in `app`; it
   grants nothing on the objects themselves.
 - **`objectGrants`** grant on the tables and sequences that exist when the
@@ -287,12 +300,18 @@ What each piece does:
   role setting overrides it); `shop.region` is an application setting that
   the Cluster's `allowedSettingPrefixes` permits.
 - **`extensions`**: `pg_trgm` and `citext` are trusted extensions, installed
-  into `public`. Grant on extension-owned objects with
-  [`extensions[].grants`](databases.md#grants-on-extension-objects) when
-  needed.
+  into `public`. `pg_stat_statements` is not trusted: the Cluster allows it,
+  and it goes into the schema `monitoring`, which pgop creates owned by the
+  operator (untrusted extensions are refused in schemas other roles own or
+  can write to). Its library is loaded by the Cluster's
+  `shared_preload_libraries`, and `CREATE EXTENSION` makes its view available
+  in this database only; the exporter connects to `shop` to read it. The
+  extension grants `SELECT` on the view to `PUBLIC` itself;
+  [`extensions[].grants`](databases.md#grants-on-extension-objects) adds
+  `USAGE` on its schema.
 
 pgop only grants on objects owned by roles of the Cluster's Roles (here
-`shop_owner`): see [Which objects pgop grants on](databases.md#which-objects-pgop-grants-on).
+`shop_owner`), or by the operator with stricter rules: see [Which objects pgop grants on](databases.md#which-objects-pgop-grants-on).
 It records what it granted and revokes exactly that when an entry is removed
 (see [What pgop tracks](databases.md#what-pgop-tracks)).
 
@@ -303,13 +322,14 @@ It records what it granted and revokes exactly that when an entry is removed
 | Migration Job | `shop-shop-owner-credentials` (Database Secret) | `shop-db` (primary) | from the Secret |
 | Application | `shop-db-shop-app-credentials` (Role Secret) | `shop-db` (primary) | `shop` (set `PGDATABASE`) |
 | Reporting | `shop-db-shop-reporting-credentials` | `shop-db-ro` (standbys) | `shop` |
-| Monitoring | `shop-db-shop-monitoring-credentials` | `shop-db` | `postgres` (the Secret's default) |
+| Monitoring | `shop-db-shop-monitoring-credentials` | `shop-db` | `shop` (and `postgres` for the cluster-wide views) |
 
 A Role's credentials Secret has `username`, `password`, `host`, `port`,
-`sslmode`, `uri` and, while TLS is active, `ca.crt`, but no `database` key
-and its `uri` names the `postgres` database. Only the owner's credentials
-end up in a Database Secret. So for the other users, take the individual keys
-and set the database yourself:
+`sslmode`, `uri` and, while TLS is active, `ca.crt`. It has **no `database`
+key**: only its `uri` names a database, `postgres`. Only the owner's
+credentials end up in a Database Secret. So for the other users, take the
+individual keys and set the database yourself (`PGDATABASE=shop`, or
+`PGDATABASE=postgres` for what the `uri` would have reached):
 
 <!-- pgop-validate: skip (container spec excerpt) -->
 ```yaml
@@ -343,10 +363,12 @@ writes; see [Replication](replication.md).
 
 Default privileges cover objects created **after** they were set; for
 objects that existed before (or were created by another role), `objectGrants`
-does the work at the next reconcile. Reconciles are event-driven (a spec
-change, a Role change, the periodic resync): after a migration you can
-trigger one with
-`kubectl annotate database shop pgop.ruck.io/reconcile="$(date +%s)" --overwrite`.
+does the work at the next reconcile. Reconciles are event-driven (a change
+of the Database or of a Role it names); otherwise the controller's periodic
+resync only comes about every 10 hours (the controller-runtime default). So
+after a migration, trigger one yourself:
+`kubectl annotate database shop pgop.ruck.io/reconcile="$(date +%s)" --overwrite`
+(for example as the last step of the migration Job).
 
 ### Checking the result
 
@@ -601,8 +623,11 @@ REASSIGN OWNED BY shop_app TO shop_owner;   -- hand its objects to the owner
 DROP OWNED BY shop_app;                     -- drop what is left, revoke its privileges
 ```
 
-To tear an application down, delete the Database before (or together with)
-its owner Role: dropping the database removes everything in it, after which
+To tear an application down, first stop its workloads (and anything else
+connected to the database): pgop runs a plain `DROP DATABASE`, without
+`WITH (FORCE)`, which PostgreSQL refuses while sessions are connected; the
+Database keeps retrying until they are gone. Then delete the Database before
+(or together with) its owner Role: dropping the database removes everything in it, after which
 the owner's `DROP ROLE` succeeds (until then the owner Role reports
 `RoleDropBlocked` and retries). Group and login roles that own nothing can
 be deleted in any order.

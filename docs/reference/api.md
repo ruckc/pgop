@@ -652,7 +652,10 @@ spec:
     keepLast: integer            # keep N full backups (repo1-retention-full=N); needs disabled: false
     keepDays: integer            # keep full backups newer than N days; needs disabled: false
 
-  # How long a completed BackupRun record is kept (Go duration, default "168h")
+  # physical: how long a completed BackupRun record is kept (Go duration,
+  # default "168h"); copied into spec.ttl of the BackupRuns pgop creates, so
+  # a change only affects later runs. No effect on logical backups (they
+  # create no BackupRuns).
   backupRunTTL: string
 
   # Required: where backups are stored
@@ -730,7 +733,8 @@ spec:
   backupRef:                 # Required: the Backup (destination and credentials)
     name: string
   type: string               # Required: full, incremental (physical) or schema, data (logical)
-  ttl: string                # Go duration; overrides the Backup's backupRunTTL
+  ttl: string                # Go duration (default 168h). pgop sets it from the Backup's
+                             # backupRunTTL when it creates a physical run
 ```
 
 ### BackupRunStatus
@@ -753,9 +757,19 @@ status:
       lastTransitionTime: string
 ```
 
-A BackupRun is deleted `ttl` (or the Backup's `backupRunTTL`, default 7 days)
-after it completed; the backup itself stays in the repository until
-pgBackRest expires it.
+A BackupRun is deleted `spec.ttl` (default 7 days) after
+`status.completionTime`; the backup itself stays in the repository until
+pgBackRest expires it. Only `spec.ttl` counts: pgop copies the Backup's
+`backupRunTTL` into it when it creates a physical run, so changing
+`backupRunTTL` later does not affect existing runs. A BackupRun created by
+hand (for a logical restore) has no Job, never gets a `completionTime`, stays
+`Pending` and is never deleted by pgop; delete it yourself after the restore.
+
+**Security:** `status.location` decides what a Restore downloads, and a
+logical restore runs the dump's SQL as the operator's superuser. Permission
+to `patch`/`update` `backupruns/status` (together with creating Restores),
+or write access to the backup bucket, is superuser-equivalent. See
+[Restores](../user-guide/restores.md#logical-restore-pg_restore).
 
 ---
 
@@ -766,6 +780,15 @@ pgBackRest expires it.
 A `Restore` is a **one-shot** restore of a BackupRun. Its `spec` is immutable
 (the API server rejects changes): create a new Restore to restore again. See
 [Restores](../user-guide/restores.md).
+
+A **logical** Restore runs `pg_restore --no-owner --clean --if-exists` as the
+operator's superuser: the dump's SQL runs as a superuser (creating Restores
+for dumps you do not trust is superuser-equivalent), a schema dump drops and
+re-creates its tables (data included), a data dump appends rows, and `GRANT`s
+to roles the target Cluster lacks fail, which makes the Job, and the Restore,
+end `Failed` although most of the dump was restored: check the Job log. A
+logical Restore created before its BackupRun has `status.location` fails at
+once and must be re-created.
 
 ### RestoreSpec
 
