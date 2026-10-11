@@ -8,9 +8,8 @@ spec:
   databaseRef:
     name: myapp
   schedule: "0 2 * * *"
-  retention:
-    disabled: true
-  backupRunTTL: "168h"
+  # retention, encryption and backupRunTTL only apply to physical backups:
+  # dumps are not expired by pgop and logical Jobs record no BackupRuns.
   destination:
     type: s3
     s3:

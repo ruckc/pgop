@@ -1,0 +1,50 @@
+# Physical (pgBackRest) backups of the whole Cluster: weekly full, daily
+# incremental, continuous WAL archiving for point-in-time recovery.
+# S3 destinations only; the endpoint must be https://.
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: s3-credentials
+type: Opaque
+stringData:
+  AWS_ACCESS_KEY_ID: replace-me
+  AWS_SECRET_ACCESS_KEY: replace-me
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: shop-db-backup-encryption
+type: Opaque
+stringData:
+  passphrase: replace-with-a-long-random-passphrase
+---
+apiVersion: pgop.ruck.io/v1alpha1
+kind: Backup
+metadata:
+  name: shop-db-backup
+spec:
+  type: physical
+  clusterRef:
+    name: shop-db
+  physical:
+    fullSchedule: "0 2 * * 0"          # Sundays 02:00
+    incrementalSchedule: "0 2 * * 1-6"
+    # archivePushQueueMax: 5Gi         # default: a quarter of the Cluster's storage size
+  retention:
+    disabled: false
+    keepLast: 4                        # 4 full backups and what depends on them
+  backupRunTTL: "720h"
+  destination:
+    type: s3
+    s3:
+      bucket: pgop-backups
+      region: us-east-1
+      # prefix: shop-db                # default repository path: /<namespace>/shop-db/shop-db-backup
+      credentialsSecretRef:
+        name: s3-credentials
+  encryption:
+    enabled: true
+    keySecretRef:
+      name: shop-db-backup-encryption
+      key: passphrase

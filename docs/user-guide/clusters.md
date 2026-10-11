@@ -372,6 +372,7 @@ kubectl get events --field-selector reason=PreExistingPVC
 
 The operator creates `<cluster-name>-credentials` containing:
 
+<!-- pgop-validate: skip (Secret data) -->
 ```yaml
 data:
   username: pgop_operator           # Superuser username
@@ -424,14 +425,19 @@ The standard `PG*` env vars are consumed automatically by `libpq`-based clients
 ## Supported Images
 
 Any Docker image compatible with the official PostgreSQL image environment
-variables. **PostgreSQL 14 is the oldest supported major version.**
+variables. **PostgreSQL 16, 17 and 18 are the tested major versions** (the
+end-to-end suite runs on 18, and pgop's Postgres+pgBackRest images for
+[physical backups](backups.md#images) exist for 16, 17 and 18):
 
-- `postgres:18`
+- `postgres:18` (the default)
 - `postgres:17`
 - `postgres:16`
-- `postgres:15`
-- `postgres:14`
 - Custom images that support `POSTGRES_USER` and `POSTGRES_PASSWORD` env vars
+
+PostgreSQL 14 and 15 are not a priority: they mostly work, but are not covered
+by the tests, and some features need newer servers (membership
+`inherit`/`set` options need 16, `parameterGrants` 15, the `MAINTAIN`
+privilege 17).
 
 For extensions that ship outside the base image (e.g. PostGIS, TimescaleDB),
 set `spec.image` to an image that bundles them, such as `postgis/postgis:18-3.5`.
@@ -657,6 +663,7 @@ first, the primary last).
 A URI cannot carry the CA, so clients using `verify-full` mount `ca.crt` from
 their credentials Secret and point libpq at it:
 
+<!-- pgop-validate: skip (container spec excerpt) -->
 ```yaml
 env:
   - name: DATABASE_URL

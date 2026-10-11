@@ -3,10 +3,13 @@ kind: Restore
 metadata:
   name: myapp-restore
 spec:
-  # logical restore: pg_restore from a pg_dump artifact in object storage
+  # logical restore: pg_restore from a pg_dump artifact in object storage.
+  # Logical backup Jobs do not record BackupRuns: create the BackupRun by hand
+  # and set its status.location to the dump (see docs/user-guide/restores.md
+  # and examples/restores/logical-restore.yaml).
   type: logical
   backupRunRef:
-    name: myapp-backup-data-20260101T020000
+    name: myapp-data-20260101
   clusterRef:
     name: example-cluster
   databaseRef:

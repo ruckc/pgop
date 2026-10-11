@@ -4,9 +4,10 @@ A simple Kubernetes operator for managing PostgreSQL databases.
 
 ## Features
 
-- **Cluster Management** - Deploy PostgreSQL instances with automatic credential generation
-- **Role Management** - Provision database roles with configurable permissions (LOGIN, SUPERUSER, etc.)
-- **Database Management** - Create databases with extensions, schemas, and grants
+- **Cluster Management** - PostgreSQL 16-18 with generated credentials, read replicas, TLS and server parameters
+- **Role Management** - Login and group roles, memberships, passwords from your Secrets or rotated, per-role settings; privileged attributes only through the Cluster's role policy (no superusers)
+- **Database Management** - Databases with extensions, schemas, database/schema/object grants, default privileges and settings, tracked and revoked when removed
+- **Backups and Restores** - Logical (pg_dump) and physical (pgBackRest, point-in-time) backups to S3
 
 ## Quick Start
 
@@ -80,7 +81,9 @@ flowchart TB
 - [Installation](getting-started/installation.md) - How to install the operator
 - [Quick Start](getting-started/quickstart.md) - Create your first cluster
 - [User Guide](user-guide/clusters.md) - Detailed usage instructions
+- [Users and Access Patterns](user-guide/access-patterns.md) - Complete role and grant setups
 - [API Reference](reference/api.md) - CRD specifications
+- [Upgrade Notes](upgrading.md) - Breaking changes by release
 
 ## License
 

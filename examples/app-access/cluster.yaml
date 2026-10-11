@@ -1,0 +1,37 @@
+# A Cluster for one application ("shop"), with one read replica, TLS from a
+# self-managed CA and a role policy that allows exactly what the Roles and the
+# Database in this directory need. See docs/user-guide/access-patterns.md.
+apiVersion: pgop.ruck.io/v1alpha1
+kind: Cluster
+metadata:
+  name: shop-db
+spec:
+  image: postgres:18
+  # 1 primary (Service shop-db) + 1 streaming hot standby (Service shop-db-ro).
+  replicas: 2
+  storage:
+    size: 20Gi
+    retainPolicy: Retain
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1Gi
+    limits:
+      memory: 2Gi
+  # Self-managed CA: credentials Secrets switch to sslmode=verify-full and
+  # carry ca.crt once TLSReady is True.
+  tls: {}
+  parameters:
+    shared_preload_libraries: pg_stat_statements
+    max_connections: "200"
+    work_mem: 16MB
+  # Only a Cluster editor can widen this. Without it Roles get no privileged
+  # attributes or pg_* memberships and settings cannot use custom namespaces.
+  rolePolicy:
+    # shop-monitoring is a member of pg_monitor.
+    allowedPredefinedRoles: [pg_monitor]
+    # The Database sets shop.region (a custom placeholder parameter).
+    allowedSettingPrefixes: [shop]
+    # pg_stat_statements is not a trusted extension; the Database installs
+    # it (into an operator-owned schema) for the metrics exporter.
+    allowedExtensions: [pg_stat_statements]

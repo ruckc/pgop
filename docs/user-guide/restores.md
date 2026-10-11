@@ -22,6 +22,50 @@ it up. A physical restore also stops and restarts the Cluster (see below).
 A logical restore downloads the `pg_dump` artifact recorded on
 `BackupRun.status.location` and runs `pg_restore` into the target database.
 
+!!! danger "A logical restore runs the dump as a superuser"
+    `pg_restore` runs the dump's SQL as the target Cluster's operator
+    superuser (`pgop_operator`), and `status.location` may name any object
+    the Backup's S3 credentials can read. A crafted dump can contain any SQL.
+    So whoever can create `Restore`s and patch `backupruns/status` in the
+    namespace (or write to the backup bucket) can run SQL as a superuser:
+    that is superuser-equivalent. Only restore dumps you trust, grant
+    `create` on `restores.pgop.ruck.io` and `patch`/`update` on
+    `backupruns/status` only to Cluster administrators, and keep write
+    access to the bucket narrow.
+
+Logical backup Jobs do not record `BackupRun`s, so record the dump you want
+to restore first. Find it in the bucket (the backup Jobs, and with them the
+`s3-upload` container's `Uploaded to s3://...` log line, are deleted five
+minutes after they finish):
+
+```sh
+aws s3 ls s3://pgop-backups/myapp/data/
+```
+
+Create a `BackupRun` whose `backupRef` names the logical `Backup` (it
+provides the bucket, endpoint and credentials), then set its
+`status.location` to the dump:
+
+```sh
+kubectl apply -f - <<EOF
+apiVersion: pgop.ruck.io/v1alpha1
+kind: BackupRun
+metadata:
+  name: myapp-data-20260101
+spec:
+  backupRef:
+    name: myapp-backup
+  type: data
+EOF
+kubectl patch backuprun myapp-data-20260101 --subresource=status --type=merge \
+  -p '{"status":{"location":"s3://pgop-backups/myapp/data/20260101T020000.dump"}}'
+```
+
+Then, **only after the location is set**, create the Restore. A Restore whose
+BackupRun has no location yet fails immediately and is not retried (the
+Restore does not watch BackupRuns, and its spec is immutable): delete it and
+create it again.
+
 ```yaml
 apiVersion: pgop.ruck.io/v1alpha1
 kind: Restore
@@ -31,16 +75,45 @@ metadata:
 spec:
   type: logical
   backupRunRef:
-    name: myapp-backup-data-20260101T020000
+    name: myapp-data-20260101
   clusterRef:
     name: my-cluster        # target cluster (may differ from the source)
   databaseRef:
     name: myapp             # target database (required for logical)
 ```
 
-The restore runs `pg_restore --no-owner --clean --if-exists`, so it recreates
-objects into an existing database and tolerates a differing role set on the
-target cluster.
+The Job runs `pg_restore --no-owner --clean --if-exists` as `pgop_operator`.
+What that means:
+
+- **Schema dump**: `--clean` first **drops** the tables and other objects
+  the dump contains, **with their data**, then re-creates them empty. The
+  re-created objects are owned by `pgop_operator`, not by the database
+  owner. Hand them back to the
+  owner afterwards (`ALTER TABLE ... OWNER TO <owner>` and so on). Do not
+  `REASSIGN OWNED BY pgop_operator` blindly: the operator also owns
+  extension objects and schemas pgop created for extensions. Until then the
+  owner cannot alter the objects, and
+  [object grants](databases.md#which-objects-pgop-grants-on) apply the
+  stricter rules for operator-owned objects (no views, no `TRIGGER`).
+- **Data dump**: `--clean` does not remove rows; the dump's rows are
+  **appended** to the existing tables. Restore into empty tables (`TRUNCATE`
+  them first, or restore the schema dump first). Existing rows make primary
+  key and unique constraints fail, and foreign keys can fail on the order
+  the tables are loaded in. Objects keep their owners.
+- **Roles**: only ownership is skipped (`--no-owner`); the dump's `GRANT`s
+  are restored, and a `GRANT` to a role the target Cluster does not have
+  fails.
+- **Errors**: `pg_restore` continues past failing statements but exits with
+  an error, so the Job fails although most of the dump was restored. The Job
+  is retried (`backoffLimit: 2`; a retry of a data dump appends the rows
+  again) and the Restore ends `Failed`. Read
+  `kubectl logs job/<restore>-restore` to see which statements failed and
+  whether the result is usable.
+- pgop applies the grants the target Database declares again at its next
+  reconcile (annotate the Database to trigger one).
+
+Unlike a physical restore, a logical restore needs no confirmation on the
+Cluster.
 
 When the target Cluster has TLS enabled, `pg_restore` connects with the
 `sslmode` and `ca.crt` from the target Cluster's credentials Secret
@@ -250,3 +323,4 @@ Kubernetes cluster:
 - To re-run a restore, delete and recreate the `Restore` (or create a new one
   with a different name); a `Restore` is a one-shot record, not a controller
   loop.
+- Ready-to-edit manifests: `examples/restores/` in the repository.

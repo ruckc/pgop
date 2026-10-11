@@ -1,0 +1,88 @@
+# A NOLOGIN owner role and a migrator that switches to it with SET ROLE, so
+# every object the migrations create is owned by inventory_owner (not by a
+# login role whose password could leak or rotate). The application gets
+# privileges through defaultPrivileges on inventory_owner's future objects.
+# Membership options (inherit/set) need PostgreSQL 16 or later.
+# Uses the Cluster from examples/app-access/cluster.yaml.
+---
+apiVersion: pgop.ruck.io/v1alpha1
+kind: Role
+metadata:
+  name: inventory-owner
+spec:
+  clusterRef:
+    name: shop-db
+  roleName: inventory_owner
+  login: false               # nobody logs in as the owner
+---
+apiVersion: pgop.ruck.io/v1alpha1
+kind: Role
+metadata:
+  name: inventory-migrator
+spec:
+  clusterRef:
+    name: shop-db
+  roleName: inventory_migrator
+  login: true
+  connectionLimit: 2
+  memberships:
+    # The migration tool runs "SET ROLE inventory_owner" first. inherit:
+    # false keeps the owner's privileges out of the migrator's own sessions
+    # until it does.
+    - role: inventory_owner
+      inherit: false
+      set: true
+---
+apiVersion: pgop.ruck.io/v1alpha1
+kind: Role
+metadata:
+  name: inventory-app
+spec:
+  clusterRef:
+    name: shop-db
+  roleName: inventory_app
+  login: true
+  connectionLimit: 30
+---
+apiVersion: pgop.ruck.io/v1alpha1
+kind: Database
+metadata:
+  name: inventory
+spec:
+  clusterRef:
+    name: shop-db
+  # A NOLOGIN owner gets no connection Secret: the migrator and the app use
+  # their Role Secrets (shop-db-inventory-migrator-credentials,
+  # shop-db-inventory-app-credentials) with PGDATABASE=inventory.
+  owner: inventory-owner
+  publicPrivileges:
+    connect: false
+    temporary: false
+  grants:
+    - role: inventory_migrator
+      privileges: [CONNECT]
+    - role: inventory_app
+      privileges: [CONNECT]
+  schemas:
+    - name: app              # owned by inventory_owner (the database owner)
+      grants:
+        - role: inventory_app
+          privileges: [USAGE]
+      objectGrants:
+        - role: inventory_app
+          kind: table
+          objects: ["*"]
+          privileges: [SELECT, INSERT, UPDATE, DELETE]
+        - role: inventory_app
+          kind: sequence
+          objects: ["*"]
+          privileges: [USAGE, SELECT]
+      defaultPrivileges:
+        - forRole: inventory_owner
+          role: inventory_app
+          kind: table
+          privileges: [SELECT, INSERT, UPDATE, DELETE]
+        - forRole: inventory_owner
+          role: inventory_app
+          kind: sequence
+          privileges: [USAGE, SELECT]

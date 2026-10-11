@@ -1,0 +1,23 @@
+# Step 2 of a logical restore: apply only after the BackupRun from
+# logical-backuprun.yaml has status.location set.
+#
+# The Job runs pg_restore --no-owner --clean --if-exists as the operator's
+# superuser. A data dump appends rows: the target tables must be empty
+# (TRUNCATE them first). A schema dump drops and re-creates the objects it
+# contains, including their data. GRANTs to roles the target Cluster does not
+# have fail; pg_restore then exits non-zero and the Restore ends Failed even
+# though most objects were restored: check the Job log
+# (kubectl logs job/shop-restore-20261001-restore). See
+# docs/user-guide/restores.md.
+apiVersion: pgop.ruck.io/v1alpha1
+kind: Restore
+metadata:
+  name: shop-restore-20261001
+spec:
+  type: logical
+  backupRunRef:
+    name: shop-data-20261001
+  clusterRef:
+    name: shop-db              # may differ from the Cluster the dump came from
+  databaseRef:
+    name: shop

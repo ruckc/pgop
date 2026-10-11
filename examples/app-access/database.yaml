@@ -1,0 +1,81 @@
+# The "shop" database: owned by shop_owner (who runs the migrations), closed
+# to roles without a grant, with read/write and read-only access for the
+# group roles on the tables that exist now (objectGrants) and on the ones
+# migrations create later (defaultPrivileges).
+apiVersion: pgop.ruck.io/v1alpha1
+kind: Database
+metadata:
+  name: shop
+spec:
+  clusterRef:
+    name: shop-db
+  # A Role resource name. The database and its schemas are owned by its
+  # PostgreSQL role (shop_owner); the connection Secret
+  # shop-shop-owner-credentials holds its credentials and database: shop.
+  owner: shop-owner
+  # Revoke PostgreSQL's defaults: by default every role may CONNECT and
+  # create TEMPORARY tables. Roles that need the database get CONNECT below.
+  publicPrivileges:
+    connect: false
+    temporary: false
+  grants:
+    - role: shop_rw          # PostgreSQL role names, members inherit them
+      privileges: [CONNECT, TEMPORARY]
+    - role: shop_ro
+      privileges: [CONNECT]
+    # pg_monitor's per-database statistics (pg_stat_user_tables,
+    # pg_statio_*, pg_stat_statements) are only visible from inside the
+    # database, so the exporter needs CONNECT here too.
+    - role: shop_monitoring
+      privileges: [CONNECT]
+  settings:
+    # The YAML quotes are only quoting: the value is "$user", app
+    search_path: '"$user", app'
+    shop.region: eu-west-1   # custom placeholder: rolePolicy.allowedSettingPrefixes: [shop]
+  extensions:
+    - name: pg_trgm          # trusted: installed into public
+    - name: citext
+    # Untrusted (rolePolicy.allowedExtensions), so it needs a schema only
+    # superusers can write to: pgop creates "monitoring", owned by the
+    # operator. The library is preloaded by the Cluster's parameters.
+    - name: pg_stat_statements
+      schema: monitoring
+      grants:
+        - role: shop_monitoring
+          schema: [USAGE]      # the view itself is granted to PUBLIC by the extension
+  schemas:
+    - name: app
+      owner: shop_owner      # the default (the database owner), spelled out
+      grants:
+        - role: shop_rw
+          privileges: [USAGE]
+        - role: shop_ro
+          privileges: [USAGE]
+      # Objects that exist already ("*" is re-evaluated on every reconcile).
+      objectGrants:
+        - role: shop_rw
+          kind: table
+          objects: ["*"]
+          privileges: [SELECT, INSERT, UPDATE, DELETE]
+        - role: shop_rw
+          kind: sequence
+          objects: ["*"]
+          privileges: [USAGE, SELECT]
+        - role: shop_ro
+          kind: table
+          objects: ["*"]
+          privileges: [SELECT]
+      # Objects shop_owner creates in app from now on (the migrations).
+      defaultPrivileges:
+        - forRole: shop_owner
+          role: shop_rw
+          kind: table
+          privileges: [SELECT, INSERT, UPDATE, DELETE]
+        - forRole: shop_owner
+          role: shop_rw
+          kind: sequence
+          privileges: [USAGE, SELECT]
+        - forRole: shop_owner
+          role: shop_ro
+          kind: table
+          privileges: [SELECT]

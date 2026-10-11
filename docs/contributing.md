@@ -108,11 +108,37 @@ test: add cluster controller tests
 make test
 ```
 
-### E2E Tests (coming soon)
+### E2E Tests
 
 ```bash
 make test-e2e
 ```
+
+### Documentation and Examples
+
+Every manifest in `config/samples/`, `examples/` and every YAML snippet in
+the Markdown docs (`docs/`, `README.md`) is validated against the generated
+CRDs with a server-side dry-run on an envtest API server (schema, CEL rules
+and strict field validation):
+
+```bash
+make test-manifests   # also part of make test
+```
+
+A YAML block without `apiVersion` is a fragment of the page's kind (Role on
+`roles.md`, Database on `databases.md`, Cluster on `clusters.md` and
+`replication.md`, ...), wrapped into a full object. An HTML comment on the
+line before a fence changes that:
+
+```markdown
+<!-- pgop-validate: skip (why) -->      not a manifest: Secret data, schema notation, a container excerpt
+<!-- pgop-validate: kind=Cluster -->    a fragment of another kind
+<!-- pgop-validate: invalid -->         must be rejected by the API server
+```
+
+Heredocs (`kubectl apply -f - <<EOF`) in shell blocks are validated too.
+After changing API types, run `make manifests` and then
+`make test-manifests` to find documentation that no longer matches.
 
 ## Reporting Issues
 

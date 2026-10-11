@@ -1,6 +1,18 @@
 # API Reference
 
-Complete API specification for all pgop Custom Resource Definitions.
+Complete API specification for all pgop Custom Resource Definitions: `Cluster`,
+`Role`, `Database`, `Backup`, `BackupRun` and `Restore`, all in the group
+`pgop.ruck.io`, version `v1alpha1`, and all namespaced. Every reference
+(`clusterRef`, `owner`, `databaseRef`, `backupRef`, `backupRunRef`, Secret
+references) names an object in the **same namespace**.
+
+The YAML blocks below are schema notation: each value names the field's type,
+not a valid value. For manifests you can apply, see the
+[User Guide](../user-guide/access-patterns.md) and the `examples/` and
+`config/samples/` directories of the repository (all of them are validated
+against the CRDs by `make test-manifests`). `kubectl explain
+clusters.spec.rolePolicy` (and so on) prints the same descriptions from the
+installed CRDs.
 
 ## Cluster
 
@@ -8,10 +20,18 @@ Complete API specification for all pgop Custom Resource Definitions.
 
 ### ClusterSpec
 
+<!-- pgop-validate: skip (schema notation, not a manifest) -->
 ```yaml
 spec:
-  # PostgreSQL container image (default: postgres:18)
+  # PostgreSQL container image (default: postgres:18). PostgreSQL 16, 17 and
+  # 18 are tested; see User Guide -> Clusters -> Supported Images.
   image: string
+
+  # PostgreSQL major version of the image (>= 1). Auto-detected from the tag
+  # (postgres:18, postgis/postgis:16-3.4); set it when the tag has no
+  # parseable major version (latest, a digest, a mirror), otherwise the
+  # reconcile fails rather than guess the data-directory layout.
+  postgresMajorVersion: integer
 
   # Number of PostgreSQL instances (default: 1, max: 10): pod <cluster>-0 is
   # the primary, the others are asynchronous streaming hot standbys. No
@@ -106,6 +126,7 @@ See [Clusters → TLS](../user-guide/clusters.md#tls),
 
 ### ClusterStatus
 
+<!-- pgop-validate: skip (schema notation, not a manifest) -->
 ```yaml
 status:
   ready: boolean           # Cluster is accepting connections
@@ -117,6 +138,16 @@ status:
   tlsSecretHash: string    # Hash of the certificate the server was last confirmed to present
   parametersHash: string   # Hash of the generated config file last reloaded (spec.parameters only)
   pendingRestart: [string] # Parameters waiting for a restart (pg_settings.pending_restart)
+  lastRestore:             # Last physical Restore that finished on this Cluster
+    name: string
+    uid: string
+    fingerprint: string    # Hash of the Restore spec
+    result: string         # Succeeded, Failed or Interrupted
+    completionTime: string
+  lastWALDrop:             # Last WAL segment pgBackRest dropped (archive queue full)
+    time: string
+    segment: string        # WAL file name
+    closedBy: string       # First successful BackupRun started after the drop (empty: gap open)
   conditions:
     - type: string
       status: string       # True/False/Unknown
@@ -129,10 +160,13 @@ Condition types:
 
 | Type | Meaning |
 |------|---------|
-| `Available` | `True` (reason `ClusterReady`) while the primary pod is ready. Standbys never affect it (nor `status.ready`, `TLSReady`, the `sslmode` published to clients, or Role/Database reconciles); their health is reported by `status.readyInstances` and `ReplicationHealthy`. |
+| `Available` | `True` (reason `ClusterReady`) while the primary pod is ready; `False` with `ClusterNotReady`, `PausedForRestore` (a physical Restore stopped it) or `RestoreInterrupted`. Standbys never affect it (nor `status.ready`, `TLSReady`, the `sslmode` published to clients, or Role/Database reconciles); their health is reported by `status.readyInstances` and `ReplicationHealthy`. |
 | `ReplicationHealthy` | Only present while `spec.replicas` is greater than 1. `True` (reason `Streaming`) when every standby streams from the primary. `False` with reason `StandbyNotStreaming` (a standby is still being cloned, catching up, or disconnected; the message names it), `WaitingForPrimary` (the primary pod is not ready) or `ReplicationError` (the operator could not set up the replication role or slots on the primary). When a standby's replication slot was invalidated, the message says which standby to re-clone and a `ReplicationSlotInvalidated` Warning event is recorded. Never affects `Available`. |
 | `ExistingVolume` | Set once when the StatefulSet is created. `True` (reason `PreExistingPVC`) if the data PVC already existed, so PostgreSQL started on retained data; `False` (reason `NewVolume`) otherwise. Never recomputed afterwards. |
 | `TLSReady` | Only present while `spec.tls` is set. `True` (reason `TLSActive`) once the primary presents the certificate from its TLS Secret (`spec.tls.secretName`, `<cluster>-server-tls` for `issuerRef`, `<cluster>-server-cert` for the self-managed CA). `False` with reason `InvalidTLSSecret` (Secret missing/incomplete/unusable, or a Secret the operator would manage exists and is not owned by the Cluster; the StatefulSet is left unchanged), `CertManagerUnavailable` (`issuerRef` set but cert-manager is not installed), `CertificatePending` (cert-manager has not issued the certificate yet), `WaitingForServer` (pod not ready or not serving TLS yet) or `CertificateReloading` (a rotated certificate is not loaded yet; the operator ran `pg_reload_conf()`, or restarted the pod because the new CA cannot verify the old certificate). |
+| `PhysicalBackup` | Only present once a physical `Backup` named the Cluster. `True` (`Enabled`) while WAL is archived for it; `False` with `Invalid` (a physical Backup names the Cluster but cannot be used; nothing is archived) or `Disabled` (no physical Backup any more; pgop's Postgres+pgBackRest image is kept). See [Backups](../user-guide/backups.md#what-the-operator-sets-up). |
+| `WALArchiving` | Only with a physical Backup. `True` (`Archiving`), `False` with `ArchiveFailing` or `WALDropped` (latched until a backup started after the drop succeeds), `Unknown` (`NoWALArchivedYet`, `Unknown`). Mirrored on the Backup. See [Backups: Dropped WAL](../user-guide/backups.md#dropped-wal). |
+| `RestoreInterrupted` | `True` while a physical restore failed or was interrupted after its Job started: the Cluster stays stopped (annotation `pgop.ruck.io/restore-interrupted`) until a new Restore succeeds. See [Restores](../user-guide/restores.md#failed-or-interrupted-restores). |
 | `ParametersApplied` | Only present while `spec.parameters` is set. `True` (reason `Applied`) once every parameter is in effect. `False` with reason `WaitingForServer` (pod not ready, rollout in progress, or no connection), `WaitingForSync` (the server does not see the current configuration file yet), `Reloading` (`pg_reload_conf()` ran; checking the result), `PendingRestart` (a parameter needs a restart; the operator restarts the pod once), `InvalidParameter` (the server rejects a name or value; nothing is reloaded or restarted) or `OverriddenByAlterSystem` (`ALTER SYSTEM` overrides a parameter). Never affects `Available`. |
 
 ---
@@ -143,6 +177,7 @@ Condition types:
 
 ### RoleSpec
 
+<!-- pgop-validate: skip (schema notation, not a manifest) -->
 ```yaml
 spec:
   # Reference to the cluster (required, same namespace, immutable)
@@ -155,7 +190,8 @@ spec:
   roleName: string
 
   # PostgreSQL role options
-  login: boolean           # LOGIN/NOLOGIN (default: true)
+  login: boolean           # LOGIN/NOLOGIN (default: true). A NOLOGIN (group) role
+                           # gets no password and no credentials Secret.
   createDB: boolean        # CREATEDB/NOCREATEDB (default: false)
   createRole: boolean      # CREATEROLE/NOCREATEROLE (default: false); needs the Cluster's rolePolicy
   inherit: boolean         # INHERIT/NOINHERIT (default: true)
@@ -237,18 +273,20 @@ password). Each value is acted on once.
 
 ### RoleStatus
 
+<!-- pgop-validate: skip (schema notation, not a manifest) -->
 ```yaml
 status:
   ready: boolean           # Role exists in PostgreSQL
   roleName: string         # Effective PostgreSQL role name
   clusterUID: string       # UID of the Cluster roleName was created/adopted on
-  secretName: string       # Auto-generated credentials secret
+  secretName: string       # Credentials Secret <cluster>-<role>-credentials (LOGIN roles only)
   managedMemberships:      # Roles whose membership pgop granted (revoked when removed)
     - string
   managedParameterGrants:  # Parameter privileges pgop granted (revoked when removed)
     - parameter: string    # Lowercased parameter name
-      privileges: [string]
-      withGrantOption: boolean
+      privileges: [string] # Privileges pgop added (only these are revoked)
+      grantOptions: [string]   # Privileges whose grant option pgop added
+      withGrantOption: boolean # Deprecated (ledgers written before v0.17), read as grantOptions = privileges
   managedSettings:         # Lowercased parameter names pgop set (reset when removed)
     - string
   managedDatabaseSettings: # Per database, the names pgop set (reset when removed)
@@ -317,6 +355,7 @@ to subjects that may already read the namespace's other Secrets. See
 
 ### DatabaseSpec
 
+<!-- pgop-validate: skip (schema notation, not a manifest) -->
 ```yaml
 spec:
   # Reference to the cluster (required, same namespace, immutable)
@@ -491,6 +530,7 @@ not make the Database unavailable.
 
 ### DatabaseStatus
 
+<!-- pgop-validate: skip (schema notation, not a manifest) -->
 ```yaml
 status:
   ready: boolean
@@ -517,7 +557,7 @@ status:
     - role: string         # Role name or PUBLIC
       privileges: [string] # Normalized: CONNECT, CREATE, TEMPORARY
       grantOptions: [string]   # Privileges whose grant option pgop added
-      withGrantOption: boolean # Deprecated (v0.15 ledgers), read as grantOptions = privileges; no longer written
+      withGrantOption: boolean # Deprecated (ledgers written before v0.17), read as grantOptions = privileges; no longer written
   managedSchemaGrants:     # max 2048
     - schema: string
       role: string         # Role name or PUBLIC
@@ -564,12 +604,260 @@ status:
 
 ---
 
+## Backup
+
+**Group/Version:** `pgop.ruck.io/v1alpha1`
+
+A `Backup` is a backup **policy**: the operator turns it into CronJobs. See
+[Backups](../user-guide/backups.md).
+
+### BackupSpec
+
+<!-- pgop-validate: skip (schema notation, not a manifest) -->
+```yaml
+spec:
+  # Required: physical (pgBackRest, a whole Cluster) or logical (pg_dump, one Database)
+  type: string
+
+  # physical: the Cluster to back up (required for physical). One physical
+  # Backup per Cluster; a second one is Invalid.
+  clusterRef:
+    name: string
+
+  # logical: the Database resource to back up (required for logical)
+  databaseRef:
+    name: string
+
+  # logical: cron schedule of the CronJobs <backup>-schema and <backup>-data
+  # (one schedule for both; default "0 2 * * *")
+  schedule: string
+
+  # physical: schedules and images
+  physical:
+    fullSchedule: string         # CronJob <backup>-full (default "0 2 * * 0")
+    incrementalSchedule: string  # CronJob <backup>-incremental (default "0 2 * * 1-6")
+    image: string                # pgBackRest Job image (default ghcr.io/ruckc/pgop-pgbackrest:<version>);
+                                 # must run the same pgBackRest version as the Cluster's image
+    postgresImageIncludesPgbackrest: boolean  # the Cluster's spec.image already has pgBackRest
+                                 # (same version, /usr/bin/pgbackrest, uid 999): no image swap
+    acceptImageSwap: boolean     # allow replacing a bare postgres:16 / :17 tag by pgop's
+                                 # trixie image (check collations first)
+    archivePushQueueMax: quantity    # WAL allowed to queue in pg_wal while archiving fails
+                                 # (default: a quarter of the Cluster's storage size, min 64Mi);
+                                 # beyond it WAL is dropped (WALArchiving=False/WALDropped)
+
+  # physical: pgBackRest retention (logical dumps are never expired by pgop)
+  retention:
+    disabled: boolean            # default true: nothing is expired (use with write-only credentials)
+    keepLast: integer            # keep N full backups (repo1-retention-full=N); needs disabled: false
+    keepDays: integer            # keep full backups newer than N days; needs disabled: false
+
+  # physical: how long a completed BackupRun record is kept (Go duration,
+  # default "168h"); copied into spec.ttl of the BackupRuns pgop creates, so
+  # a change only affects later runs. No effect on logical backups (they
+  # create no BackupRuns).
+  backupRunTTL: string
+
+  # Required: where backups are stored
+  destination:
+    type: string                 # s3 (azure and gcs are accepted by the schema but not implemented)
+    s3:
+      bucket: string             # Required
+      region: string             # Required
+      prefix: string             # physical: the repository path (default
+                                 # /<namespace>/<cluster>/<backup>); logical: dumps go to
+                                 # <prefix>/schema/ and <prefix>/data/
+      endpoint: string           # S3-compatible endpoint. physical: must be https://
+      credentialsSecretRef:      # Secret with AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY;
+        name: string             # omitted: ambient credentials (IRSA, instance profile)
+      caSecretRef:               # physical: PEM CA bundle for a private endpoint
+        name: string
+        key: string
+    azure:                       # not implemented yet
+      container: string
+      storageAccount: string
+      credentialsSecretRef:
+        name: string
+    gcs:                         # not implemented yet
+      bucket: string
+      prefix: string
+      credentialsSecretRef:
+        name: string
+
+  # physical: pgBackRest repository encryption
+  encryption:
+    enabled: boolean             # Required in the block
+    keySecretRef:                # Secret key holding the passphrase (required when enabled)
+      name: string
+      key: string
+```
+
+### BackupStatus
+
+<!-- pgop-validate: skip (schema notation, not a manifest) -->
+```yaml
+status:
+  lastFullBackupTime: string         # physical: completion of the last full backup Job
+  lastIncrementalBackupTime: string  # physical: completion of the last incremental backup Job
+  conditions:
+    - type: string
+      status: string
+      reason: string
+      message: string
+      lastTransitionTime: string
+```
+
+| Condition | Meaning |
+|-----------|---------|
+| `Available` | `True` (reason `Scheduled`) when the CronJobs are in place. `False` with `Invalid` when the spec cannot be used (an `http://` endpoint for a physical backup, an unsupported Cluster image, a second physical Backup of the Cluster; nothing is scheduled and the Cluster is not changed) or `ReconcileError` (for example a missing Database or Cluster). |
+| `WALArchiving` | Physical only: mirrored from the Cluster (see above). |
+
+---
+
+## BackupRun
+
+**Group/Version:** `pgop.ruck.io/v1alpha1`
+
+A `BackupRun` records one execution of a Backup and is what a `Restore`
+restores from. pgop creates one, named after the Job and owned by the Backup,
+for every Job of a physical Backup's CronJobs (also Jobs created by hand with
+`kubectl create job --from=cronjob/...`). **Logical backup Jobs do not record
+BackupRuns**: create one by hand to restore a dump (see
+[Restores](../user-guide/restores.md#logical-restore-pg_restore)).
+
+### BackupRunSpec
+
+<!-- pgop-validate: skip (schema notation, not a manifest) -->
+```yaml
+spec:
+  backupRef:                 # Required: the Backup (destination and credentials)
+    name: string
+  type: string               # Required: full, incremental (physical) or schema, data (logical)
+  ttl: string                # Go duration (default 168h). pgop sets it from the Backup's
+                             # backupRunTTL when it creates a physical run
+```
+
+### BackupRunStatus
+
+<!-- pgop-validate: skip (schema notation, not a manifest) -->
+```yaml
+status:
+  phase: string              # Pending, Running, Succeeded or Failed (from the Job)
+  startTime: string
+  completionTime: string
+  location: string           # physical: s3://<bucket>/<repository path>/backup/main/<label>;
+                             # logical: the dump, s3://<bucket>/<prefix>/<schema|data>/<time>.dump
+  sizeBytes: integer         # Reserved: not filled in yet
+  jobName: string            # The Job executing the backup
+  conditions:
+    - type: string           # Available: Pending, Succeeded or Failed
+      status: string
+      reason: string
+      message: string
+      lastTransitionTime: string
+```
+
+A BackupRun is deleted `spec.ttl` (default 7 days) after
+`status.completionTime`; the backup itself stays in the repository until
+pgBackRest expires it. Only `spec.ttl` counts: pgop copies the Backup's
+`backupRunTTL` into it when it creates a physical run, so changing
+`backupRunTTL` later does not affect existing runs. A BackupRun created by
+hand (for a logical restore) has no Job, never gets a `completionTime`, stays
+`Pending` and is never deleted by pgop; delete it yourself after the restore.
+
+**Security:** `status.location` decides what a Restore downloads, and a
+logical restore runs the dump's SQL as the operator's superuser. Permission
+to `patch`/`update` `backupruns/status` (together with creating Restores),
+or write access to the backup bucket, is superuser-equivalent. See
+[Restores](../user-guide/restores.md#logical-restore-pg_restore).
+
+---
+
+## Restore
+
+**Group/Version:** `pgop.ruck.io/v1alpha1`
+
+A `Restore` is a **one-shot** restore of a BackupRun. Its `spec` is immutable
+(the API server rejects changes): create a new Restore to restore again. See
+[Restores](../user-guide/restores.md).
+
+A **logical** Restore runs `pg_restore --no-owner --clean --if-exists` as the
+operator's superuser: the dump's SQL runs as a superuser (creating Restores
+for dumps you do not trust is superuser-equivalent), a schema dump drops and
+re-creates its tables (data included), a data dump appends rows, and `GRANT`s
+to roles the target Cluster lacks fail, which makes the Job, and the Restore,
+end `Failed` although most of the dump was restored: check the Job log. A
+logical Restore created before its BackupRun has `status.location` fails at
+once and must be re-created.
+
+### RestoreSpec
+
+<!-- pgop-validate: skip (schema notation, not a manifest) -->
+```yaml
+spec:
+  type: string               # Required: logical (pg_restore) or physical (pgBackRest)
+  backupRunRef:              # Required: the BackupRun to restore; its Backup provides
+    name: string             # the destination and credentials
+  clusterRef:                # Required: the target Cluster. physical: must be the
+    name: string             # Backup's clusterRef; logical: may be another Cluster
+  databaseRef:               # logical: the target Database resource (required)
+    name: string
+  targetTime: string         # physical: RFC 3339 point-in-time target (second precision);
+                             # unset restores the BackupRun's backup to consistency
+```
+
+A physical Restore does nothing until the Cluster confirms it with the
+annotation `pgop.ruck.io/allow-restore: <restore name>` (or `<name>/<uid>`,
+required once the Cluster had a physical restore); see
+[Annotations](#annotations).
+
+### RestoreStatus
+
+<!-- pgop-validate: skip (schema notation, not a manifest) -->
+```yaml
+status:
+  phase: string              # Pending, Running, Succeeded or Failed
+  startTime: string
+  completionTime: string
+  jobName: string            # <restore>-restore
+  conditions:
+    - type: string           # Available
+      status: string
+      reason: string
+      message: string
+      lastTransitionTime: string
+```
+
+`Available` reasons: `Running`, `Succeeded`, `Failed`, `ReconcileError`, and,
+for physical restores, the steps `AwaitingConfirmation` (the Cluster has not
+confirmed the Restore), `WaitingForRestore` (another Restore holds the
+Cluster), `WaitingForOldJob`, `StoppingCluster`, `CreatingJob` and
+`Restoring`.
+
+---
+
+## Annotations
+
+Annotations users set (the other `pgop.ruck.io/*` annotations are written by
+the operator and should not be edited):
+
+| Annotation | On | Effect |
+|------------|----|--------|
+| `pgop.ruck.io/rotate-password: <any new value>` | Role | Rotate the generated password now (with `passwordSecretRef`: set the referenced password in PostgreSQL again). Each value is acted on once. See [Roles: rotating on demand](../user-guide/roles.md#rotating-on-demand). |
+| `pgop.ruck.io/allow-restore: <restore>` or `<restore>/<uid>` | Cluster | Confirms a physical Restore of this Cluster; removed by the operator when the Restore finishes. Apply it with `kubectl annotate`, **never commit it to Git**. See [Restores: confirmation](../user-guide/restores.md#confirmation). |
+| `pgop.ruck.io/restore-interrupted` | Cluster | Set by the operator after a failed or interrupted physical restore. Removing it by hand starts PostgreSQL on the data directory as it is (only when you know the restore did not change it). |
+| `pgop.ruck.io/allow-primary-init: "true"` | Cluster | Lets the primary run `initdb` on an empty volume although the Cluster had data before (start over with an empty database). Remove it again afterwards. See [Replication](../user-guide/replication.md#primary-volume-lost). |
+| any change, e.g. `pgop.ruck.io/reconcile: <timestamp>` | Database | Triggers a reconcile, for example to apply `objectGrants` with `"*"` to tables a migration just created. |
+
+---
+
 ## Common Types
 
 ### ClusterReference
 
 Used in Role and Database specs to reference a Cluster in the same namespace:
 
+<!-- pgop-validate: skip (schema notation, not a manifest) -->
 ```yaml
 clusterRef:
   name: string             # Required: Cluster name (same namespace)
@@ -579,6 +867,7 @@ clusterRef:
 
 Used to reference a key within a Secret:
 
+<!-- pgop-validate: skip (schema notation, not a manifest) -->
 ```yaml
 passwordSecretRef:
   name: string             # Secret name
@@ -589,6 +878,7 @@ passwordSecretRef:
 
 Storage configuration for Clusters:
 
+<!-- pgop-validate: skip (schema notation, not a manifest) -->
 ```yaml
 storage:
   size: string             # Optional: PVC size (e.g., "10Gi"), default "1Gi"

@@ -20,7 +20,6 @@ spec:
   databaseRef:
     name: myapp
   schedule: "0 2 * * *"        # schema and data dumps share one schedule
-  backupRunTTL: "168h"
   destination:
     type: s3
     s3:
@@ -33,9 +32,30 @@ spec:
 ```
 
 The operator creates the CronJobs `<backup>-schema` and `<backup>-data`. Each
-Job runs `pg_dump -Fc` against the primary and uploads the dump with the AWS
-CLI. See [Clusters → Backups and restores](clusters.md#backups-and-restores)
-for how the Jobs connect over TLS.
+Job runs `pg_dump -Fc` (`--schema-only` or `--data-only`) against the primary
+as the operator's superuser and uploads the dump with the AWS CLI to
+`s3://<bucket>/<prefix>/schema/<time>.dump` and
+`s3://<bucket>/<prefix>/data/<time>.dump` (`<time>` is `YYYYMMDDTHHMMSS`, UTC
+in the Job's container). List them with
+`aws s3 ls s3://<bucket>/<prefix>/data/` (and `.../schema/`). The finished
+Jobs are deleted after five minutes (`ttlSecondsAfterFinished: 300`), so the
+`s3-upload` container's `Uploaded to s3://...` log line is only briefly
+available; the bucket listing is the reliable record. See
+[Clusters → Backups and restores](clusters.md#backups-and-restores) for how
+the Jobs connect over TLS.
+
+Things to know about logical backups:
+
+- Only `s3` destinations are implemented; `endpoint` may be `http://` (for
+  example an in-cluster MinIO or RustFS).
+- `retention`, `encryption` and `backupRunTTL` are not applied: dumps are
+  never expired or encrypted by pgop, and no BackupRuns are recorded. Use
+  bucket lifecycle rules and server-side encryption.
+- The Jobs do **not** record `BackupRun`s. To restore a dump, create a
+  `BackupRun` for it by hand (see
+  [Restores: logical](restores.md#logical-restore-pg_restore)).
+- Take a dump now with
+  `kubectl create job myapp-data-now --from=cronjob/myapp-backup-data`.
 
 ## Physical backups (pgBackRest)
 
@@ -154,7 +174,9 @@ my-cluster-backup-full-29342160  full          Succeeded   10m       9m
 `s3://<bucket>/<repository path>/backup/main/<pgBackRest label>`, for example
 `s3://pgop-backups/my-cluster/backup/main/20260101-020000F`. A `BackupRun` is
 deleted `backupRunTTL` after it completed (the backup itself stays in the
-repository until pgBackRest expires it).
+repository until pgBackRest expires it). The TTL is copied into the run's
+`spec.ttl` when pgop creates it, so changing `backupRunTTL` only affects
+later runs.
 
 The `Backup` reports `status.lastFullBackupTime`,
 `status.lastIncrementalBackupTime`, an `Available` condition (`False`,
