@@ -503,9 +503,8 @@ done
 // applyPgbackrestTemplate adds physical backups to the pod template of a
 // Cluster with a (validated) physical Backup: the Postgres+pgBackRest image,
 // the repository settings, WAL archiving, the Unix socket shared with the
-// pgbackrest sidecar (the pgBackRest TLS server), and the recovery-aware
-// password-sync hook (a restored instance starts in recovery). Returns the
-// sidecar and the pod volumes.
+// pgbackrest sidecar (the pgBackRest TLS server). Returns the sidecar and the
+// pod volumes.
 func applyPgbackrestTemplate(cluster *postgresv1alpha1.Cluster, backup *postgresv1alpha1.Backup, layout postgresLayout,
 	container *corev1.Container, volumes []corev1.Volume) (corev1.Container, []corev1.Volume, error) {
 	image, err := postgresImageForBackups(cluster, backup)
@@ -522,7 +521,6 @@ func applyPgbackrestTemplate(cluster *postgresv1alpha1.Cluster, backup *postgres
 	socketMount := corev1.VolumeMount{Name: postgresSocketVolume, MountPath: postgresSocketDir}
 	container.VolumeMounts = append(container.VolumeMounts, socketMount)
 	container.VolumeMounts = append(container.VolumeMounts, caMounts...)
-	container.Lifecycle = replicationPasswordSyncLifecycle()
 	args := container.Args
 	if len(args) == 0 {
 		args = []string{postgresBinary}

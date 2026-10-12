@@ -299,27 +299,25 @@ The operator owns `spec.replicas` of the StatefulSet: a manual
 ### Restores and the password-sync hook
 
 Every pod runs a postStart hook that sets the operator's password in the
-database to the one in `<cluster>-credentials`. On Clusters with standbys the
-hook skips instances in recovery (standbys, and a server recovering a
-physical backup), where `ALTER ROLE` would fail. Known limitations:
+database to the one in `<cluster>-credentials`. The hook skips an instance in
+recovery (a standby, or a server recovering a backup, for example a
+point-in-time restore), where `ALTER ROLE` would fail on the read-only server
+and the failed hook would make the kubelet restart the container, and with
+it the recovery, in a loop. A standby gets the password from the primary
+through replication.
 
-- **Single-instance Clusters** (that never had standbys) keep the original
-  hook, which does not skip recovery, so their pod template stays unchanged
-  on operator upgrade. Clusters with a
-  [physical Backup](backups.md#physical-backups-pgbackrest) (the only ones a
-  physical restore applies to) use the recovery-aware hook as well, and pgop's
-  restores promote the server once the target is reached
-  (`--target-action=promote`).
-- **Clusters with standbys:** after a restore, the hook skipped the password
-  sync while the server was recovering, so the primary may reject the
-  operator password (`28P01`) once recovery ends. The operator cannot tell
-  from a failed login whether the server is still recovering, so it restarts
-  the primary pod and retries with a growing delay (after 5, 10, 20 and 40
-  minutes; at most 5 restarts per password value, recorded in the
-  `pgop.ruck.io/password-sync-restart` annotation of the credentials Secret,
-  which is cleared once the login works). A restart while the server is still
-  paused in recovery does not sync the password; resume or promote it, and a
-  later attempt (or deleting the primary pod by hand) completes the sync.
+After a restore, the hook skipped the password sync while the server was
+recovering, so the primary may reject the operator password (`28P01`) once
+recovery ends (pgop's restores promote the server once the target is
+reached, `--target-action=promote`). The operator then restarts the primary
+pod so the hook runs again, on Clusters with and without standbys. It cannot
+tell from a failed login whether the server is still recovering, so it
+retries with a growing delay (after 5, 10, 20 and 40 minutes; at most 5
+restarts per password value, recorded in the
+`pgop.ruck.io/password-sync-restart` annotation of the credentials Secret,
+which is cleared once the login works). A restart while the server is still
+paused in recovery does not sync the password; resume or promote it, and a
+later attempt (or deleting the primary pod by hand) completes the sync.
 
 ## Backups and restores
 

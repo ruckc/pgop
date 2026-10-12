@@ -27,6 +27,20 @@ or together with the operator image, so the API server knows the new fields.
   (membership `inherit`/`set` options: 16+; `parameterGrants`: 15+;
   `MAINTAIN`: 17+), and they are not covered by the test suite.
 
+## v0.19.2: recovery-aware password-sync hook
+
+- **Single-instance Clusters restart once.** Every Cluster now uses the
+  recovery-aware password-sync postStart hook (it skips an instance in
+  recovery instead of failing, which crash-looped a point-in-time restore;
+  [#45](https://github.com/ruckc/pgop/issues/45)). Clusters that never had
+  standbys or a physical Backup used the old hook, so their pod template
+  changes and the pod restarts once after the operator upgrade. Plan the
+  upgrade for a maintenance window if that brief outage matters.
+- A Cluster whose primary rejects the operator password (`28P01`) now has
+  its primary pod restarted so the hook syncs the password, also without
+  standbys (see
+  [Restores and the password-sync hook](user-guide/replication.md#restores-and-the-password-sync-hook)).
+
 ## v0.19.0: object grants and default privileges
 
 New, opt-in: `Database.spec.schemas[].objectGrants` and

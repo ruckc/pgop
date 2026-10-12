@@ -955,8 +955,8 @@ func (r *ClusterReconciler) reconcileStatefulSet(ctx context.Context, cluster *p
 		sidecars = append(sidecars, sidecar)
 	}
 
-	// Streaming replication: bootstrap init container, recovery-aware
-	// postStart hook, primary_conninfo and the managed pg_hba. Not added to
+	// Streaming replication: bootstrap init container, primary_conninfo
+	// and the managed pg_hba. Not added to
 	// Clusters that never had more than one instance.
 	var initContainers []corev1.Container
 	if replication {
@@ -1381,15 +1381,25 @@ func convergeContainer(existing *corev1.Container, desired corev1.Container) boo
 // every Role/Database reconcile with 28P01. Local socket connections use trust
 // auth, so this ALTER ROLE needs no password itself.
 // See https://github.com/ruckc/pgop/issues/7.
+//
+// The hook does nothing on an instance in recovery (a standby, or a server
+// recovering a backup, e.g. a point-in-time restore): pg_isready succeeds as
+// soon as such a server accepts hot-standby connections, the ALTER ROLE
+// would fail on the read-only server, and a failed postStart hook makes the
+// kubelet kill the container, restarting recovery from scratch in a loop
+// (https://github.com/ruckc/pgop/issues/45). A standby gets the password from
+// the primary through replication; a restored primary that rejects the
+// operator password once recovery ended is restarted by the operator so the
+// hook runs again (see restartPrimaryForPasswordSync).
 func operatorPasswordSyncLifecycle() *corev1.Lifecycle {
-	script := `until pg_isready -q -U "$POSTGRES_USER" -d postgres 2>/dev/null; do sleep 1; done; ` +
+	script := `if [ -e "$PGDATA/standby.signal" ] || [ -e "$PGDATA/recovery.signal" ]; then exit 0; fi; ` +
+		`until pg_isready -q -U "$POSTGRES_USER" -d postgres 2>/dev/null; do sleep 1; done; ` +
+		`if [ "$(psql -U "$POSTGRES_USER" -d postgres -tAc 'SELECT pg_is_in_recovery()')" = t ]; then exit 0; fi; ` +
 		`psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d postgres ` +
 		`-c "ALTER ROLE \"$POSTGRES_USER\" WITH PASSWORD '$POSTGRES_PASSWORD'"`
 	return &corev1.Lifecycle{
 		PostStart: &corev1.LifecycleHandler{
-			Exec: &corev1.ExecAction{
-				Command: []string{"sh", "-c", script},
-			},
+			Exec: &corev1.ExecAction{Command: []string{"sh", "-c", script}},
 		},
 	}
 }

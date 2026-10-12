@@ -241,6 +241,10 @@ var _ = Describe("Cluster Controller", func() {
 			// pg_isready must pass -U so it works on images whose runtime UID
 			// has no /etc/passwd entry (e.g. postgis:18-alpine). See issue #8.
 			Expect(lifecycle.PostStart.Exec.Command).To(ContainElement(ContainSubstring("pg_isready -q -U")))
+			// Single-instance Clusters skip the sync in recovery too, so a
+			// point-in-time restore does not crash-loop. See issue #45.
+			Expect(lifecycle).To(Equal(operatorPasswordSyncLifecycle()))
+			Expect(lifecycle.PostStart.Exec.Command).To(ContainElement(ContainSubstring("pg_is_in_recovery()")))
 		})
 
 		It("should backfill the lifecycle hook on a StatefulSet that lacks it", func() {

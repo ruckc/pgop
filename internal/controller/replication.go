@@ -455,32 +455,13 @@ func bootstrapInitContainer(cluster *postgresv1alpha1.Cluster, secretName string
 	}
 }
 
-// replicationPasswordSyncLifecycle is operatorPasswordSyncLifecycle for
-// replication-enabled pods: it does nothing on an instance in recovery (a
-// standby, or a server recovering a backup), where ALTER ROLE would fail and
-// make the kubelet kill the container. A standby gets the password from the
-// primary through replication.
-func replicationPasswordSyncLifecycle() *corev1.Lifecycle {
-	script := `if [ -e "$PGDATA/standby.signal" ] || [ -e "$PGDATA/recovery.signal" ]; then exit 0; fi; ` +
-		`until pg_isready -q -U "$POSTGRES_USER" -d postgres 2>/dev/null; do sleep 1; done; ` +
-		`if [ "$(psql -U "$POSTGRES_USER" -d postgres -tAc 'SELECT pg_is_in_recovery()')" = t ]; then exit 0; fi; ` +
-		`psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d postgres ` +
-		`-c "ALTER ROLE \"$POSTGRES_USER\" WITH PASSWORD '$POSTGRES_PASSWORD'"`
-	return &corev1.Lifecycle{
-		PostStart: &corev1.LifecycleHandler{
-			Exec: &corev1.ExecAction{Command: []string{"sh", "-c", script}},
-		},
-	}
-}
-
 // applyReplicationTemplate adds the replication settings to the postgresql
-// container and the pod: the bootstrap init container, the recovery-aware
-// postStart hook, $(POD_NAME), the server options and the volumes.
+// container and the pod: the bootstrap init container, $(POD_NAME), the
+// server options and the volumes.
 func applyReplicationTemplate(cluster *postgresv1alpha1.Cluster, secretName string, layout postgresLayout,
 	container *corev1.Container, volumes []corev1.Volume) ([]corev1.Container, []corev1.Volume) {
 	replVolumes, replMounts := replicationVolumes(cluster)
 	container.Env = append(container.Env, podNameEnv())
-	container.Lifecycle = replicationPasswordSyncLifecycle()
 	container.VolumeMounts = append(container.VolumeMounts, replMounts...)
 	args := container.Args
 	if len(args) == 0 {
@@ -724,8 +705,9 @@ func setReplicationCondition(cluster *postgresv1alpha1.Cluster, status metav1.Co
 // scaled-away standbys, labels the standbys by whether they stream (only
 // streaming standbys are in the read-only Service), and reports whether every
 // standby streams (ReplicationHealthy). Problems are reported in the
-// condition and never fail the reconcile. Returns when to check again (0: no
-// need).
+// condition and never fail the reconcile. A Cluster without the replication
+// settings only gets the operator-password check (checkOperatorLogin).
+// Returns when to check again (0: no need).
 func (r *ClusterReconciler) reconcileReplication(ctx context.Context, cluster *postgresv1alpha1.Cluster,
 	secret *corev1.Secret, sts *appsv1.StatefulSet, pods []corev1.Pod) time.Duration {
 	want := desiredReplicas(cluster)
@@ -733,7 +715,7 @@ func (r *ClusterReconciler) reconcileReplication(ctx context.Context, cluster *p
 		meta.RemoveStatusCondition(&cluster.Status.Conditions, ConditionTypeReplicationHealthy)
 	}
 	if !replicationEnabled(cluster, sts) {
-		return 0
+		return r.checkOperatorLogin(ctx, cluster, secret, pods)
 	}
 	log := logf.FromContext(ctx)
 
@@ -874,6 +856,41 @@ func (r *ClusterReconciler) connectPrimary(ctx context.Context, cluster *postgre
 		return nil, err
 	}
 	return srv, nil
+}
+
+// checkOperatorLogin is the password-sync part of reconcileReplication for a
+// Cluster without the replication settings: it logs in to the ready primary
+// as the operator, restarting the primary when it rejects the password
+// (28P01, see restartPrimaryForPasswordSync) and clearing the restart record
+// once the login works. Other failures are left to the Role and Database
+// reconciles, which report them. Returns when to check again (0: no need).
+func (r *ClusterReconciler) checkOperatorLogin(ctx context.Context, cluster *postgresv1alpha1.Cluster,
+	secret *corev1.Secret, pods []corev1.Pod) time.Duration {
+	log := logf.FromContext(ctx)
+	var primary *corev1.Pod
+	for i := range pods {
+		if pods[i].Name == primaryPodName(cluster) {
+			primary = &pods[i]
+		}
+	}
+	if primary == nil || primary.DeletionTimestamp != nil || !isPodReady(primary) {
+		return 0
+	}
+	srv, err := r.connectPrimary(ctx, cluster, secret, primary)
+	if err != nil {
+		if pqErr, ok := errors.AsType[*pq.Error](err); ok && pqErr.Code == pqCodeInvalidPassword {
+			log.Error(err, "The primary rejects the operator password")
+			return replicationRetryInterval
+		}
+		log.V(1).Info("Cannot log in to the primary to check the operator password", "error", err.Error())
+		return 0
+	}
+	_ = srv.Close()
+	if err := r.clearPasswordSyncRestart(ctx, secret); err != nil {
+		log.Error(err, "Failed to clear the password-sync restart record")
+		return replicationRetryInterval
+	}
+	return 0
 }
 
 // labelStreaming sets pgop.ruck.io/streaming on the standby pods from

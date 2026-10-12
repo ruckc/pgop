@@ -140,7 +140,7 @@ var _ = Describe("Replication helpers", func() {
 	})
 
 	It("guards the password-sync hook against recovery", func() {
-		cmd := strings.Join(replicationPasswordSyncLifecycle().PostStart.Exec.Command, " ")
+		cmd := strings.Join(operatorPasswordSyncLifecycle().PostStart.Exec.Command, " ")
 		Expect(cmd).To(ContainSubstring(`[ -e "$PGDATA/standby.signal" ]`))
 		Expect(cmd).To(ContainSubstring(`[ -e "$PGDATA/recovery.signal" ]`))
 		Expect(cmd).To(ContainSubstring("pg_is_in_recovery()"))
@@ -524,7 +524,7 @@ var _ = Describe("Cluster replication", func() {
 		Expect(c.Args).To(ContainElement("hba_file=/etc/pgop/hba/pg_hba.conf"))
 		Expect(c.Args).To(ContainElement(HavePrefix("primary_conninfo=host=" + name + ".default.svc.cluster.local ")))
 		Expect(c.Env).To(ContainElement(HaveField("Name", envPodName)))
-		Expect(c.Lifecycle).To(Equal(replicationPasswordSyncLifecycle()))
+		Expect(c.Lifecycle).To(Equal(operatorPasswordSyncLifecycle()))
 		Expect(c.VolumeMounts).To(ContainElements(HaveField("Name", hbaVolumeName), HaveField("Name", runVolumeName)))
 		Expect(sts.Spec.Template.Spec.Volumes).To(ContainElements(HaveField("Name", hbaVolumeName), HaveField("Name", runVolumeName)))
 
@@ -1102,6 +1102,79 @@ var _ = Describe("Cluster replication", func() {
 			createPod(0, true)
 			reconcileOnce(r)
 			Expect(record()).To(BeEmpty())
+		})
+
+		It("restarts a single-instance primary that rejects the operator password", func() {
+			create(newCluster(1))
+			r := newReconciler()
+			now := time.Now()
+			r.Now = func() time.Time { return now }
+			loginFails := true
+			connects := 0
+			connectErr := &pq.Error{Code: pqCodeInvalidPassword, Message: "password authentication failed"}
+			r.ConnectReplicationServer = func(context.Context, postgres.ConnectionConfig) (ReplicationServer, error) {
+				connects++
+				if loginFails {
+					return nil, fmt.Errorf("failed to ping database: %w", connectErr)
+				}
+				return fake, nil
+			}
+			// check runs the password check alone (Reconcile also requeues
+			// for the StatefulSet that never becomes ready in envtest).
+			check := func() time.Duration {
+				s := &corev1.Secret{}
+				Expect(k8sClient.Get(ctx, key(name+"-credentials"), s)).To(Succeed())
+				pods, err := r.listClusterPods(ctx, getCluster())
+				Expect(err).NotTo(HaveOccurred())
+				return r.checkOperatorLogin(ctx, getCluster(), s, pods)
+			}
+			By("no login attempt before the primary is ready")
+			reconcileOnce(r)
+			Expect(connects).To(BeZero())
+			restarted := func(p *corev1.Pod) bool {
+				return apierrors.IsNotFound(k8sClient.Get(ctx, key(p.Name), &corev1.Pod{}))
+			}
+			record := func() string {
+				s := &corev1.Secret{}
+				Expect(k8sClient.Get(ctx, key(name+"-credentials"), s)).To(Succeed())
+				return s.Annotations[AnnotationPasswordSyncRestart]
+			}
+
+			By("28P01 after recovery ended: the primary is restarted and checked again")
+			p0 := createPod(0, true)
+			reconcileOnce(r)
+			Expect(connects).To(Equal(1))
+			Eventually(func() bool { return restarted(p0) }).Should(BeTrue())
+			Expect(record()).To(HaveSuffix(fmt.Sprintf("/1/%d", now.Unix())))
+			Expect(meta.FindStatusCondition(getCluster().Status.Conditions, ConditionTypeReplicationHealthy)).To(BeNil())
+
+			By("no immediate second restart, but a recheck")
+			p0 = createPod(0, true)
+			Expect(check()).To(Equal(replicationRetryInterval))
+			Consistently(func() bool { return restarted(p0) }, time.Second, 200*time.Millisecond).Should(BeFalse())
+
+			By("once the login works the record is cleared and no recheck is needed")
+			loginFails = false
+			Expect(check()).To(BeZero())
+			Expect(record()).To(BeEmpty())
+			Expect(restarted(p0)).To(BeFalse())
+
+			By("the pod template stays without the replication settings")
+			Expect(getSTS().Spec.Template.Spec.InitContainers).To(BeEmpty())
+		})
+
+		It("ignores other login failures of a single-instance primary", func() {
+			create(newCluster(1))
+			r := newReconciler()
+			r.ConnectReplicationServer = func(context.Context, postgres.ConnectionConfig) (ReplicationServer, error) {
+				return nil, errors.New("dial tcp: connection refused")
+			}
+			reconcileOnce(r)
+			p0 := createPod(0, true)
+			s := &corev1.Secret{}
+			Expect(k8sClient.Get(ctx, key(name+"-credentials"), s)).To(Succeed())
+			Expect(r.checkOperatorLogin(ctx, getCluster(), s, []corev1.Pod{*p0})).To(BeZero())
+			Expect(apierrors.IsNotFound(k8sClient.Get(ctx, key(p0.Name), &corev1.Pod{}))).To(BeFalse())
 		})
 
 		It("bounds the password-sync restarts per password", func() {
