@@ -68,6 +68,11 @@ type ConnectionConfig struct {
 	// particular to verify the server certificate, so a single pod can be
 	// reached by its IP while verify-full checks the Service DNS name.
 	DialAddress string
+	// ConnectTimeout, when positive, bounds establishing the connection
+	// (libpq connect_timeout, whole seconds, at least 1). Without it a
+	// connection to an address that drops packets waits for the kernel's
+	// TCP connect timeout (about two minutes on Linux).
+	ConnectTimeout time.Duration
 }
 
 // fixedAddressDialer dials one fixed address, whatever address lib/pq asks

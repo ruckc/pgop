@@ -360,7 +360,8 @@ condition is evaluated only once, at StatefulSet creation.
 
 This is informational: the regenerated operator password in
 `<name>-credentials` is synced into the existing database automatically on pod
-start, so the operator can still connect. Application roles and databases from
+start, so the operator can still connect (see
+[Changing the operator password](#changing-the-operator-password)). Application roles and databases from
 the old data directory remain as they were.
 
 ```sh
@@ -390,6 +391,20 @@ data:
 primary as `pgop_replicator`. It is generated for every Cluster (also added to
 Secrets created by older operator versions) and only used once the Cluster
 has more than one instance.
+
+### Changing the operator password
+
+The operator password in `<cluster-name>-credentials` is set in the database
+by a postStart hook of the PostgreSQL pod, so it only takes effect when the
+pod (re)starts. When you edit `password`, the primary rejects the operator's
+next login (`28P01`) and **the operator restarts the primary pod** so the hook
+syncs the new value: on the first rejected login, or, on a Cluster without
+standbys, once the pod has been ready for 2 minutes. This is a short outage of
+the Cluster. If the primary keeps rejecting the password, the restart is
+retried with a growing delay, at most 5 times per password value. Plan
+password changes accordingly, or restart the pod yourself in a maintenance
+window. Details, including restores, are in
+[Restores and the password-sync hook](replication.md#restores-and-the-password-sync-hook).
 
 ## Using Credentials in Applications
 

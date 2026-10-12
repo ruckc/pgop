@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/lib/pq"
 )
@@ -67,6 +68,10 @@ func buildDSN(cfg ConnectionConfig) (string, error) {
 		{"dbname", cfg.Database},
 		{"sslmode", sslMode},
 	}...)
+	if cfg.ConnectTimeout > 0 {
+		pairs = append(pairs, struct{ k, v string }{"connect_timeout",
+			strconv.Itoa(max(1, int(cfg.ConnectTimeout/time.Second)))})
+	}
 	// Pin the session settings of every operator session (see
 	// operatorSessionSettings). Startup parameters take precedence over
 	// ALTER DATABASE / ALTER ROLE ... SET.
