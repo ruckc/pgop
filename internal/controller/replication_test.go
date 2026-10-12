@@ -1200,6 +1200,7 @@ var _ = Describe("Cluster replication", func() {
 				now        time.Time
 				connects   int
 				connectErr error
+				lastCfg    postgres.ConnectionConfig
 			)
 			rejected := fmt.Errorf("failed to ping database: %w",
 				&pq.Error{Code: pqCodeInvalidPassword, Message: "password authentication failed"})
@@ -1241,8 +1242,9 @@ var _ = Describe("Cluster replication", func() {
 				r.Now = func() time.Time { return now }
 				connects = 0
 				connectErr = rejected
-				r.ConnectReplicationServer = func(context.Context, postgres.ConnectionConfig) (ReplicationServer, error) {
+				r.ConnectReplicationServer = func(_ context.Context, cfg postgres.ConnectionConfig) (ReplicationServer, error) {
 					connects++
+					lastCfg = cfg
 					if connectErr != nil {
 						return nil, connectErr
 					}
@@ -1258,6 +1260,7 @@ var _ = Describe("Cluster replication", func() {
 				p0 := createPod(0, true)
 				reconcileOnce(r)
 				Expect(connects).To(Equal(1))
+				Expect(lastCfg.ConnectTimeout).To(Equal(operatorConnectTimeout), "a stalled connect must not block the controller")
 				Eventually(func() bool { return gone(p0) }).Should(BeTrue())
 				Expect(record().Attempts).To(Equal(1))
 				Expect(record().Last.Unix()).To(Equal(now.Unix()))

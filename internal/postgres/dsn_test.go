@@ -122,6 +122,28 @@ func TestBuildDSNDefaults(t *testing.T) {
 	}
 }
 
+func TestBuildDSNConnectTimeout(t *testing.T) {
+	dsn, err := buildDSN(ConnectionConfig{Host: testHost})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(dsn, "connect_timeout") {
+		t.Errorf("dsn %q sets connect_timeout without ConnectTimeout", dsn)
+	}
+	for timeout, want := range map[time.Duration]string{
+		10 * time.Second:       "connect_timeout='10'",
+		500 * time.Millisecond: "connect_timeout='1'",
+	} {
+		dsn, err := buildDSN(ConnectionConfig{Host: testHost, ConnectTimeout: timeout})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(dsn, want) {
+			t.Errorf("dsn %q does not contain %q", dsn, want)
+		}
+	}
+}
+
 func TestBuildDSNSSLModes(t *testing.T) {
 	for _, mode := range []string{SSLModeDisable, SSLModePrefer, SSLModeRequire} {
 		dsn, err := buildDSN(ConnectionConfig{Host: testHost, SSLMode: mode})

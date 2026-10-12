@@ -127,6 +127,8 @@ const (
 	// have been ready before checkOperatorLogin restarts it for a rejected
 	// operator password (it may still be recovering a backup).
 	passwordSyncReadyGrace = 2 * time.Minute
+	// operatorConnectTimeout bounds connectOperator.
+	operatorConnectTimeout = 5 * time.Second
 
 	// rolloutStandbyTimeout is how long a password rollout waits for a
 	// restarted standby to stream again before restarting the next one.
@@ -858,6 +860,10 @@ func (r *ClusterReconciler) connectOperator(ctx context.Context, cluster *postgr
 	if err != nil {
 		return nil, err
 	}
+	// The Cluster controller reconciles one Cluster at a time: a primary
+	// that just became ready (its Service not yet routed) must not stall it
+	// for the kernel's TCP connect timeout.
+	cfg.ConnectTimeout = operatorConnectTimeout
 	connect := r.ConnectReplicationServer
 	if connect == nil {
 		connect = connectReplicationServer
@@ -886,8 +892,9 @@ func podReadySince(pod *corev1.Pod) time.Time {
 // Cluster without the replication settings: it logs in to the ready primary
 // as the operator, restarting the primary when it rejects the password
 // (28P01, see restartPrimaryForPasswordSync) and clearing the restart record
-// once the login works. Other failures are left to the Role and Database
-// reconciles, which report them.
+// once the login works. Other failures (the connection is bounded by
+// operatorConnectTimeout) are left to the Role and Database reconciles,
+// which report them; the login is checked again on the next reconcile.
 //
 // A primary that may still be recovering is not restarted: never while a
 // physical Restore stopped the Cluster (or one was interrupted), and not
