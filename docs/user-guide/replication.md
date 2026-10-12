@@ -306,6 +306,12 @@ and the failed hook would make the kubelet restart the container, and with
 it the recovery, in a loop. A standby gets the password from the primary
 through replication.
 
+The hook only changes the password when the server reports it is not in
+recovery; on any other answer it does nothing. It never puts the password on
+a command line or in SQL text the server could log: psql reads it from the
+environment (`\getenv`, psql 15+; on psql 14 the shell quotes it and feeds
+it through stdin) and the statement logging of its session is off.
+
 After a restore, the hook skipped the password sync while the server was
 recovering, so the primary may reject the operator password (`28P01`) once
 recovery ends (pgop's restores promote the server once the target is
@@ -318,6 +324,14 @@ restarts per password value, recorded in the
 which is cleared once the login works). A restart while the server is still
 paused in recovery does not sync the password; resume or promote it, and a
 later attempt (or deleting the primary pod by hand) completes the sync.
+
+On a Cluster without standbys the operator also leaves a primary that may
+still be recovering alone: it never restarts it while a physical Restore
+stopped the Cluster (`pgop.ruck.io/restore-in-progress`) or after an
+interrupted one (`pgop.ruck.io/restore-interrupted`), and only once the pod
+has been ready for 2 minutes. The same restart happens when you change the
+operator password in `<cluster>-credentials` by hand (see
+[Changing the operator password](clusters.md#changing-the-operator-password)).
 
 ## Backups and restores
 

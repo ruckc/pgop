@@ -18,6 +18,8 @@ package controller
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -147,6 +149,94 @@ var _ = Describe("Replication helpers", func() {
 		Expect(cmd).To(ContainSubstring("pg_isready -q -U"))
 		// The guard comes before ALTER ROLE.
 		Expect(strings.Index(cmd, "pg_is_in_recovery()")).To(BeNumerically("<", strings.Index(cmd, "ALTER ROLE")))
+	})
+
+	It("pins the password-sync hook script (golden)", func() {
+		// The hook is part of every pod template: any change to it restarts
+		// every Cluster's pods on operator upgrade. Update the hash only on
+		// purpose (and note the restart in docs/upgrading.md).
+		cmd := operatorPasswordSyncLifecycle().PostStart.Exec.Command
+		Expect(cmd).To(Equal([]string{"sh", "-c", passwordSyncScript}))
+		sum := sha256.Sum256([]byte(passwordSyncScript))
+		Expect(hex.EncodeToString(sum[:])).To(Equal("c939d7d8d94b70be35dd32bcb780e5c1b8024e4fe66f9ff5c3b01cad612fbde0"))
+	})
+
+	Describe("the password-sync hook script", func() {
+		const password = "it's \"x\" $HOME `id` \\ ;--\n"
+		// runHook runs the script with stub pg_isready and psql binaries:
+		// psql -V reports version, the recovery query prints recovery (or
+		// fails when it is empty), and any other psql call records its stdin.
+		// Returns the recorded psql arguments and stdin ("" when no SQL was
+		// sent).
+		runHook := func(version, recovery string, signal bool) (argv, stdin string) {
+			dir := GinkgoT().TempDir()
+			bin := filepath.Join(dir, "bin")
+			pgdata := filepath.Join(dir, "pgdata")
+			Expect(os.MkdirAll(bin, 0o755)).To(Succeed())
+			Expect(os.MkdirAll(pgdata, 0o755)).To(Succeed())
+			if signal {
+				Expect(os.WriteFile(filepath.Join(pgdata, "recovery.signal"), nil, 0o600)).To(Succeed())
+			}
+			Expect(os.WriteFile(filepath.Join(bin, "pg_isready"), []byte("#!/bin/sh\nexit 0\n"), 0o755)).To(Succeed())
+			Expect(os.WriteFile(filepath.Join(bin, "psql"), []byte(`#!/bin/sh
+for a in "$@"; do printf '%s\n' "$a" >> "$FAKE_DIR/argv"; done
+case " $* " in
+*" -V "*) echo "psql (PostgreSQL) $FAKE_VERSION (Debian $FAKE_VERSION-1)"; exit 0 ;;
+*" -tAc "*) [ -n "$FAKE_RECOVERY" ] || exit 2; printf '%s\n' "$FAKE_RECOVERY"; exit 0 ;;
+esac
+cat > "$FAKE_DIR/stdin"
+`), 0o755)).To(Succeed())
+			cmd := exec.Command("/bin/sh", "-c", passwordSyncScript)
+			cmd.Env = []string{
+				"PATH=" + bin + ":" + os.Getenv("PATH"),
+				"PGDATA=" + pgdata,
+				"POSTGRES_USER=pgop",
+				"POSTGRES_PASSWORD=" + password,
+				"FAKE_DIR=" + dir,
+				"FAKE_VERSION=" + version,
+				"FAKE_RECOVERY=" + recovery,
+			}
+			out, err := cmd.CombinedOutput()
+			Expect(err).NotTo(HaveOccurred(), string(out))
+			a, _ := os.ReadFile(filepath.Join(dir, "argv"))
+			in, _ := os.ReadFile(filepath.Join(dir, "stdin"))
+			return string(a), string(in)
+		}
+
+		It("reads the password inside psql 15+, never from argv or SQL text", func() {
+			for _, version := range []string{"15.8", "16.4", "17.2", "18.0"} {
+				argv, stdin := runHook(version, "f", false)
+				Expect(argv).NotTo(ContainSubstring("it's"), version)
+				Expect(argv).To(ContainSubstring("-X\n"), version)
+				Expect(stdin).To(Equal("SET log_statement = 'none';\n"+
+					"SET log_min_duration_statement = -1;\n"+
+					"SET log_min_error_statement = 'panic';\n"+
+					"\\getenv pgop_password POSTGRES_PASSWORD\n"+
+					"\\getenv pgop_user POSTGRES_USER\n"+
+					"ALTER ROLE :\"pgop_user\" WITH PASSWORD :'pgop_password';\n"), version)
+			}
+		})
+
+		It("quotes the password in the shell on psql 14 and older, through stdin only", func() {
+			for _, version := range []string{"14.11", "13.16", "10.23", "9.6.24"} {
+				argv, stdin := runHook(version, "f", false)
+				Expect(argv).NotTo(ContainSubstring("it's"), version)
+				Expect(stdin).To(Equal("SET log_statement = 'none';\n"+
+					"SET log_min_duration_statement = -1;\n"+
+					"SET log_min_error_statement = 'panic';\n"+
+					"ALTER ROLE \"pgop\" WITH PASSWORD 'it''s \"x\" $HOME `id` \\ ;--\n';\n"), version)
+			}
+		})
+
+		It("changes nothing unless the server reports it is not in recovery", func() {
+			for _, recovery := range []string{"t", "", "f\nf", "F"} {
+				_, stdin := runHook("17.2", recovery, false)
+				Expect(stdin).To(BeEmpty(), "recovery output %q", recovery)
+			}
+			argv, stdin := runHook("17.2", "f", true)
+			Expect(argv).To(BeEmpty(), "with recovery.signal psql is not even started")
+			Expect(stdin).To(BeEmpty())
+		})
 	})
 
 	It("clones standbys through a staging directory and a slot", func() {
@@ -1104,77 +1194,166 @@ var _ = Describe("Cluster replication", func() {
 			Expect(record()).To(BeEmpty())
 		})
 
-		It("restarts a single-instance primary that rejects the operator password", func() {
-			create(newCluster(1))
-			r := newReconciler()
-			now := time.Now()
-			r.Now = func() time.Time { return now }
-			loginFails := true
-			connects := 0
-			connectErr := &pq.Error{Code: pqCodeInvalidPassword, Message: "password authentication failed"}
-			r.ConnectReplicationServer = func(context.Context, postgres.ConnectionConfig) (ReplicationServer, error) {
-				connects++
-				if loginFails {
-					return nil, fmt.Errorf("failed to ping database: %w", connectErr)
-				}
-				return fake, nil
+		Context("single-instance operator password check", func() {
+			var (
+				r          *ClusterReconciler
+				now        time.Time
+				connects   int
+				connectErr error
+			)
+			rejected := fmt.Errorf("failed to ping database: %w",
+				&pq.Error{Code: pqCodeInvalidPassword, Message: "password authentication failed"})
+			secret := func() *corev1.Secret {
+				s := &corev1.Secret{}
+				Expect(k8sClient.Get(ctx, key(name+"-credentials"), s)).To(Succeed())
+				return s
+			}
+			record := func() passwordSyncRestart {
+				return parsePasswordSyncRestart(secret().Annotations[AnnotationPasswordSyncRestart])
+			}
+			gone := func(p *corev1.Pod) bool {
+				return apierrors.IsNotFound(k8sClient.Get(ctx, key(p.Name), &corev1.Pod{}))
 			}
 			// check runs the password check alone (Reconcile also requeues
 			// for the StatefulSet that never becomes ready in envtest).
 			check := func() time.Duration {
-				s := &corev1.Secret{}
-				Expect(k8sClient.Get(ctx, key(name+"-credentials"), s)).To(Succeed())
 				pods, err := r.listClusterPods(ctx, getCluster())
 				Expect(err).NotTo(HaveOccurred())
-				return r.checkOperatorLogin(ctx, getCluster(), s, pods)
+				return r.checkOperatorLogin(ctx, getCluster(), secret(), pods)
 			}
-			By("no login attempt before the primary is ready")
-			reconcileOnce(r)
-			Expect(connects).To(BeZero())
-			restarted := func(p *corev1.Pod) bool {
-				return apierrors.IsNotFound(k8sClient.Get(ctx, key(p.Name), &corev1.Pod{}))
+			// restartedNow creates a ready primary, runs the check and reports
+			// whether the primary was restarted, with the returned recheck.
+			restartedNow := func() (bool, time.Duration) {
+				p0 := createPod(0, true)
+				d := check()
+				if gone(p0) {
+					return true, d
+				}
+				Consistently(func() bool { return gone(p0) }, 300*time.Millisecond, 100*time.Millisecond).Should(BeFalse())
+				return false, d
 			}
-			record := func() string {
-				s := &corev1.Secret{}
-				Expect(k8sClient.Get(ctx, key(name+"-credentials"), s)).To(Succeed())
-				return s.Annotations[AnnotationPasswordSyncRestart]
-			}
+			BeforeEach(func() {
+				create(newCluster(1))
+				r = newReconciler()
+				// Whole seconds, as stored in the restart record and pod
+				// conditions.
+				now = time.Now().Truncate(time.Second)
+				r.Now = func() time.Time { return now }
+				connects = 0
+				connectErr = rejected
+				r.ConnectReplicationServer = func(context.Context, postgres.ConnectionConfig) (ReplicationServer, error) {
+					connects++
+					if connectErr != nil {
+						return nil, connectErr
+					}
+					return fake, nil
+				}
+				reconcileOnce(r)
+			})
 
-			By("28P01 after recovery ended: the primary is restarted and checked again")
-			p0 := createPod(0, true)
-			reconcileOnce(r)
-			Expect(connects).To(Equal(1))
-			Eventually(func() bool { return restarted(p0) }).Should(BeTrue())
-			Expect(record()).To(HaveSuffix(fmt.Sprintf("/1/%d", now.Unix())))
-			Expect(meta.FindStatusCondition(getCluster().Status.Conditions, ConditionTypeReplicationHealthy)).To(BeNil())
+			It("restarts the primary with a growing delay and a bounded number of attempts", func() {
+				Expect(connects).To(BeZero(), "no login attempt before the primary is ready")
 
-			By("no immediate second restart, but a recheck")
-			p0 = createPod(0, true)
-			Expect(check()).To(Equal(replicationRetryInterval))
-			Consistently(func() bool { return restarted(p0) }, time.Second, 200*time.Millisecond).Should(BeFalse())
+				By("28P01 after recovery ended: restart, recheck when the next attempt is allowed")
+				p0 := createPod(0, true)
+				reconcileOnce(r)
+				Expect(connects).To(Equal(1))
+				Eventually(func() bool { return gone(p0) }).Should(BeTrue())
+				Expect(record().Attempts).To(Equal(1))
+				Expect(record().Last.Unix()).To(Equal(now.Unix()))
+				Expect(meta.FindStatusCondition(getCluster().Status.Conditions, ConditionTypeReplicationHealthy)).To(BeNil())
 
-			By("once the login works the record is cleared and no recheck is needed")
-			loginFails = false
-			Expect(check()).To(BeZero())
-			Expect(record()).To(BeEmpty())
-			Expect(restarted(p0)).To(BeFalse())
+				By("within the delay: no restart, recheck at the end of the delay")
+				now = now.Add(time.Minute)
+				restarted, d := restartedNow()
+				Expect(restarted).To(BeFalse())
+				Expect(d).To(Equal(passwordSyncBackoff(1) - time.Minute))
 
-			By("the pod template stays without the replication settings")
-			Expect(getSTS().Spec.Template.Spec.InitContainers).To(BeEmpty())
-		})
+				By("after the delay: restarted again")
+				for attempt := 2; attempt <= passwordSyncMaxAttempts; attempt++ {
+					now = now.Add(passwordSyncBackoff(attempt-1) + time.Second)
+					restarted, d = restartedNow()
+					Expect(restarted).To(BeTrue(), "attempt %d", attempt)
+					Expect(record().Attempts).To(Equal(attempt))
+					if attempt < passwordSyncMaxAttempts {
+						Expect(d).To(Equal(passwordSyncBackoff(attempt)))
+					} else {
+						Expect(d).To(BeZero(), "no recheck after the last attempt")
+					}
+				}
 
-		It("ignores other login failures of a single-instance primary", func() {
-			create(newCluster(1))
-			r := newReconciler()
-			r.ConnectReplicationServer = func(context.Context, postgres.ConnectionConfig) (ReplicationServer, error) {
-				return nil, errors.New("dial tcp: connection refused")
-			}
-			reconcileOnce(r)
-			p0 := createPod(0, true)
-			s := &corev1.Secret{}
-			Expect(k8sClient.Get(ctx, key(name+"-credentials"), s)).To(Succeed())
-			Expect(r.checkOperatorLogin(ctx, getCluster(), s, []corev1.Pod{*p0})).To(BeZero())
-			Expect(apierrors.IsNotFound(k8sClient.Get(ctx, key(p0.Name), &corev1.Pod{}))).To(BeFalse())
+				By("after the last attempt: no more restarts and no recheck")
+				now = now.Add(24 * time.Hour)
+				restarted, d = restartedNow()
+				Expect(restarted).To(BeFalse())
+				Expect(d).To(BeZero())
+				Expect(record().Attempts).To(Equal(passwordSyncMaxAttempts))
+
+				By("a changed password starts over")
+				s := secret()
+				s.Data[SecretKeyPassword] = []byte("a-new-password")
+				Expect(k8sClient.Update(ctx, s)).To(Succeed())
+				p0 = &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: name + "-0"}}
+				Expect(check()).To(Equal(passwordSyncBackoff(1)))
+				Eventually(func() bool { return gone(p0) }).Should(BeTrue())
+				Expect(record().Attempts).To(Equal(1))
+
+				By("once the login works the record is cleared")
+				connectErr = nil
+				createPod(0, true)
+				Expect(check()).To(BeZero())
+				Expect(secret().Annotations).NotTo(HaveKey(AnnotationPasswordSyncRestart))
+
+				By("the pod template stays without the replication settings")
+				Expect(getSTS().Spec.Template.Spec.InitContainers).To(BeEmpty())
+			})
+
+			It("does not log in to a primary that is not ready or is being deleted", func() {
+				p0 := createPod(0, false)
+				Expect(check()).To(BeZero())
+				deleting := p0.DeepCopy()
+				deleting.DeletionTimestamp = new(metav1.Now())
+				deleting.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
+				Expect(r.checkOperatorLogin(ctx, getCluster(), secret(), []corev1.Pod{*deleting})).To(BeZero())
+				Expect(connects).To(BeZero())
+				Expect(gone(p0)).To(BeFalse())
+			})
+
+			It("does not restart a primary that just became ready", func() {
+				p0 := createPod(0, true)
+				p0.Status.Conditions[0].LastTransitionTime = metav1.NewTime(now.Add(-30 * time.Second))
+				Expect(k8sClient.Status().Update(ctx, p0)).To(Succeed())
+				Expect(check()).To(Equal(passwordSyncReadyGrace - 30*time.Second))
+				Expect(gone(p0)).To(BeFalse())
+				Expect(secret().Annotations).NotTo(HaveKey(AnnotationPasswordSyncRestart))
+
+				now = now.Add(passwordSyncReadyGrace)
+				Expect(check()).To(Equal(passwordSyncBackoff(1)))
+				Eventually(func() bool { return gone(p0) }).Should(BeTrue())
+			})
+
+			It("does not restart the primary while a physical restore stopped the Cluster", func() {
+				for _, ann := range []string{AnnotationRestoreInProgress, AnnotationRestoreInterrupted} {
+					p0 := createPod(0, true)
+					c := getCluster()
+					c.Annotations = map[string]string{ann: "some-restore"}
+					Expect(r.checkOperatorLogin(ctx, c, secret(), []corev1.Pod{*p0})).To(BeZero())
+					Expect(connects).To(BeZero(), ann)
+					Expect(gone(p0)).To(BeFalse(), ann)
+				}
+			})
+
+			It("ignores other login failures and keeps the restart record", func() {
+				s := secret()
+				s.Annotations = map[string]string{AnnotationPasswordSyncRestart: "fp/1/1"}
+				Expect(k8sClient.Update(ctx, s)).To(Succeed())
+				connectErr = errors.New("dial tcp: connection refused")
+				restarted, d := restartedNow()
+				Expect(restarted).To(BeFalse())
+				Expect(d).To(BeZero())
+				Expect(connects).To(Equal(1))
+				Expect(secret().Annotations).To(HaveKeyWithValue(AnnotationPasswordSyncRestart, "fp/1/1"))
+			})
 		})
 
 		It("bounds the password-sync restarts per password", func() {

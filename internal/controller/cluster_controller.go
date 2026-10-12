@@ -1392,17 +1392,49 @@ func convergeContainer(existing *corev1.Container, desired corev1.Container) boo
 // operator password once recovery ended is restarted by the operator so the
 // hook runs again (see restartPrimaryForPasswordSync).
 func operatorPasswordSyncLifecycle() *corev1.Lifecycle {
-	script := `if [ -e "$PGDATA/standby.signal" ] || [ -e "$PGDATA/recovery.signal" ]; then exit 0; fi; ` +
-		`until pg_isready -q -U "$POSTGRES_USER" -d postgres 2>/dev/null; do sleep 1; done; ` +
-		`if [ "$(psql -U "$POSTGRES_USER" -d postgres -tAc 'SELECT pg_is_in_recovery()')" = t ]; then exit 0; fi; ` +
-		`psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d postgres ` +
-		`-c "ALTER ROLE \"$POSTGRES_USER\" WITH PASSWORD '$POSTGRES_PASSWORD'"`
 	return &corev1.Lifecycle{
 		PostStart: &corev1.LifecycleHandler{
-			Exec: &corev1.ExecAction{Command: []string{"sh", "-c", script}},
+			Exec: &corev1.ExecAction{Command: []string{"sh", "-c", passwordSyncScript}},
 		},
 	}
 }
+
+// passwordSyncScript is the shell script of operatorPasswordSyncLifecycle.
+//
+// It only changes the password on a server that reports it is not in
+// recovery (pg_is_in_recovery() is exactly "f"); on any other answer it does
+// nothing, and the operator restarts a primary that still rejects its
+// password (checkOperatorLogin, restartPrimaryForPasswordSync).
+//
+// The password never appears in a command line (ps) or in the SQL text the
+// server could log: psql reads it from the environment (\getenv, psql 15+)
+// and quotes it itself (:'pgop_password'), and the statement logging of the
+// session is turned off first. psql 14 and older have no \getenv: there the
+// shell quotes the password (printf is a shell builtin, so it never shows up
+// in ps) and feeds the statement through stdin. psql -X ignores ~/.psqlrc.
+const passwordSyncScript = `if [ -e "$PGDATA/standby.signal" ] || [ -e "$PGDATA/recovery.signal" ]; then exit 0; fi
+until pg_isready -q -U "$POSTGRES_USER" -d postgres 2>/dev/null; do sleep 1; done
+if [ "$(psql -X -U "$POSTGRES_USER" -d postgres -tAc 'SELECT pg_is_in_recovery()')" != f ]; then exit 0; fi
+case "$(psql -X -V)" in
+*") 9."* | *") 1"[0-4]"."*)
+	pw=$(printf '%sx' "$POSTGRES_PASSWORD" | sed "s/'/''/g"); pw=${pw%x}
+	user=$(printf '%sx' "$POSTGRES_USER" | sed 's/"/""/g'); user=${user%x}
+	printf '%s\n' "SET log_statement = 'none';" "SET log_min_duration_statement = -1;" \
+		"SET log_min_error_statement = 'panic';" "ALTER ROLE \"$user\" WITH PASSWORD '$pw';" |
+		psql -X -q -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d postgres
+	;;
+*)
+	psql -X -q -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d postgres <<'SQL'
+SET log_statement = 'none';
+SET log_min_duration_statement = -1;
+SET log_min_error_statement = 'panic';
+\getenv pgop_password POSTGRES_PASSWORD
+\getenv pgop_user POSTGRES_USER
+ALTER ROLE :"pgop_user" WITH PASSWORD :'pgop_password';
+SQL
+	;;
+esac
+`
 
 // isStatefulSetReady reports whether the Cluster accepts connections: its
 // primary pod is ready. Standbys never affect it (a standby that is cloning,

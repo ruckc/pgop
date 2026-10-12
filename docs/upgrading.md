@@ -29,17 +29,27 @@ or together with the operator image, so the API server knows the new fields.
 
 ## v0.19.2: recovery-aware password-sync hook
 
-- **Single-instance Clusters restart once.** Every Cluster now uses the
-  recovery-aware password-sync postStart hook (it skips an instance in
-  recovery instead of failing, which crash-looped a point-in-time restore;
-  [#45](https://github.com/ruckc/pgop/issues/45)). Clusters that never had
-  standbys or a physical Backup used the old hook, so their pod template
-  changes and the pod restarts once after the operator upgrade. Plan the
-  upgrade for a maintenance window if that brief outage matters.
-- A Cluster whose primary rejects the operator password (`28P01`) now has
-  its primary pod restarted so the hook syncs the password, also without
-  standbys (see
-  [Restores and the password-sync hook](user-guide/replication.md#restores-and-the-password-sync-hook)).
+(The version is the expected next patch release; see the GitHub release
+notes for the release that contains [#45](https://github.com/ruckc/pgop/issues/45).)
+
+- **Every Cluster's pod restarts once on this upgrade.** The password-sync
+  postStart hook changed for all Clusters: it now skips an instance in
+  recovery instead of failing (which crash-looped a point-in-time restore),
+  and it no longer passes the password on the command line or in logged SQL
+  (psql reads it from the environment). The pod template changes, so the
+  StatefulSet restarts its pods once after the operator upgrade, standbys
+  first and the primary last. Clusters that currently have neither standbys
+  nor a physical Backup (single instance) are down for the restart of their
+  only pod. Plan the upgrade for a maintenance window if that matters.
+- **Editing the operator password restarts the primary.** A primary that
+  rejects the operator password (`28P01`) is now restarted so the hook syncs
+  the password on every Cluster, also without standbys (without standbys:
+  once the pod has been ready for 2 minutes, never while a physical Restore
+  stopped the Cluster). Changing `password` in `<cluster>-credentials` by
+  hand therefore restarts the primary. See
+  [Changing the operator password](user-guide/clusters.md#changing-the-operator-password)
+  and
+  [Restores and the password-sync hook](user-guide/replication.md#restores-and-the-password-sync-hook).
 
 ## v0.19.0: object grants and default privileges
 
