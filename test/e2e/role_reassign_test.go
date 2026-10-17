@@ -61,6 +61,7 @@ kind: Role
 metadata:
   name: ` + name + `
 spec:
+  roleName: ` + strings.ReplaceAll(name, "-", "_") + `
   clusterRef:
     name: example-cluster
 ` + extra
@@ -86,7 +87,7 @@ spec:
 		It("reassigns owned objects to a role the deleted role is a member of", func() {
 			kubectlApply(roleManifest("rsg-target", "  login: false\n"))
 			waitReady("role.pgop.ruck.io/rsg-target")
-			kubectlApply(roleManifest("rsg-old", "  memberships:\n    - role: rsg-target\n  deletion:\n    reassignOwnedTo: rsg-target\n"))
+			kubectlApply(roleManifest("rsg-old", "  memberships:\n    - role: rsg_target\n  deletion:\n    reassignOwnedTo: rsg_target\n"))
 			waitReady("role.pgop.ruck.io/rsg-old")
 
 			_, err := psql(`CREATE TABLE rsg_t (id int); ALTER TABLE rsg_t OWNER TO rsg_old`)
@@ -101,7 +102,7 @@ spec:
 		})
 
 		It("blocks the deletion when the role is not a member of the target", func() {
-			kubectlApply(roleManifest("rsg-nomember", "  deletion:\n    reassignOwnedTo: rsg-target\n"))
+			kubectlApply(roleManifest("rsg-nomember", "  deletion:\n    reassignOwnedTo: rsg_target\n"))
 			waitReady("role.pgop.ruck.io/rsg-nomember")
 			_, err := psql(`CREATE TABLE rsg_n (id int); ALTER TABLE rsg_n OWNER TO rsg_nomember`)
 			Expect(err).NotTo(HaveOccurred())
