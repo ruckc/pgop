@@ -423,11 +423,33 @@ func (r *RoleReconciler) dropPostgresRole(ctx context.Context, cluster *postgres
 	}
 	skipped = append(skipped, objectSkipped...)
 
+	if role.Spec.Deletion != nil && role.Spec.Deletion.ReassignOwnedTo != "" {
+		reassignSkipped, blocked, err := reassignOwnedObjects(ctx, r.Client, cluster, pgClient, pgName, role.Spec.Deletion.ReassignOwnedTo)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if blocked != nil {
+			log.Info("Role cannot be dropped yet", "reason", blocked.Error())
+			meta.SetStatusCondition(&role.Status.Conditions, metav1.Condition{
+				Type:               ConditionTypeAvailable,
+				Status:             metav1.ConditionFalse,
+				ObservedGeneration: role.Generation,
+				Reason:             ReasonRoleDropBlocked,
+				Message:            blocked.Error(),
+			})
+			if statusErr := r.saveStatus(ctx, role); statusErr != nil {
+				return ctrl.Result{}, statusErr
+			}
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+		}
+		skipped = append(skipped, reassignSkipped...)
+	}
+
 	err = pgClient.DropRole(ctx, pgName)
 	if depErr, ok := errors.AsType[*postgres.DependentObjectsError](err); ok {
 		msg := depErr.Error()
 		if len(skipped) > 0 {
-			msg += "; schema, extension object or object privileges could not be revoked in: " + strings.Join(skipped, ", ")
+			msg += "; schema, extension object or object privileges could not be revoked, or owned objects reassigned, in: " + strings.Join(skipped, ", ")
 		}
 		log.Info("Role cannot be dropped yet", "reason", msg)
 		meta.SetStatusCondition(&role.Status.Conditions, metav1.Condition{

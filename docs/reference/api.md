@@ -265,6 +265,13 @@ spec:
                            # database is pending, not an error
       settings:            # max 64, same rules as settings
         string: string
+
+  # What happens to objects the role owns when the Role is deleted.
+  deletion:
+    reassignOwnedTo: string  # PostgreSQL role (1-63 chars; not postgres, pg_*, pgop_*, a superuser or the role
+                             # itself). REASSIGN OWNED, then DROP OWNED, in each database before DROP ROLE.
+                             # The role must be a member of it. Refused (RoleDropBlocked) otherwise, or if
+                             # the role owns a database.
 ```
 
 Annotation `pgop.ruck.io/rotate-password: <any new value>` requests an

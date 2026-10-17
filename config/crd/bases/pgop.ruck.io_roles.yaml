@@ -149,6 +149,29 @@ spec:
                 x-kubernetes-list-map-keys:
                 - database
                 x-kubernetes-list-type: map
+              deletion:
+                description: |-
+                  deletion configures what happens to objects the role owns when this Role
+                  is deleted. Unset, objects the role owns block the drop (reported with
+                  reason RoleDropBlocked).
+                properties:
+                  reassignOwnedTo:
+                    description: |-
+                      reassignOwnedTo is the PostgreSQL name of a role that takes over the
+                      objects the deleted role owns (REASSIGN OWNED BY role TO target, then
+                      DROP OWNED BY role, in every database that allows connections). The
+                      deleted role must be a member of the target (pg_has_role USAGE), and the
+                      target must exist and must not be a superuser, "postgres", "pgop_*" or
+                      "pg_*". A role that owns a database is never reassigned: change the
+                      Database spec.owner first.
+                    maxLength: 63
+                    minLength: 1
+                    type: string
+                    x-kubernetes-validations:
+                    - message: reassignOwnedTo must not be postgres or start with
+                        'pg_' or 'pgop_'
+                      rule: self != 'postgres' && !self.startsWith('pgop_') && !self.startsWith('pg_')
+                type: object
               inherit:
                 default: true
                 description: inherit allows the role to inherit privileges from roles
@@ -432,6 +455,9 @@ spec:
             - message: roleName is immutable
               rule: has(oldSelf.roleName) == has(self.roleName) && (!has(self.roleName)
                 || self.roleName == oldSelf.roleName)
+            - message: deletion.reassignOwnedTo must not be the role itself
+              rule: '!has(self.deletion) || !has(self.roleName) || self.deletion.reassignOwnedTo
+                != self.roleName'
             - message: a role must not be listed in both memberOf and memberships
               rule: '!has(self.memberOf) || !has(self.memberships) || self.memberOf.all(r,
                 !self.memberships.exists(m, m.role == r))'
