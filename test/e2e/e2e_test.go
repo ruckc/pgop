@@ -152,7 +152,7 @@ var _ = Describe("Manager", Ordered, func() {
 						// base64 output might contain n newlines, remove them
 						contentBase64 = strings.ReplaceAll(strings.TrimSpace(contentBase64), "\n", "")
 						contentBase64 = strings.ReplaceAll(contentBase64, "\r", "")
-						
+
 						content, err := base64.StdEncoding.DecodeString(contentBase64)
 						if err != nil {
 							fmt.Fprintf(GinkgoWriter, "Failed to decode base64 content for %s: %s\n", file, err)
@@ -262,7 +262,7 @@ var _ = Describe("Manager", Ordered, func() {
 			} else {
 				_, _ = fmt.Fprintf(GinkgoWriter, "Failed to get PostgreSQL logs: %s", err)
 			}
-			
+
 			By("Describing PostgreSQL pods")
 			cmd = exec.Command("kubectl", "describe", "pods", "-l", "app.kubernetes.io/name=postgresql", "-n", namespace)
 			pgDescribe, err := utils.Run(cmd)
