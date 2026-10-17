@@ -23,6 +23,7 @@ import (
 )
 
 func TestCheckReassignTarget(t *testing.T) {
+	const target = "owner"
 	member := postgres.ReassignTargetInfo{Exists: true, OldHasUsage: true}
 	tests := []struct {
 		name    string
@@ -31,14 +32,14 @@ func TestCheckReassignTarget(t *testing.T) {
 		info    postgres.ReassignTargetInfo
 		wantErr bool
 	}{
-		{"member", "app", "owner", member, false},
-		{"not a member", "app", "owner", postgres.ReassignTargetInfo{Exists: true}, true},
-		{"superuser", "app", "owner", postgres.ReassignTargetInfo{Exists: true, Super: true, OldHasUsage: true}, true},
-		{"missing", "app", "owner", postgres.ReassignTargetInfo{}, true},
-		{"self", "app", "app", member, true},
-		{"postgres", "app", "postgres", member, true},
-		{"operator role", "app", "pgop_operator", member, true},
-		{"predefined", "app", "pg_monitor", member, true},
+		{"member", ogSchema, target, member, false},
+		{"not a member", ogSchema, target, postgres.ReassignTargetInfo{Exists: true}, true},
+		{"superuser", ogSchema, target, postgres.ReassignTargetInfo{Exists: true, Super: true, OldHasUsage: true}, true},
+		{"missing", ogSchema, target, postgres.ReassignTargetInfo{}, true},
+		{"self", ogSchema, ogSchema, member, true},
+		{defaultDatabaseName, ogSchema, defaultDatabaseName, member, true},
+		{"operator role", ogSchema, DefaultOperatorUsername, member, true},
+		{"predefined", ogSchema, reservedPgPrefixed, member, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

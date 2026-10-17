@@ -31,8 +31,12 @@ import (
 	postgresv1alpha1 "github.com/ruckc/pgop/api/v1alpha1"
 )
 
+const reservedPgPrefixed = "pg_x"
+
 // CRD validation of Role spec.deletion.reassignOwnedTo.
 var _ = Describe("Role deletion CRD validation", func() {
+	const ns = "default"
+
 	var (
 		ctx    context.Context
 		suffix string
@@ -45,7 +49,7 @@ var _ = Describe("Role deletion CRD validation", func() {
 
 	create := func(spec postgresv1alpha1.RoleSpec) error {
 		spec.ClusterRef = postgresv1alpha1.ClusterReference{Name: nonexistentCluster}
-		obj := &postgresv1alpha1.Role{ObjectMeta: metav1.ObjectMeta{Name: "del-" + suffix, Namespace: "default"}, Spec: spec}
+		obj := &postgresv1alpha1.Role{ObjectMeta: metav1.ObjectMeta{Name: "del-" + suffix, Namespace: ns}, Spec: spec}
 		err := k8sClient.Create(ctx, obj)
 		if err == nil {
 			DeferCleanup(func() {
@@ -60,7 +64,7 @@ var _ = Describe("Role deletion CRD validation", func() {
 		return postgresv1alpha1.RoleSpec{Deletion: &postgresv1alpha1.RoleDeletionSpec{ReassignOwnedTo: target}}
 	}
 
-	for _, target := range []string{"postgres", "pgop_x", "pg_x", strings.Repeat("a", 64)} {
+	for _, target := range []string{defaultDatabaseName, "pgop_x", reservedPgPrefixed, strings.Repeat("a", 64)} {
 		It(fmt.Sprintf("rejects reassignOwnedTo %q", target), func() {
 			Expect(apierrors.IsInvalid(create(deletion(target)))).To(BeTrue())
 		})
