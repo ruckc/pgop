@@ -64,10 +64,27 @@ type PasswordRotationSpec struct {
 	Every metav1.Duration `json:"every"`
 }
 
+// RoleDeletionSpec configures how a Role is deleted.
+type RoleDeletionSpec struct {
+	// reassignOwnedTo is the PostgreSQL name of a role that takes over the
+	// objects the deleted role owns (REASSIGN OWNED BY role TO target, then
+	// DROP OWNED BY role, in every database that allows connections). The
+	// deleted role must be a member of the target (pg_has_role USAGE), and the
+	// target must exist and must not be a superuser, "postgres", "pgop_*" or
+	// "pg_*". A role that owns a database is never reassigned: change the
+	// Database spec.owner first.
+	// +optional
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:XValidation:rule="self != 'postgres' && !self.startsWith('pgop_') && !self.startsWith('pg_')",message="reassignOwnedTo must not be postgres or start with 'pg_' or 'pgop_'"
+	ReassignOwnedTo string `json:"reassignOwnedTo,omitempty"`
+}
+
 // RoleSpec defines the desired state of Role
 // +kubebuilder:validation:XValidation:rule="self.clusterRef.name == oldSelf.clusterRef.name",message="clusterRef is immutable; create a new Role for another Cluster"
 // +kubebuilder:validation:XValidation:rule="!(has(self.passwordSecretRef) && has(self.passwordRotation))",message="passwordRotation cannot be combined with passwordSecretRef; rotate the referenced Secret instead"
 // +kubebuilder:validation:XValidation:rule="has(oldSelf.roleName) == has(self.roleName) && (!has(self.roleName) || self.roleName == oldSelf.roleName)",message="roleName is immutable"
+// +kubebuilder:validation:XValidation:rule="!has(self.deletion) || !has(self.roleName) || self.deletion.reassignOwnedTo != self.roleName",message="deletion.reassignOwnedTo must not be the role itself"
 // +kubebuilder:validation:XValidation:rule="!has(self.memberOf) || !has(self.memberships) || self.memberOf.all(r, !self.memberships.exists(m, m.role == r))",message="a role must not be listed in both memberOf and memberships"
 type RoleSpec struct {
 	// clusterRef references the PostgreSQL Cluster this role belongs to
@@ -213,6 +230,12 @@ type RoleSpec struct {
 	// +listMapKey=parameter
 	// +kubebuilder:validation:MaxItems=256
 	ParameterGrants []ParameterGrantSpec `json:"parameterGrants,omitempty"`
+
+	// deletion configures what happens to objects the role owns when this Role
+	// is deleted. Unset, objects the role owns block the drop (reported with
+	// reason RoleDropBlocked).
+	// +optional
+	Deletion *RoleDeletionSpec `json:"deletion,omitempty"`
 
 	// settings are per-role defaults for configuration parameters (ALTER ROLE
 	// ... SET name TO value). They apply to new sessions of this role only

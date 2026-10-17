@@ -277,9 +277,11 @@ spec:
   `schemas[].defaultPrivileges` on the ones a role creates later; see
   [Object Grants](#object-grants) and
   [Default Privileges](#default-privileges).
-- There is no arbitrary SQL (`initSQL`): pgop declares grants instead (issue
-  #24). Objects your own roles own can also be granted on from your
-  migrations.
+- There is no arbitrary SQL (`initSQL`): everything above is declared. Objects
+  your own roles own can also be granted on from your migrations. Marking
+  functions `LEAKPROOF`, creating event triggers and granting on
+  superuser-owned C or `SECURITY DEFINER` functions remain bootstrap tasks
+  for a superuser.
 
 !!! note "Upgrade note: schema privileges are validated"
     Earlier versions passed `schemas[].grants[].privileges` into the `GRANT`

@@ -45,6 +45,10 @@ spec:
   # passwordSecretRef:
   #   name: app-user-password
   #   key: password
+  # Optional: hand the objects the role owns to another role when this Role is
+  # deleted (the role must be a member of it; see docs/user-guide/roles.md).
+  # deletion:
+  #   reassignOwnedTo: app_owner
   # Optional: rotate the generated password (Go duration, minimum 1h).
   # passwordRotation:
   #   every: 720h
