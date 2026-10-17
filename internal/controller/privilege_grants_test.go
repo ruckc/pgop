@@ -1077,7 +1077,7 @@ var _ = Describe("Settings and parameter grants", func() {
 
 		It("refuses denylisted and superuser-only parameters but applies the rest", func() {
 			f := &fakeGrantClient{contexts: map[string]string{
-				testWorkMem: "user", grantTestSuperuserParam: "superuser", grantTestPostmasterParam: "postmaster",
+				testWorkMem: "user", grantTestSuperuserParam: pgContextSuperuser, grantTestPostmasterParam: "postmaster",
 			}}
 			db := &postgresv1alpha1.Database{Spec: postgresv1alpha1.DatabaseSpec{Settings: map[string]string{
 				testWorkMem: grantTestValue, grantTestSuperuserParam: "none", grantTestPostmasterParam: "1GB",

@@ -134,7 +134,7 @@ var _ = Describe("Role policy CRD validation", func() {
 
 		It("rejects superuser as an attribute", func() {
 			expectInvalid(create(newCluster(&postgresv1alpha1.RolePolicySpec{
-				AllowedAttributes: []postgresv1alpha1.RoleAttribute{"superuser"},
+				AllowedAttributes: []postgresv1alpha1.RoleAttribute{pgContextSuperuser},
 			})))
 		})
 

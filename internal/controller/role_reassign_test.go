@@ -34,7 +34,7 @@ func TestCheckReassignTarget(t *testing.T) {
 	}{
 		{"member", ogSchema, target, member, false},
 		{"not a member", ogSchema, target, postgres.ReassignTargetInfo{Exists: true}, true},
-		{"superuser", ogSchema, target, postgres.ReassignTargetInfo{Exists: true, Super: true, OldHasUsage: true}, true},
+		{pgContextSuperuser, ogSchema, target, postgres.ReassignTargetInfo{Exists: true, Super: true, OldHasUsage: true}, true},
 		{"missing", ogSchema, target, postgres.ReassignTargetInfo{}, true},
 		{"self", ogSchema, ogSchema, member, true},
 		{defaultDatabaseName, ogSchema, defaultDatabaseName, member, true},
