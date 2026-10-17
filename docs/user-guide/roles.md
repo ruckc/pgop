@@ -552,8 +552,46 @@ on tables granted outside pgop (or by default privileges pgop no longer
 tracks), or default privileges set by hand, is left alone. The drop then fails, and the Role reports
 `Available=False` with reason `RoleDropBlocked` and PostgreSQL's list of
 dependents. pgop retries every 30 seconds until you resolve them (for
-example with `REASSIGN OWNED BY ... TO ...` and `DROP OWNED BY ...` in each
-database), after which the finalizer is removed.
+example with `spec.deletion.reassignOwnedTo`, see below, or by hand with
+`REASSIGN OWNED BY ... TO ...` and `DROP OWNED BY ...` in each database),
+after which the finalizer is removed.
+
+### Deleting a Role that owns objects
+
+`spec.deletion.reassignOwnedTo` names a PostgreSQL role that takes over what
+the deleted role owns:
+
+```yaml
+spec:
+  memberships:
+    - role: app_owner
+  deletion:
+    reassignOwnedTo: app_owner
+```
+
+Before the drop, in every database where the role owns objects and that
+accepts connections, pgop runs `REASSIGN OWNED BY <role> TO <target>` and then
+`DROP OWNED BY <role>` in one transaction (the second statement only removes
+the privileges and default privileges that remain, as the objects have moved).
+Without `deletion`, behaviour is unchanged.
+
+pgop refuses (`Available=False`, reason `RoleDropBlocked`, retried every 30
+seconds, nothing reassigned) when:
+
+- the target does not exist, is a superuser, is `postgres`, or starts with
+  `pgop_` or `pg_`, or is the role itself;
+- the deleted role is not a member of the target (`pg_has_role(..., 'USAGE')`).
+  pgop connects as a superuser, so it enforces PostgreSQL's rule that the
+  issuer holds the privileges of both roles; otherwise a Role author could
+  hand `SECURITY DEFINER` functions to a more privileged role. Grant the
+  membership first, for example with `spec.memberships`;
+- the role owns a database. `REASSIGN OWNED` would silently change the owner
+  of a pgop `Database`; change `Database.spec.owner` first.
+
+Databases that do not accept connections, or that cannot be reached, are
+skipped and named in the condition message if `DROP ROLE` then fails.
+Changing `Database.spec.schemas[].owner` never reassigns the objects inside
+the schema.
 
 ## Role Types
 
