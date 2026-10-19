@@ -962,6 +962,11 @@ func (r *ClusterReconciler) reconcileStatefulSet(ctx context.Context, cluster *p
 	if replication {
 		initContainers, volumes = applyReplicationTemplate(cluster, secret.Name, layout, &container, volumes)
 	}
+	if layout.NeedsVolumeFix() {
+		initContainers = append([]corev1.Container{
+			buildVolumePermissionsInitContainer(container.Image, layout, cluster.Spec.Resources),
+		}, initContainers...)
+	}
 	containers := append([]corev1.Container{container}, sidecars...)
 
 	sts := &appsv1.StatefulSet{}
@@ -1121,13 +1126,58 @@ func (r *ClusterReconciler) detectExistingVolume(ctx context.Context, cluster *p
 // every PostgreSQL StatefulSet pod.
 func postgresPodSecurityContext() *corev1.PodSecurityContext {
 	return &corev1.PodSecurityContext{
-		RunAsNonRoot: func() *bool { b := true; return &b }(),
+		// runAsNonRoot is set on each long-running container instead of the
+		// pod, because the volume-permissions init container runs as root.
 		SeccompProfile: &corev1.SeccompProfile{
 			Type: corev1.SeccompProfileTypeRuntimeDefault,
 		},
 		RunAsUser:  func() *int64 { i := int64(999); return &i }(),
 		RunAsGroup: func() *int64 { i := int64(999); return &i }(),
 		FSGroup:    func() *int64 { i := int64(999); return &i }(),
+	}
+}
+
+// volumePermissionsContainerName is the name of the root init container that
+// fixes ownership of the data volume root on PG <= 17.
+const volumePermissionsContainerName = "volume-permissions"
+
+// volumePermissionsScript chowns the data mount root to the postgres user and
+// restricts it to 0700 (initdb requires 0700 or 0750). It is a no-op when the
+// directory is already owned by uid 999 (provisioners honouring fsGroup).
+const volumePermissionsScript = `set -e
+if [ "$(stat -c %u "$DATA_DIR")" != "999" ]; then
+  chown 999:999 "$DATA_DIR"
+fi
+chmod 0700 "$DATA_DIR"`
+
+// buildVolumePermissionsInitContainer builds the init container that makes the
+// data volume root usable by initdb on PG <= 17, where the PVC is mounted
+// directly at PGDATA. Provisioners that ignore fsGroup (e.g. Kind local-path)
+// hand out a root-owned directory which a non-root process cannot fix. It runs
+// as root with ALL capabilities dropped except CHOWN, FOWNER and DAC_OVERRIDE,
+// and mounts only the data volume.
+func buildVolumePermissionsInitContainer(image string, layout postgresLayout, resources corev1.ResourceRequirements) corev1.Container {
+	root := int64(0)
+	f, t := false, true
+	return corev1.Container{
+		Name:    volumePermissionsContainerName,
+		Image:   image,
+		Command: []string{shBin, "-c", volumePermissionsScript},
+		Env:     []corev1.EnvVar{{Name: "DATA_DIR", Value: layout.MountPath}},
+		VolumeMounts: []corev1.VolumeMount{
+			{Name: dataVolumeName, MountPath: layout.MountPath},
+		},
+		Resources: resources,
+		SecurityContext: &corev1.SecurityContext{
+			RunAsUser:                &root,
+			RunAsNonRoot:             &f,
+			AllowPrivilegeEscalation: &f,
+			ReadOnlyRootFilesystem:   &t,
+			Capabilities: &corev1.Capabilities{
+				Drop: []corev1.Capability{"ALL"},
+				Add:  []corev1.Capability{"CHOWN", "FOWNER", "DAC_OVERRIDE"},
+			},
+		},
 	}
 }
 
@@ -1147,6 +1197,7 @@ func buildPostgresContainer(secret *corev1.Secret, image string, port int32, res
 			},
 		},
 		SecurityContext: &corev1.SecurityContext{
+			RunAsNonRoot:             func() *bool { b := true; return &b }(),
 			AllowPrivilegeEscalation: func() *bool { b := false; return &b }(),
 			Capabilities: &corev1.Capabilities{
 				Drop: []corev1.Capability{"ALL"},

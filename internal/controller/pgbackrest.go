@@ -660,7 +660,9 @@ var pgbackrestLabelPattern = regexp.MustCompile(`^[0-9]{8}-[0-9]{6}F(_[0-9]{8}-[
 // (uid/gid 999), so a restore writes the data directory with the ownership
 // PostgreSQL expects and the TLS key is readable through the fsGroup.
 func pgbackrestPodSecurityContext() *corev1.PodSecurityContext {
-	return postgresPodSecurityContext()
+	sc := postgresPodSecurityContext()
+	sc.RunAsNonRoot = func() *bool { b := true; return &b }()
+	return sc
 }
 
 // pausedForRestore reports whether a physical Restore stopped the Cluster.
