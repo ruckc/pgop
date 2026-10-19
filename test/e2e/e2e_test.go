@@ -707,6 +707,7 @@ spec:
 	RegisterParametersTests()
 	RegisterReplicationTests()
 	RegisterPhysicalBackupTests()
+	RegisterVolumePermissionsTests()
 })
 
 // serviceAccountToken returns a token for the specified service account in the given namespace.

@@ -59,7 +59,7 @@ After editing `*_types.go` or `+kubebuilder:` markers, always run `make manifest
 - All owned resources set `controllerutil.SetControllerReference` for automatic GC.
 - Controllers watch owned resources with `.Owns()` so mutations trigger re-reconciliation.
 - Status uses `metav1.Condition` with `meta.SetStatusCondition`.
-- Pods run as UID 999 (postgres), non-root, drop ALL capabilities, RuntimeDefault seccomp.
+- Pods run as UID 999 (postgres), non-root, drop ALL capabilities, RuntimeDefault seccomp. `runAsNonRoot` is set on each long-running container (not the pod). Exception: for PG<=17 the `volume-permissions` init container runs as root (drops ALL, adds back only CHOWN, FOWNER, DAC_OVERRIDE) to chown the data volume root, since provisioners like Kind local-path ignore `fsGroup`.
 
 ## Scaffold Rules
 

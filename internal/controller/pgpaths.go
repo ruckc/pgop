@@ -45,6 +45,13 @@ type postgresLayout struct {
 	PGDATA string
 }
 
+// NeedsVolumeFix reports whether the data PVC is mounted directly at PGDATA
+// (PG <= 17), in which case initdb needs the volume root itself to be owned by
+// uid 999 and a volume-permissions init container is required.
+func (l postgresLayout) NeedsVolumeFix() bool {
+	return l.MountPath == l.PGDATA
+}
+
 // layoutForMajor returns the mount path and PGDATA for the given PostgreSQL
 // major version, following the official image conventions described above.
 func layoutForMajor(major int) postgresLayout {
