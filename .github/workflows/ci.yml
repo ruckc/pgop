@@ -68,6 +68,91 @@ jobs:
           go mod tidy
           make test
 
+  test-integration:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        # postgres:18
+        image: postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336
+        env:
+          # POSTGRES_USER becomes a superuser, as the integration tests require.
+          POSTGRES_USER: pgop_operator
+          POSTGRES_PASSWORD: pw
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U pgop_operator"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      PGOP_TEST_PGHOST: 127.0.0.1
+      PGOP_TEST_PGPORT: "5432"
+      PGOP_TEST_PGUSER: pgop_operator
+      PGOP_TEST_PGPASSWORD: pw
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.3
+
+      - name: Setup Go
+        uses: actions/setup-go@v6.4.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Cache Go build cache
+        uses: actions/cache@v5.0.5
+        with:
+          path: ~/.cache/go-build
+          key: ${{ runner.os }}-go-build-${{ hashFiles('**/go.sum') }}
+          restore-keys: ${{ runner.os }}-go-build-
+
+      # TestExtensionFixturesIntegration skips unless the pgop_evs/pgop_evt
+      # fixture extensions are installed. Extension files are read at
+      # CREATE EXTENSION time, so no restart is needed.
+      # NOTE: the path is tied to the postgres major version (18) of the service.
+      - name: Install extension fixtures into the postgres service
+        run: |
+          CID=$(docker ps --filter "ancestor=postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336" -q | head -1)
+          if [ -z "$CID" ]; then
+            CID=$(docker ps --filter "publish=5432" -q | head -1)
+          fi
+          test -n "$CID"
+          docker cp internal/controller/testdata/extensions/. "$CID:/usr/share/postgresql/18/extension/"
+
+      - name: Run integration tests
+        run: go test ./internal/controller/ ./internal/postgres/ -run Integration -count=1 -v 2>&1 | tee it.log
+
+      - name: Verify integration tests ran and were not skipped
+        run: |
+          if grep -E '^\s*--- SKIP' it.log; then
+            echo "Integration tests were skipped" >&2
+            exit 1
+          fi
+          PASSED=$(grep -cE '^--- PASS: Test.*Integration' it.log || true)
+          if [ "$PASSED" -lt 6 ]; then
+            echo "Expected 6 passing integration tests, got $PASSED" >&2
+            exit 1
+          fi
+
+  docker-build:
+    name: Docker Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4.1.0
+
+      - name: Build image (no push)
+        uses: docker/build-push-action@v7.2.0
+        with:
+          context: .
+          push: false
+          cache-from: type=gha
+
   test-e2e:
     name: E2E Tests
     runs-on: ubuntu-latest
@@ -133,7 +218,7 @@ jobs:
 
   prepare-release:
     name: Prepare Release
-    needs: [lint, test, test-e2e, lint-helm, check-conflict-markers]
+    needs: [lint, test, test-integration, docker-build, test-e2e, lint-helm, check-conflict-markers]
     # Only run on main or manual dispatch, and skip if this push is itself a release merge
     if: |
       (github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch') &&
