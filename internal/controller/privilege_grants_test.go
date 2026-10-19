@@ -952,7 +952,7 @@ var _ = Describe("Privilege grants", func() {
 				{Name: "ext"}, {Name: grantTestOther}, {Name: recordedSchema}, {Name: "su_owned", Owner: polDBA}, {Name: "pg_catalog"},
 			}}}
 			db.Status.CreatedSchemas = []string{recordedSchema}
-			managed, refused, err := reconcileSchemas(ctx, s, db, grantTestAdmin)
+			managed, refused, err := reconcileSchemas(ctx, s, db, grantTestAdmin, nil)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(managed).To(Equal([]string{"fresh", "fresh_owned", ownedByDBSchema, declaredSchema, publicSchemaName, recordedSchema}))
 			Expect(s.calls).To(Equal([]string{
@@ -974,13 +974,13 @@ var _ = Describe("Privilege grants", func() {
 			s := &fakeSchemaClient{dbOwner: ogtLegacy, owners: map[string]string{ogtOldSchema: ogtLegacy}}
 			db := &postgresv1alpha1.Database{Spec: postgresv1alpha1.DatabaseSpec{Schemas: []postgresv1alpha1.SchemaSpec{
 				{Name: ogtOldSchema}}}}
-			managed, refused, err := reconcileSchemas(ctx, s, db, "")
+			managed, refused, err := reconcileSchemas(ctx, s, db, "", nil)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(managed).To(BeEmpty())
 			Expect(refused).To(MatchError(ContainSubstring(ogtOldSchema + " (owned by legacy_owner)")))
 
 			By("managing it once the Database declares that owner")
-			managed, _, err = reconcileSchemas(ctx, s, db, ogtLegacy)
+			managed, _, err = reconcileSchemas(ctx, s, db, ogtLegacy, nil)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(managed).To(Equal([]string{ogtOldSchema}))
 		})
@@ -996,7 +996,7 @@ var _ = Describe("Privilege grants", func() {
 				{Name: publicSchemaName, Owner: grantTestRole},
 			}}}
 			db.Status.CreatedSchemas = []string{publicSchemaName}
-			managed, refused, err := reconcileSchemas(ctx, s, db, "")
+			managed, refused, err := reconcileSchemas(ctx, s, db, "", nil)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(refused).NotTo(HaveOccurred())
 			Expect(managed).To(Equal([]string{publicSchemaName}))
