@@ -74,6 +74,7 @@ jobs:
     services:
       postgres:
         # postgres:18
+        # Not tracked by Dependabot: bump manually (docker buildx imagetools inspect postgres:18) and update the digest in the fixture step too.
         image: postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336
         env:
           # POSTGRES_USER becomes a superuser, as the integration tests require.
@@ -122,6 +123,7 @@ jobs:
           docker cp internal/controller/testdata/extensions/. "$CID:/usr/share/postgresql/18/extension/"
 
       - name: Run integration tests
+        shell: bash
         run: go test ./internal/controller/ ./internal/postgres/ -run Integration -count=1 -v 2>&1 | tee it.log
 
       - name: Verify integration tests ran and were not skipped
@@ -130,6 +132,7 @@ jobs:
             echo "Integration tests were skipped" >&2
             exit 1
           fi
+          # Bump this count when adding a new top-level *Integration test.
           PASSED=$(grep -cE '^--- PASS: Test.*Integration' it.log || true)
           if [ "$PASSED" -lt 6 ]; then
             echo "Expected 6 passing integration tests, got $PASSED" >&2

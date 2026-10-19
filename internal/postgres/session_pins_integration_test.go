@@ -83,7 +83,7 @@ func TestOperatorSessionPinsIntegration(t *testing.T) {
 		exec(`ALTER DATABASE ` + db + ` SET ` + set)
 	}
 	// Only on newer servers: idle_session_timeout (14+), transaction_timeout (17+).
-	for _, set := range []string{`idle_session_timeout = 1`, `transaction_timeout = 1`} {
+	for _, set := range []string{`idle_session_timeout = 1`, `transaction_timeout = 5000`} {
 		_, _ = admin.db.ExecContext(ctx, `ALTER DATABASE `+db+` SET `+set)
 	}
 	exec(`ALTER ROLE ` + quoteIdent(cfg.User) + ` IN DATABASE ` + db + ` SET search_path = evil2`)
