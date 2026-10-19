@@ -52,7 +52,18 @@ func RegisterVolumePermissionsTests() {
 
 		versions := map[string]string{"volperm-16": "postgres:16", "volperm-17": "postgres:17"}
 
+		// The PG<=17 root init container adds CHOWN/FOWNER/DAC_OVERRIDE, which
+		// the namespace's "restricted" Pod Security level rejects. Relax to
+		// "baseline" (which permits those capabilities) for these specs only.
+		BeforeAll(func() {
+			_, err := kubectl("label", "ns", namespace, "--overwrite",
+				"pod-security.kubernetes.io/enforce=baseline")
+			Expect(err).NotTo(HaveOccurred())
+		})
+
 		AfterAll(func() {
+			_, _ = kubectl("label", "ns", namespace, "--overwrite",
+				"pod-security.kubernetes.io/enforce=restricted")
 			for name := range versions {
 				_, _ = kubectl("delete", "cluster", name, "--ignore-not-found", "--wait=false")
 			}
