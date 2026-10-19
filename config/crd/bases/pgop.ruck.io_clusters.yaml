@@ -642,6 +642,12 @@ spec:
                   type: string
                 type: array
                 x-kubernetes-list-type: atomic
+              pgopImageSwappedFrom:
+                description: |-
+                  pgopImageSwappedFrom is the spec.image that pgop's Postgres+pgBackRest
+                  image replaced for physical backups. After the Backup is removed, the
+                  pgop image is kept only while spec.image still equals this value.
+                type: string
               readOnlyEndpoint:
                 description: |-
                   readOnlyEndpoint is the internal endpoint of the "<cluster>-ro"

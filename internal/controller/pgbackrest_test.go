@@ -39,6 +39,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -390,6 +391,140 @@ var _ = Describe("Physical backups (envtest)", func() {
 		Expect(apierrors.IsNotFound(err)).To(BeTrue())
 	})
 
+	for _, changed := range []string{"postgres:17-alpine", "postgres:17-trixie"} {
+		It("keeps pgop's image after the Backup is removed only while spec.image is unchanged: "+changed, func() {
+			const original = "postgres:17.5-trixie"
+			clusterName := "pbkp-" + suffix
+			cluster := &postgresv1alpha1.Cluster{
+				ObjectMeta: metav1.ObjectMeta{Name: clusterName, Namespace: ns},
+				Spec:       postgresv1alpha1.ClusterSpec{Image: original, Replicas: 1, Port: 5432},
+			}
+			Expect(k8sClient.Create(ctx, cluster)).To(Succeed())
+			defer func() {
+				_ = k8sClient.Get(ctx, client.ObjectKeyFromObject(cluster), cluster)
+				cluster.Finalizers = nil
+				_ = k8sClient.Update(ctx, cluster)
+				_ = k8sClient.Delete(ctx, cluster)
+			}()
+			recorder := events.NewFakeRecorder(20)
+			r := &ClusterReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), Recorder: recorder}
+			req := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(cluster)}
+			reconcileOnce := func() {
+				_, err := r.Reconcile(ctx, req)
+				Expect(err).NotTo(HaveOccurred())
+			}
+			image := func() string {
+				s := &appsv1.StatefulSet{}
+				Expect(k8sClient.Get(ctx, req.NamespacedName, s)).To(Succeed())
+				return s.Spec.Template.Spec.Containers[0].Image
+			}
+			current := func() *postgresv1alpha1.Cluster {
+				c := &postgresv1alpha1.Cluster{}
+				Expect(k8sClient.Get(ctx, req.NamespacedName, c)).To(Succeed())
+				return c
+			}
+			drain := func() []string {
+				var got []string
+				for {
+					select {
+					case e := <-recorder.Events:
+						got = append(got, e)
+					default:
+						return got
+					}
+				}
+			}
+			reconcileOnce()
+
+			By("creating a physical Backup: the image is swapped and the original recorded")
+			backup := &postgresv1alpha1.Backup{
+				ObjectMeta: metav1.ObjectMeta{Name: "pbkp-backup-" + suffix, Namespace: ns},
+				Spec:       physicalBackupSpec(clusterName),
+			}
+			Expect(k8sClient.Create(ctx, backup)).To(Succeed())
+			reconcileOnce()
+			Expect(image()).To(Equal(PgopPostgresImage(17)))
+			Expect(current().Status.PgopImageSwappedFrom).To(Equal(original))
+			drain()
+
+			By("making the Backup invalid: a Warning, and the pod is unchanged")
+			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(backup), backup)).To(Succeed())
+			backup.Spec.Destination.S3.Endpoint = "http://s3.example.com:9000"
+			Expect(k8sClient.Update(ctx, backup)).To(Succeed())
+			reconcileOnce()
+			reconcileOnce()
+			Expect(image()).To(Equal(PgopPostgresImage(17)))
+			Expect(current().Status.PgopImageSwappedFrom).To(Equal(original))
+			Expect(drain()).To(ConsistOf(HavePrefix(corev1.EventTypeWarning + " " + reasonInvalid)))
+
+			By("deleting the Backup: one Disabled Warning, however often it reconciles")
+			Expect(k8sClient.Delete(ctx, backup)).To(Succeed())
+			Eventually(func() bool {
+				return apierrors.IsNotFound(k8sClient.Get(ctx, client.ObjectKeyFromObject(backup), &postgresv1alpha1.Backup{}))
+			}).Should(BeTrue())
+			for range 4 {
+				reconcileOnce()
+			}
+			Expect(image()).To(Equal(PgopPostgresImage(17)))
+			pb := meta.FindStatusCondition(current().Status.Conditions, ConditionTypePhysicalBackup)
+			Expect(pb).NotTo(BeNil())
+			Expect(pb.Reason).To(Equal("Disabled"))
+			Expect(drain()).To(ConsistOf(HavePrefix(corev1.EventTypeWarning + " Disabled")))
+
+			By("changing spec.image releases the pgop image")
+			c := current()
+			c.Spec.Image = changed
+			Expect(k8sClient.Update(ctx, c)).To(Succeed())
+			reconcileOnce()
+			Expect(image()).To(Equal(changed))
+			c = current()
+			Expect(c.Status.PgopImageSwappedFrom).To(BeEmpty())
+			Expect(meta.FindStatusCondition(c.Status.Conditions, ConditionTypePhysicalBackup)).To(BeNil())
+			Expect(drain()).To(BeEmpty())
+		})
+	}
+
+	It("pins the current spec.image of a Cluster on pgop's image that has no marker", func() {
+		const original = "postgres:17.5-trixie"
+		clusterName := "pbku-" + suffix
+		cluster := &postgresv1alpha1.Cluster{
+			ObjectMeta: metav1.ObjectMeta{Name: clusterName, Namespace: ns},
+			Spec:       postgresv1alpha1.ClusterSpec{Image: original, Replicas: 1, Port: 5432},
+		}
+		Expect(k8sClient.Create(ctx, cluster)).To(Succeed())
+		defer func() {
+			_ = k8sClient.Get(ctx, client.ObjectKeyFromObject(cluster), cluster)
+			cluster.Finalizers = nil
+			_ = k8sClient.Update(ctx, cluster)
+			_ = k8sClient.Delete(ctx, cluster)
+		}()
+		r := &ClusterReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		req := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(cluster)}
+		_, err := r.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+
+		By("simulating a Cluster from before the marker: pgop's image and no marker")
+		s := &appsv1.StatefulSet{}
+		Expect(k8sClient.Get(ctx, req.NamespacedName, s)).To(Succeed())
+		s.Spec.Template.Spec.Containers[0].Image = PgopPostgresImage(17)
+		Expect(k8sClient.Update(ctx, s)).To(Succeed())
+
+		_, err = r.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(k8sClient.Get(ctx, req.NamespacedName, s)).To(Succeed())
+		Expect(s.Spec.Template.Spec.Containers[0].Image).To(Equal(PgopPostgresImage(17)))
+		Expect(k8sClient.Get(ctx, req.NamespacedName, cluster)).To(Succeed())
+		Expect(cluster.Status.PgopImageSwappedFrom).To(Equal(original))
+
+		By("changing spec.image releases it")
+		cluster.Spec.Image = "postgres:17-alpine"
+		Expect(k8sClient.Update(ctx, cluster)).To(Succeed())
+		_, err = r.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(k8sClient.Get(ctx, req.NamespacedName, s)).To(Succeed())
+		Expect(s.Spec.Template.Spec.Containers[0].Image).To(Equal("postgres:17-alpine"))
+	})
+
 	It("schedules pgBackRest backup Jobs and records them as BackupRuns", func() {
 		clusterName := "pbkj-" + suffix
 		cluster := &postgresv1alpha1.Cluster{
@@ -641,3 +776,27 @@ func (f fakeArchiveServer) ArchiverStats(context.Context) (postgres.ArchiverStat
 }
 func (f fakeArchiveServer) TailFile(context.Context, string) (string, error) { return f.marker, nil }
 func (f fakeArchiveServer) Close() error                                     { return nil }
+
+var _ = Describe("keptPgopImage", func() {
+	pgop := PgopPostgresImage(17)
+	cluster := func(image, swappedFrom string) *postgresv1alpha1.Cluster {
+		c := &postgresv1alpha1.Cluster{Spec: postgresv1alpha1.ClusterSpec{Image: image}}
+		c.Status.PgopImageSwappedFrom = swappedFrom
+		return c
+	}
+	It("keeps the pgop image while spec.image equals the recorded one", func() {
+		Expect(keptPgopImage(cluster("postgres:17-trixie", "postgres:17-trixie"), pgop)).To(Equal(pgop))
+	})
+	It("releases it when spec.image differs, even for an official image of the same major", func() {
+		Expect(keptPgopImage(cluster("postgres:17-alpine", "postgres:17-trixie"), pgop)).To(BeEmpty())
+	})
+	It("releases it without a recorded image", func() {
+		Expect(keptPgopImage(cluster("postgres:17-trixie", ""), pgop)).To(BeEmpty())
+	})
+	It("releases it for a different major", func() {
+		Expect(keptPgopImage(cluster("postgres:18", "postgres:18"), pgop)).To(BeEmpty())
+	})
+	It("returns nothing when the running image is not pgop's", func() {
+		Expect(keptPgopImage(cluster("postgres:17-trixie", "postgres:17-trixie"), "postgres:17-trixie")).To(BeEmpty())
+	})
+})

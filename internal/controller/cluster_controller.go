@@ -18,7 +18,6 @@ package controller
 
 import (
 	"bytes"
-	"cmp"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -190,7 +189,7 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// archives WAL with pgBackRest and runs the pgBackRest TLS server (see
 	// pgbackrest.go). Clusters without one keep their pod template.
 	// The pgBackRest TLS Secret must exist before a pod that mounts it starts.
-	backup, pgbackrestRecheckAt, err := r.preparePgbackrest(ctx, cluster)
+	backup, pgbackrestRecheckAt, backupState, err := r.preparePgbackrest(ctx, cluster)
 	if err != nil {
 		log.Error(err, "Failed to prepare physical backups")
 		return r.updateStatus(ctx, cluster, false, err)
@@ -231,7 +230,7 @@ func (r *ClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	} // else reconcileStatefulSet reports the layout error
 
 	// Reconcile StatefulSet
-	if err := r.reconcileStatefulSet(ctx, cluster, secret, replication, backup); err != nil {
+	if err := r.reconcileStatefulSet(ctx, cluster, secret, replication, backup, backupState); err != nil {
 		log.Error(err, "Failed to reconcile StatefulSet")
 		return r.updateStatus(ctx, cluster, false, err)
 	}
@@ -316,50 +315,70 @@ func earliest(a, b time.Time) time.Time {
 // preparePgbackrest returns the Cluster's physical Backup (nil without one)
 // and, with one, creates or renews the pgBackRest TLS Secret, returning when
 // it must be looked at again.
-func (r *ClusterReconciler) preparePgbackrest(ctx context.Context, cluster *postgresv1alpha1.Cluster) (*postgresv1alpha1.Backup, time.Time, error) {
-	backup, err := r.physicalBackup(ctx, cluster)
+func (r *ClusterReconciler) preparePgbackrest(ctx context.Context, cluster *postgresv1alpha1.Cluster) (*postgresv1alpha1.Backup, time.Time, physicalBackupState, error) {
+	backup, state, err := r.physicalBackup(ctx, cluster)
 	if err != nil || backup == nil {
-		return nil, time.Time{}, err
+		return nil, time.Time{}, state, err
 	}
 	recheckAt, err := r.reconcilePgbackrestTLS(ctx, cluster)
 	if err != nil {
-		return nil, time.Time{}, fmt.Errorf("failed to reconcile the pgBackRest TLS Secret: %w", err)
+		return nil, time.Time{}, state, fmt.Errorf("failed to reconcile the pgBackRest TLS Secret: %w", err)
 	}
-	return backup, recheckAt, nil
+	return backup, recheckAt, state, nil
+}
+
+// physicalBackupState is what physicalBackup learned about a Cluster without
+// a usable physical Backup, for keepPgopImage.
+type physicalBackupState struct {
+	// prev is the PhysicalBackup condition from before this reconcile.
+	prev *metav1.Condition
+	// invalid: a Backup exists but cannot be used (the pod is not changed).
+	invalid bool
 }
 
 // physicalBackup returns the physical Backup of the Cluster (see
 // physicalBackupFor), or nil. A Backup whose settings pgBackRest cannot use is
 // ignored here (the Backup reports why), so the pod is not changed for it.
-func (r *ClusterReconciler) physicalBackup(ctx context.Context, cluster *postgresv1alpha1.Cluster) (*postgresv1alpha1.Backup, error) {
+func (r *ClusterReconciler) physicalBackup(ctx context.Context, cluster *postgresv1alpha1.Cluster) (*postgresv1alpha1.Backup, physicalBackupState, error) {
+	var state physicalBackupState
 	backup, err := physicalBackupFor(ctx, r.Client, cluster)
 	if err != nil {
-		return nil, err
+		return nil, state, err
+	}
+	if prev := meta.FindStatusCondition(cluster.Status.Conditions, ConditionTypePhysicalBackup); prev != nil {
+		state.prev = prev.DeepCopy()
 	}
 	if backup == nil {
 		meta.RemoveStatusCondition(&cluster.Status.Conditions, ConditionTypePhysicalBackup)
-		return nil, nil
+		return nil, state, nil
 	}
 	// A Backup the Cluster cannot archive for (an unsupported image, an
 	// http:// endpoint, ...) never changes the pod; the Backup and the
 	// Cluster's PhysicalBackup condition report why.
 	if err := validatePhysicalBackupFor(backup, cluster); err != nil {
 		logf.FromContext(ctx).Info("Ignoring an invalid physical Backup", "backup", backup.Name, "reason", err.Error())
-		r.setPhysicalBackupCondition(cluster, metav1.ConditionFalse, reasonInvalid,
+		r.setPhysicalBackupCondition(cluster, state.prev, metav1.ConditionFalse, reasonInvalid,
 			fmt.Sprintf("Physical Backup %q is invalid, so WAL is not archived: %v", backup.Name, err))
-		return nil, nil
+		state.invalid = true
+		return nil, state, nil
 	}
-	r.setPhysicalBackupCondition(cluster, metav1.ConditionTrue, "Enabled",
+	// Remember the image the pgop image replaces, so it is kept after the
+	// Backup is removed only while spec.image stays the same.
+	cluster.Status.PgopImageSwappedFrom = ""
+	if image, err := postgresImageForBackups(cluster, backup); err == nil && image != effectiveImage(cluster) {
+		cluster.Status.PgopImageSwappedFrom = effectiveImage(cluster)
+	}
+	r.setPhysicalBackupCondition(cluster, state.prev, metav1.ConditionTrue, "Enabled",
 		fmt.Sprintf("WAL is archived for physical Backup %q", backup.Name))
-	return backup, nil
+	return backup, state, nil
 }
 
 // setPhysicalBackupCondition sets the PhysicalBackup condition, with a
-// Warning event when archiving stops being enabled.
-func (r *ClusterReconciler) setPhysicalBackupCondition(cluster *postgresv1alpha1.Cluster, status metav1.ConditionStatus, reason, msg string) {
+// Warning event when archiving stops being enabled. prev is the condition
+// from before this reconcile; the event fires only when it differs.
+func (r *ClusterReconciler) setPhysicalBackupCondition(cluster *postgresv1alpha1.Cluster, prev *metav1.Condition, status metav1.ConditionStatus, reason, msg string) {
 	if status != metav1.ConditionTrue && r.Recorder != nil {
-		if prev := meta.FindStatusCondition(cluster.Status.Conditions, ConditionTypePhysicalBackup); prev == nil ||
-			prev.Status != status || prev.Reason != reason {
+		if prev == nil || prev.Status != status || prev.Reason != reason {
 			r.Recorder.Eventf(cluster, nil, corev1.EventTypeWarning, reason, "PhysicalBackup", "%s", msg)
 		}
 	}
@@ -905,7 +924,7 @@ func (r *ClusterReconciler) reconcileService(ctx context.Context, cluster *postg
 }
 
 func (r *ClusterReconciler) reconcileStatefulSet(ctx context.Context, cluster *postgresv1alpha1.Cluster, secret *corev1.Secret,
-	replication bool, backup *postgresv1alpha1.Backup) error {
+	replication bool, backup *postgresv1alpha1.Backup, backupState physicalBackupState) error {
 	stsName := cluster.Name
 
 	// Set defaults
@@ -973,7 +992,7 @@ func (r *ClusterReconciler) reconcileStatefulSet(ctx context.Context, cluster *p
 	err = r.Get(ctx, types.NamespacedName{Name: stsName, Namespace: cluster.Namespace}, sts)
 	if err == nil {
 		if backup == nil && len(sts.Spec.Template.Spec.Containers) > 0 {
-			r.keepPgopImage(cluster, sts.Spec.Template.Spec.Containers[0].Image, containers, initContainers)
+			r.keepPgopImage(cluster, backupState, sts.Spec.Template.Spec.Containers[0].Image, containers, initContainers)
 		}
 		replicas := statefulSetReplicas(cluster, sts)
 		if pausedForRestore(cluster) {
@@ -1631,21 +1650,29 @@ func (r *ClusterReconciler) clustersForTLSSecret(ctx context.Context, obj client
 // the official image could change the C library and corrupt text indexes.
 // WAL archiving and the sidecar are removed as usual; the PhysicalBackup
 // condition tells how to pick the image explicitly.
-func (r *ClusterReconciler) keepPgopImage(cluster *postgresv1alpha1.Cluster, running string,
+func (r *ClusterReconciler) keepPgopImage(cluster *postgresv1alpha1.Cluster, state physicalBackupState, running string,
 	containers, initContainers []corev1.Container) {
+	if cluster.Status.PgopImageSwappedFrom == "" && strings.HasPrefix(running, pgopPostgresImageRepository+":") &&
+		effectiveImage(cluster) != running {
+		// A Cluster from before the marker existed: pin the current spec.image.
+		cluster.Status.PgopImageSwappedFrom = effectiveImage(cluster)
+	}
 	kept := keptPgopImage(cluster, running)
 	if kept == "" {
+		if !state.invalid {
+			cluster.Status.PgopImageSwappedFrom = ""
+		}
 		return
 	}
 	containers[0].Image = kept
 	for i := range initContainers {
 		initContainers[i].Image = kept
 	}
-	if meta.FindStatusCondition(cluster.Status.Conditions, ConditionTypePhysicalBackup) == nil {
-		r.setPhysicalBackupCondition(cluster, metav1.ConditionFalse, "Disabled", fmt.Sprintf(
+	if !state.invalid {
+		r.setPhysicalBackupCondition(cluster, state.prev, metav1.ConditionFalse, "Disabled", fmt.Sprintf(
 			"No physical Backup: WAL is not archived. The Postgres+pgBackRest image %s is kept, because switching back to "+
 				"%s could change the C library (and text index collations); set spec.image to %s to keep it explicitly, "+
 				"or change spec.image once you have checked the collations",
-			kept, cmp.Or(cluster.Spec.Image, DefaultPostgresImage), kept))
+			kept, effectiveImage(cluster), kept))
 	}
 }
