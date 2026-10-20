@@ -450,7 +450,7 @@ var _ = Describe("Privilege grants", func() {
 			db := newDB([]postgresv1alpha1.DatabaseGrantSpec{{Role: grantTestRole, Privileges: connect}},
 				postgresv1alpha1.ManagedDatabaseGrant{Role: grantTestRole, Privileges: []string{postgres.PrivilegeConnect, postgres.PrivilegeCreate},
 					GrantOptions: []string{postgres.PrivilegeConnect, postgres.PrivilegeCreate}},
-				postgresv1alpha1.ManagedDatabaseGrant{Role: "old", Privileges: connect})
+				postgresv1alpha1.ManagedDatabaseGrant{Role: memOld, Privileges: connect})
 			Expect(reconcileDatabaseGrants(ctx, f, db, "app_db", testChecker(f, nil), nil)).To(Succeed())
 			Expect(f.calls).To(Equal([]string{
 				"revoke CONNECT on app_db from app optionOnly=true cascade=true",
@@ -947,12 +947,12 @@ var _ = Describe("Privilege grants", func() {
 				superusers: map[string]bool{DefaultOperatorUsername: true, polDBA: true},
 			}
 			db := &postgresv1alpha1.Database{Spec: postgresv1alpha1.DatabaseSpec{Schemas: []postgresv1alpha1.SchemaSpec{
-				{Name: "fresh"}, {Name: "fresh_owned", Owner: grantTestRole},
+				{Name: schemaFresh}, {Name: "fresh_owned", Owner: grantTestRole},
 				{Name: ownedByDBSchema, Owner: grantTestRole}, {Name: declaredSchema, Owner: grantTestRole}, {Name: publicSchemaName},
 				{Name: "ext"}, {Name: grantTestOther}, {Name: recordedSchema}, {Name: "su_owned", Owner: polDBA}, {Name: "pg_catalog"},
 			}}}
 			db.Status.CreatedSchemas = []string{recordedSchema}
-			managed, refused, err := reconcileSchemas(ctx, s, db, grantTestAdmin)
+			managed, refused, err := reconcileSchemas(ctx, s, db, grantTestAdmin, nil)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(managed).To(Equal([]string{"fresh", "fresh_owned", ownedByDBSchema, declaredSchema, publicSchemaName, recordedSchema}))
 			Expect(s.calls).To(Equal([]string{
@@ -974,13 +974,13 @@ var _ = Describe("Privilege grants", func() {
 			s := &fakeSchemaClient{dbOwner: ogtLegacy, owners: map[string]string{ogtOldSchema: ogtLegacy}}
 			db := &postgresv1alpha1.Database{Spec: postgresv1alpha1.DatabaseSpec{Schemas: []postgresv1alpha1.SchemaSpec{
 				{Name: ogtOldSchema}}}}
-			managed, refused, err := reconcileSchemas(ctx, s, db, "")
+			managed, refused, err := reconcileSchemas(ctx, s, db, "", nil)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(managed).To(BeEmpty())
 			Expect(refused).To(MatchError(ContainSubstring(ogtOldSchema + " (owned by legacy_owner)")))
 
 			By("managing it once the Database declares that owner")
-			managed, _, err = reconcileSchemas(ctx, s, db, ogtLegacy)
+			managed, _, err = reconcileSchemas(ctx, s, db, ogtLegacy, nil)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(managed).To(Equal([]string{ogtOldSchema}))
 		})
@@ -996,7 +996,7 @@ var _ = Describe("Privilege grants", func() {
 				{Name: publicSchemaName, Owner: grantTestRole},
 			}}}
 			db.Status.CreatedSchemas = []string{publicSchemaName}
-			managed, refused, err := reconcileSchemas(ctx, s, db, "")
+			managed, refused, err := reconcileSchemas(ctx, s, db, "", nil)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(refused).NotTo(HaveOccurred())
 			Expect(managed).To(Equal([]string{publicSchemaName}))
@@ -1080,7 +1080,7 @@ var _ = Describe("Settings and parameter grants", func() {
 				testWorkMem: "user", grantTestSuperuserParam: pgContextSuperuser, grantTestPostmasterParam: "postmaster",
 			}}
 			db := &postgresv1alpha1.Database{Spec: postgresv1alpha1.DatabaseSpec{Settings: map[string]string{
-				testWorkMem: grantTestValue, grantTestSuperuserParam: "none", grantTestPostmasterParam: "1GB",
+				testWorkMem: grantTestValue, grantTestSuperuserParam: rsNone, grantTestPostmasterParam: "1GB",
 				"Session_Replication_Role": "replica", grantTestRoleParam: "postgres", grantTestAuditParam: "none",
 				grantTestParam: grantTestTenant,
 			}}}
