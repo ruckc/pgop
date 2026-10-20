@@ -242,14 +242,14 @@ start on an incomplete restore instead of running on mixed data; but a restore
 that was interrupted early may have left the previous data without its
 `pg_control`, which then needs a new restore as well.
 
-A Restore deleted before it recorded its Job name (still `Pending` or
-stopping the Cluster), with no Job of it existing, leaves the data untouched,
-and the Cluster simply starts again. From the moment the Job name is recorded
-(condition reason `CreatingJob`), any interruption, including a Restore whose
-target (BackupRun, Backup) disappears while its Job is created, counts as
-interrupted: whether the Job ran cannot be told for sure, so the Cluster stays
-stopped. pgop also never starts the Cluster while a Job of the Restore
-exists.
+A Restore deleted before its Job was created leaves the data untouched, and
+the Cluster simply starts again. This covers a Restore that is still `Pending`
+or stopping the Cluster, and one in condition reason `CreatingJob` (Job name
+recorded, Job not yet created) with no Job of it existing; the same holds when
+its target (BackupRun, Backup) disappears at that point (the Restore fails and
+the Cluster is released). Once a Job of the Restore exists, or the reason is
+`Restoring` or later, any interruption counts as interrupted. pgop never starts
+the Cluster while a Job of the Restore exists.
 
 ### Disaster recovery
 

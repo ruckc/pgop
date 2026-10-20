@@ -838,7 +838,8 @@ status:
 `Available` reasons: `Running`, `Succeeded`, `Failed`, `ReconcileError`, and,
 for physical restores, the steps `AwaitingConfirmation` (the Cluster has not
 confirmed the Restore), `WaitingForRestore` (another Restore holds the
-Cluster), `WaitingForOldJob`, `StoppingCluster`, `CreatingJob` and
+Cluster), `WaitingForOldJob`, `StoppingCluster`, `CreatingJob` (Job name
+recorded; a Restore interrupted here with no Job existing releases the Cluster) and
 `Restoring`.
 
 ---
@@ -852,7 +853,7 @@ the operator and should not be edited):
 |------------|----|--------|
 | `pgop.ruck.io/rotate-password: <any new value>` | Role | Rotate the generated password now (with `passwordSecretRef`: set the referenced password in PostgreSQL again). Each value is acted on once. See [Roles: rotating on demand](../user-guide/roles.md#rotating-on-demand). |
 | `pgop.ruck.io/allow-restore: <restore>` or `<restore>/<uid>` | Cluster | Confirms a physical Restore of this Cluster; removed by the operator when the Restore finishes. Apply it with `kubectl annotate`, **never commit it to Git**. See [Restores: confirmation](../user-guide/restores.md#confirmation). |
-| `pgop.ruck.io/restore-interrupted` | Cluster | Set by the operator after a failed or interrupted physical restore. Removing it by hand starts PostgreSQL on the data directory as it is (only when you know the restore did not change it). |
+| `pgop.ruck.io/restore-interrupted` | Cluster | Set by the operator after a failed or interrupted physical restore (not when it was interrupted before its Job was created). Removing it by hand starts PostgreSQL on the data directory as it is (only when you know the restore did not change it). |
 | `pgop.ruck.io/allow-primary-init: "true"` | Cluster | Lets the primary run `initdb` on an empty volume although the Cluster had data before (start over with an empty database). Remove it again afterwards. See [Replication](../user-guide/replication.md#primary-volume-lost). |
 | any change, e.g. `pgop.ruck.io/reconcile: <timestamp>` | Database | Triggers a reconcile, for example to apply `objectGrants` with `"*"` to tables a migration just created. |
 

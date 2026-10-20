@@ -516,7 +516,7 @@ var _ = Describe("Restore Controller", func() {
 		Expect(pausedForRestore(cluster)).To(BeTrue())
 	})
 
-	It("should keep the Cluster stopped when a Restore is deleted right after recording its Job name", func() {
+	It("should release the Cluster when a Restore is deleted in CreatingJob and no Job exists", func() {
 		clusterName, runName := physicalFixture(1)
 		restore, req := newPhysicalRestore("restore-"+suffix, clusterName, runName, nil)
 		annotate(clusterName, AnnotationAllowRestore, restore.Name)
@@ -529,11 +529,35 @@ var _ = Describe("Restore Controller", func() {
 		reconcileRestore(req, restore)
 		err := k8sClient.Get(ctx, req.NamespacedName, &postgresv1alpha1.Restore{})
 		Expect(apierrors.IsNotFound(err)).To(BeTrue())
-		Expect(getCluster(clusterName).Annotations).To(HaveKeyWithValue(AnnotationRestoreInterrupted, restore.Name),
-			"once the Job name is recorded the restore counts as started")
+		cluster := getCluster(clusterName)
+		Expect(cluster.Annotations).NotTo(HaveKey(AnnotationRestoreInterrupted))
+		Expect(cluster.Annotations).NotTo(HaveKey(AnnotationRestoreInProgress))
+		Expect(pausedForRestore(cluster)).To(BeFalse())
 	})
 
-	It("should keep the Cluster stopped when the target cannot be resolved while creating the Job", func() {
+	It("should keep the Cluster stopped when a Restore is deleted in CreatingJob and its Job exists", func() {
+		clusterName, runName := physicalFixture(1)
+		restore, req := newPhysicalRestore("restore-"+suffix, clusterName, runName, nil)
+		annotate(clusterName, AnnotationAllowRestore, restore.Name)
+		reconcileRestore(req, restore) // stop the Cluster
+		reconcileRestore(req, restore) // record the Job name
+		Expect(restore.Status.Conditions[0].Reason).To(Equal(reasonCreatingJob))
+		job := &batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{Name: restore.Name + "-restore", Namespace: RestoreNamespace},
+			Spec: batchv1.JobSpec{Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+				RestartPolicy: corev1.RestartPolicyNever,
+				Containers:    []corev1.Container{{Name: "c", Image: "x"}},
+			}}},
+		}
+		Expect(controllerutil.SetControllerReference(restore, job, k8sClient.Scheme())).To(Succeed())
+		Expect(k8sClient.Create(ctx, job)).To(Succeed())
+
+		Expect(k8sClient.Delete(ctx, restore)).To(Succeed())
+		reconcileRestore(req, restore)
+		Expect(getCluster(clusterName).Annotations).To(HaveKeyWithValue(AnnotationRestoreInterrupted, restore.Name))
+	})
+
+	It("should release the Cluster when the target cannot be resolved in CreatingJob and no Job exists", func() {
 		clusterName, runName := physicalFixture(1)
 		restore, req := newPhysicalRestore("restore-"+suffix, clusterName, runName, nil)
 		annotate(clusterName, AnnotationAllowRestore, restore.Name)
@@ -544,7 +568,10 @@ var _ = Describe("Restore Controller", func() {
 		Expect(k8sClient.Delete(ctx, run)).To(Succeed())
 		reconcileRestore(req, restore)
 		Expect(restore.Status.Phase).To(Equal(postgresv1alpha1.RestorePhaseFailed))
-		Expect(getCluster(clusterName).Annotations).To(HaveKeyWithValue(AnnotationRestoreInterrupted, restore.Name))
+		cluster := getCluster(clusterName)
+		Expect(cluster.Annotations).NotTo(HaveKey(AnnotationRestoreInterrupted))
+		Expect(cluster.Annotations).NotTo(HaveKey(AnnotationRestoreInProgress))
+		Expect(pausedForRestore(cluster)).To(BeFalse())
 	})
 
 	It("should remove the finalizer of a Restore whose Cluster is gone", func() {

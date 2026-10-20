@@ -264,16 +264,18 @@ func (r *RestoreReconciler) reader() client.Reader {
 }
 
 // createRestoreJob creates the restore Job of a Restore whose Job name is
-// recorded. If the target can no longer be resolved, the restore counts as
-// interrupted: whether a Job ran before cannot be told for sure.
+// recorded. Only called in reason CreatingJob with no Job, so no Job was
+// created yet and the volume was not written: if the target can no longer be
+// resolved, the Cluster is released (finishOnCluster still upgrades this to
+// interrupted when a Job of the Restore exists).
 func (r *RestoreReconciler) createRestoreJob(ctx context.Context, restore *postgresv1alpha1.Restore) (ctrl.Result, error) {
 	target, err := r.resolvePhysicalRestore(ctx, restore)
 	if err != nil {
 		if errors.Is(err, errRestoreInvalid) || apierrors.IsNotFound(err) {
-			if err := r.finishOnCluster(ctx, restore, restoreOutcomeInterrupted); err != nil {
+			if err := r.finishOnCluster(ctx, restore, restoreOutcomeReleased); err != nil {
 				return ctrl.Result{}, err
 			}
-			return r.failPhysicalRestore(ctx, restore, fmt.Errorf("%w; %s", err, interruptedHint(restore.Spec.ClusterRef.Name)))
+			return r.failPhysicalRestore(ctx, restore, fmt.Errorf("%w; Cluster released, nothing was restored", err))
 		}
 		return ctrl.Result{}, err
 	}
@@ -527,8 +529,10 @@ func (r *RestoreReconciler) finalizeRestoreJob(ctx context.Context, restore *pos
 	if job != nil && !metav1.IsControlledBy(job, restore) {
 		job = nil // an earlier Restore's Job, never ours
 	}
-	if restore.Status.JobName == "" && job == nil {
-		// The restore never started: the Cluster starts again.
+	if job == nil && (restore.Status.JobName == "" || restoreReason(restore) == reasonCreatingJob) {
+		// The restore never started, or its Job name was recorded but the Job
+		// was never created (the reason only moves on after a successful
+		// Create): the volume was not written and the Cluster starts again.
 		return true, r.finishOnCluster(ctx, restore, restoreOutcomeReleased)
 	}
 	if job != nil && job.DeletionTimestamp == nil && (jobConditionTrue(job, batchv1.JobComplete) || job.Status.Succeeded > 0) {
