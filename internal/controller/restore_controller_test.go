@@ -19,6 +19,9 @@ package controller
 import (
 	"context"
 	"fmt"
+	"os"
+	"os/exec"
+	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -323,7 +326,30 @@ var _ = Describe("Restore Controller", func() {
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: restore.Status.JobName, Namespace: RestoreNamespace}, job)).To(Succeed())
 		c := job.Spec.Template.Spec.Containers[0]
 		Expect(c.Image).To(Equal(DefaultPgbackrestImage))
-		Expect(c.Command[2]).To(ContainSubstring(`exec /usr/bin/pgbackrest restore "$@"`))
+		Expect(c.Command[2]).To(ContainSubstring(`/usr/bin/pgbackrest restore "$@"`))
+
+		By("the restore script removes the copied WAL-drop marker, and a failed restore still fails")
+		runScript := func(rc int) (string, error) {
+			dir := GinkgoT().TempDir()
+			fake := dir + "/pgbackrest"
+			Expect(os.WriteFile(fake, fmt.Appendf(nil, "#!/bin/sh\nexit %d\n", rc), 0o755)).To(Succeed())
+			pgdata := dir + "/data"
+			Expect(os.MkdirAll(pgdata, 0o700)).To(Succeed())
+			marker := pgdata + "/" + walDropMarkerFile
+			Expect(os.WriteFile(marker, []byte("2026-01-01T00:00:00Z 000000010000000000000001\n"), 0o600)).To(Succeed())
+			script := strings.ReplaceAll(c.Command[2], pgbackrestBin, fake)
+			cmd := exec.Command(shBin, "-c", script, pgbackrestContainerName)
+			cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "PGBACKREST_PG1_PATH=" + pgdata, "PGBACKREST_REPO1_PATH=/repo"}
+			_, err := cmd.CombinedOutput()
+			_, statErr := os.Stat(marker)
+			return fmt.Sprint(os.IsNotExist(statErr)), err
+		}
+		removed, err2 := runScript(0)
+		Expect(err2).NotTo(HaveOccurred())
+		Expect(removed).To(Equal("true"))
+		removed, err2 = runScript(1)
+		Expect(err2).To(HaveOccurred())
+		Expect(removed).To(Equal("false"), "the marker is kept when the restore fails")
 		Expect(c.Command[4:]).To(Equal(physicalRestoreArgs(restore, "20260101-020000F")))
 		Expect(c.Command).To(ContainElement("--set=20260101-020000F"))
 		Expect(c.VolumeMounts).To(ContainElement(corev1.VolumeMount{Name: dataVolumeName, MountPath: "/var/lib/postgresql"}))
