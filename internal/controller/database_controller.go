@@ -253,6 +253,31 @@ var _ schemaClient = (*postgres.Client)(nil)
 // the current database (it owns the schema public since PostgreSQL 15).
 const pgDatabaseOwnerRole = "pg_database_owner"
 
+// schemaOwnerProblem checks the declared owner of schema with the grantee
+// policy (owners; nil skips the check). It returns a message when the owner is
+// refused, or one when it is missing or being deleted (to retry); both are
+// empty when the owner is allowed or undeclared.
+func schemaOwnerProblem(ctx context.Context, owners *granteeChecker, schema postgresv1alpha1.SchemaSpec,
+) (refused, pending string, err error) {
+	if owners == nil || schema.Owner == "" {
+		return "", "", nil
+	}
+	res, err := owners.checkOwner(ctx, schema.Owner)
+	if err != nil {
+		return "", "", err
+	}
+	field := fmt.Sprintf("schemas[%s].owner", schema.Name)
+	switch res.verdict {
+	case granteeRefused:
+		refused = fmt.Sprintf("%s: %s %s", field, schema.Owner, res.problem)
+	case granteeMissing:
+		pending = fmt.Sprintf("%s: PostgreSQL role %q does not exist yet", field, schema.Owner)
+	case granteePaused:
+		pending = fmt.Sprintf("%s: %s: the Role is being deleted", field, schema.Owner)
+	}
+	return refused, pending, nil
+}
+
 // reconcileSchemas creates the Database's schemas and sets the owner of the
 // ones it manages (their grants are applied by reconcileSchemaGrants). A
 // schema is managed when the Database created it (it is recorded in
@@ -298,26 +323,20 @@ func reconcileSchemas(ctx context.Context, pg schemaClient, database *postgresv1
 			system = append(system, schema.Name)
 			continue
 		}
-		if owners != nil && schema.Owner != "" {
-			res, err := owners.checkOwner(ctx, schema.Owner)
-			if err != nil {
-				return keepRecorded(i), nil, err
+		refused, pending, err := schemaOwnerProblem(ctx, owners, schema)
+		if err != nil {
+			return keepRecorded(i), nil, err
+		}
+		if refused != "" || pending != "" {
+			if refused != "" {
+				ownerRefused = append(ownerRefused, refused)
+			} else {
+				ownerPending = append(ownerPending, pending)
 			}
-			field := fmt.Sprintf("schemas[%s].owner", schema.Name)
-			if res.verdict != granteeAllowed {
-				switch res.verdict {
-				case granteeRefused:
-					ownerRefused = append(ownerRefused, fmt.Sprintf("%s: %s %s", field, schema.Owner, res.problem))
-				case granteeMissing:
-					ownerPending = append(ownerPending, fmt.Sprintf("%s: PostgreSQL role %q does not exist yet", field, schema.Owner))
-				case granteePaused:
-					ownerPending = append(ownerPending, fmt.Sprintf("%s: %s: the Role is being deleted", field, schema.Owner))
-				}
-				if recorded[schema.Name] {
-					managed = append(managed, schema.Name)
-				}
-				continue
+			if recorded[schema.Name] {
+				managed = append(managed, schema.Name)
 			}
+			continue
 		}
 		info, exists, err := pg.SchemaOwner(ctx, schema.Name)
 		owner := info.Owner

@@ -27,6 +27,12 @@ import (
 	"github.com/ruckc/pgop/internal/postgres"
 )
 
+// Schema names shared by the schema owner tests.
+const (
+	schemaFresh = "fresh"
+	schemaGood  = "good"
+)
+
 // ownerRoleClient is a granteeClient over a fixed set of roles.
 type ownerRoleClient struct {
 	roles map[string]*postgres.ReachableRole
@@ -68,9 +74,9 @@ var _ = Describe("Schema owner policy", func() {
 	}
 
 	It("refuses unmanaged, superuser, reserved and PUBLIC owners without touching the schema", func() {
-		for _, owner := range []string{strayOwner, suOwner, "postgres", "pgop_operator", "pg_monitor", "PUBLIC", "none"} {
+		for _, owner := range []string{strayOwner, suOwner, "postgres", DefaultOperatorUsername, "pg_monitor", "PUBLIC", rsNone} {
 			s := &fakeSchemaClient{dbOwner: grantTestAdmin}
-			managed, refused, err := reconcileSchemas(ctx, s, dbWith(postgresv1alpha1.SchemaSpec{Name: "app", Owner: owner}),
+			managed, refused, err := reconcileSchemas(ctx, s, dbWith(postgresv1alpha1.SchemaSpec{Name: ogSchema, Owner: owner}),
 				"", newChecker(nil))
 			Expect(err).NotTo(HaveOccurred(), owner)
 			Expect(managed).To(BeEmpty(), owner)
@@ -92,9 +98,9 @@ var _ = Describe("Schema owner policy", func() {
 	})
 
 	It("allows managed and allowedExistingRoles owners", func() {
-		s := &fakeSchemaClient{dbOwner: grantTestAdmin, owners: map[string]string{"old": grantTestRole}}
+		s := &fakeSchemaClient{dbOwner: grantTestAdmin, owners: map[string]string{memOld: grantTestRole}}
 		db := dbWith(
-			postgresv1alpha1.SchemaSpec{Name: "fresh", Owner: managedOwner},
+			postgresv1alpha1.SchemaSpec{Name: schemaFresh, Owner: managedOwner},
 			postgresv1alpha1.SchemaSpec{Name: "fresh2", Owner: allowedOwner},
 			postgresv1alpha1.SchemaSpec{Name: "old", Owner: managedOwner})
 		db.Status.CreatedSchemas = []string{"old"}
@@ -125,7 +131,7 @@ var _ = Describe("Schema owner policy", func() {
 		s := &fakeSchemaClient{dbOwner: grantTestAdmin}
 		db := dbWith(
 			postgresv1alpha1.SchemaSpec{Name: "bad", Owner: strayOwner},
-			postgresv1alpha1.SchemaSpec{Name: "good", Owner: managedOwner})
+			postgresv1alpha1.SchemaSpec{Name: schemaGood, Owner: managedOwner})
 		managed, refused, err := reconcileSchemas(ctx, s, db, "", newChecker(nil))
 		Expect(err).NotTo(HaveOccurred())
 		Expect(refused).To(HaveOccurred())

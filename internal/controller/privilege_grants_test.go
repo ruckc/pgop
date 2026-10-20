@@ -450,7 +450,7 @@ var _ = Describe("Privilege grants", func() {
 			db := newDB([]postgresv1alpha1.DatabaseGrantSpec{{Role: grantTestRole, Privileges: connect}},
 				postgresv1alpha1.ManagedDatabaseGrant{Role: grantTestRole, Privileges: []string{postgres.PrivilegeConnect, postgres.PrivilegeCreate},
 					GrantOptions: []string{postgres.PrivilegeConnect, postgres.PrivilegeCreate}},
-				postgresv1alpha1.ManagedDatabaseGrant{Role: "old", Privileges: connect})
+				postgresv1alpha1.ManagedDatabaseGrant{Role: memOld, Privileges: connect})
 			Expect(reconcileDatabaseGrants(ctx, f, db, "app_db", testChecker(f, nil), nil)).To(Succeed())
 			Expect(f.calls).To(Equal([]string{
 				"revoke CONNECT on app_db from app optionOnly=true cascade=true",
@@ -947,7 +947,7 @@ var _ = Describe("Privilege grants", func() {
 				superusers: map[string]bool{DefaultOperatorUsername: true, polDBA: true},
 			}
 			db := &postgresv1alpha1.Database{Spec: postgresv1alpha1.DatabaseSpec{Schemas: []postgresv1alpha1.SchemaSpec{
-				{Name: "fresh"}, {Name: "fresh_owned", Owner: grantTestRole},
+				{Name: schemaFresh}, {Name: "fresh_owned", Owner: grantTestRole},
 				{Name: ownedByDBSchema, Owner: grantTestRole}, {Name: declaredSchema, Owner: grantTestRole}, {Name: publicSchemaName},
 				{Name: "ext"}, {Name: grantTestOther}, {Name: recordedSchema}, {Name: "su_owned", Owner: polDBA}, {Name: "pg_catalog"},
 			}}}
@@ -1080,7 +1080,7 @@ var _ = Describe("Settings and parameter grants", func() {
 				testWorkMem: "user", grantTestSuperuserParam: pgContextSuperuser, grantTestPostmasterParam: "postmaster",
 			}}
 			db := &postgresv1alpha1.Database{Spec: postgresv1alpha1.DatabaseSpec{Settings: map[string]string{
-				testWorkMem: grantTestValue, grantTestSuperuserParam: "none", grantTestPostmasterParam: "1GB",
+				testWorkMem: grantTestValue, grantTestSuperuserParam: rsNone, grantTestPostmasterParam: "1GB",
 				"Session_Replication_Role": "replica", grantTestRoleParam: "postgres", grantTestAuditParam: "none",
 				grantTestParam: grantTestTenant,
 			}}}
