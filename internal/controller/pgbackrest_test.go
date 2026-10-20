@@ -47,6 +47,8 @@ import (
 	"github.com/ruckc/pgop/internal/postgres"
 )
 
+const pg17AlpineImage = "postgres:17-alpine"
+
 // envValue returns the value of the named variable in env ("" if unset).
 func envValue(env []corev1.EnvVar, name string) string {
 	for _, e := range env {
@@ -391,7 +393,7 @@ var _ = Describe("Physical backups (envtest)", func() {
 		Expect(apierrors.IsNotFound(err)).To(BeTrue())
 	})
 
-	for _, changed := range []string{"postgres:17-alpine", "postgres:17-trixie"} {
+	for _, changed := range []string{pg17AlpineImage, "postgres:17-trixie"} {
 		It("keeps pgop's image after the Backup is removed only while spec.image is unchanged: "+changed, func() {
 			const original = "postgres:17.5-trixie"
 			clusterName := "pbkp-" + suffix
@@ -517,12 +519,12 @@ var _ = Describe("Physical backups (envtest)", func() {
 		Expect(cluster.Status.PgopImageSwappedFrom).To(Equal(original))
 
 		By("changing spec.image releases it")
-		cluster.Spec.Image = "postgres:17-alpine"
+		cluster.Spec.Image = pg17AlpineImage
 		Expect(k8sClient.Update(ctx, cluster)).To(Succeed())
 		_, err = r.Reconcile(ctx, req)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(k8sClient.Get(ctx, req.NamespacedName, s)).To(Succeed())
-		Expect(s.Spec.Template.Spec.Containers[0].Image).To(Equal("postgres:17-alpine"))
+		Expect(s.Spec.Template.Spec.Containers[0].Image).To(Equal(pg17AlpineImage))
 	})
 
 	It("schedules pgBackRest backup Jobs and records them as BackupRuns", func() {
@@ -628,7 +630,7 @@ var _ = Describe("Physical backups (envtest)", func() {
 	It("leaves the pod of a Cluster with an unsupported image alone", func() {
 		cluster := &postgresv1alpha1.Cluster{
 			ObjectMeta: metav1.ObjectMeta{Name: "pbku-" + suffix, Namespace: ns},
-			Spec:       postgresv1alpha1.ClusterSpec{Image: "postgres:17-alpine", Replicas: 1, Port: 5432},
+			Spec:       postgresv1alpha1.ClusterSpec{Image: pg17AlpineImage, Replicas: 1, Port: 5432},
 		}
 		Expect(k8sClient.Create(ctx, cluster)).To(Succeed())
 		defer func() {
@@ -648,7 +650,7 @@ var _ = Describe("Physical backups (envtest)", func() {
 		sts := &appsv1.StatefulSet{}
 		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(cluster), sts)).To(Succeed())
 		Expect(sts.Spec.Template.Spec.Containers).To(HaveLen(1))
-		Expect(sts.Spec.Template.Spec.Containers[0].Image).To(Equal("postgres:17-alpine"))
+		Expect(sts.Spec.Template.Spec.Containers[0].Image).To(Equal(pg17AlpineImage))
 		Expect(sts.Spec.Template.Spec.Containers[0].Args).To(BeEmpty(), "no archive_command without pgBackRest")
 		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(cluster), cluster)).To(Succeed())
 		pb := meta.FindStatusCondition(cluster.Status.Conditions, ConditionTypePhysicalBackup)
@@ -788,7 +790,7 @@ var _ = Describe("keptPgopImage", func() {
 		Expect(keptPgopImage(cluster("postgres:17-trixie", "postgres:17-trixie"), pgop)).To(Equal(pgop))
 	})
 	It("releases it when spec.image differs, even for an official image of the same major", func() {
-		Expect(keptPgopImage(cluster("postgres:17-alpine", "postgres:17-trixie"), pgop)).To(BeEmpty())
+		Expect(keptPgopImage(cluster(pg17AlpineImage, "postgres:17-trixie"), pgop)).To(BeEmpty())
 	})
 	It("releases it without a recorded image", func() {
 		Expect(keptPgopImage(cluster("postgres:17-trixie", ""), pgop)).To(BeEmpty())
