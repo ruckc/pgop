@@ -542,3 +542,15 @@ func containsSubstring(s, substr string) bool {
 	}
 	return false
 }
+
+func TestLoggingSessionPinsNamesEveryParameter(t *testing.T) {
+	for _, name := range []string{
+		"log_statement", "log_min_messages", "log_min_error_statement",
+		"log_min_duration_statement", "log_min_duration_sample",
+		"log_statement_sample_rate", "log_transaction_sample_rate", "log_statement_stats",
+	} {
+		if !strings.Contains(loggingSessionPins, "'"+name+"'") {
+			t.Errorf("loggingSessionPins does not pin %s", name)
+		}
+	}
+}

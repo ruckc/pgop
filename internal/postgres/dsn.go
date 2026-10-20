@@ -107,7 +107,9 @@ const operatorSearchPath = "pg_catalog, pg_temp"
 //
 // They all exist in every supported PostgreSQL version (14 and later);
 // settings that only exist in newer versions are pinned after connecting
-// (versionedSessionPins).
+// (versionedSessionPins). The logging parameters (log_statement, log_min_*)
+// are pinned after connecting too (loggingSessionPins), to the cluster's
+// server-wide value, which a fixed startup parameter would override.
 var operatorSessionSettings = []struct{ k, v string }{
 	{settingSearchPath, operatorSearchPath},
 	{settingRole, roleNone},

@@ -399,13 +399,14 @@ spec:
   statement logging off for its own sessions. If the role also owns a
   database, it can set the parameter as a default for **every** session in
   that database (`ALTER DATABASE ... SET log_statement = 'none'`), including
-  other roles' and the operator's: the logging and auditing of that database
-  is then in its hands. pgop pins the settings that could break its own
-  sessions (`exit_on_error` among them, see
-  [Databases: settings](databases.md#which-parameters-may-be-set)), but not
-  logging parameters, whose server-wide value it does not override. Grant
-  logging parameters only to roles that do not own databases, or accept that
-  risk. Grant only what the role needs.
+  other roles': the logging and auditing of those sessions is then in its
+  hands. pgop pins the settings that could break its own sessions
+  (`exit_on_error` among them, see
+  [Databases: settings](databases.md#which-parameters-may-be-set)) and its
+  own logging parameters, which keep the server-wide value, so the operator's
+  sessions stay logged. Other roles' sessions are not pinned. Grant logging
+  parameters only to roles that do not own databases, or accept that risk.
+  Grant only what the role needs.
 
 ## Role Settings
 
