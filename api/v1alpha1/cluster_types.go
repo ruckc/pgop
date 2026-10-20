@@ -530,6 +530,12 @@ type ClusterStatus struct {
 	// +optional
 	LastWALDrop *WALDropRecord `json:"lastWALDrop,omitempty"`
 
+	// pgopImageSwappedFrom is the spec.image that pgop's Postgres+pgBackRest
+	// image replaced for physical backups. After the Backup is removed, the
+	// pgop image is kept only while spec.image still equals this value.
+	// +optional
+	PgopImageSwappedFrom string `json:"pgopImageSwappedFrom,omitempty"`
+
 	// ready indicates if the cluster is ready to accept connections
 	Ready bool `json:"ready,omitempty"`
 

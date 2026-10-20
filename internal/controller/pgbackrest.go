@@ -720,16 +720,22 @@ func clustersForBackup(_ context.Context, obj client.Object) []reconcile.Request
 
 // keptPgopImage returns the pgop Postgres+pgBackRest image the StatefulSet
 // runs, when the Cluster no longer has a (valid) physical Backup but its
-// spec.image is the official image of the same major: switching back could
+// spec.image is still the one the pgop image replaced
+// (status.pgopImageSwappedFrom): switching back could
 // change the C library across glibc releases, so pgop keeps its image (only
 // archiving and the sidecar are removed). "" otherwise.
 func keptPgopImage(cluster *postgresv1alpha1.Cluster, running string) string {
 	if !strings.HasPrefix(running, pgopPostgresImageRepository+":") {
 		return ""
 	}
-	image := cmp.Or(cluster.Spec.Image, DefaultPostgresImage)
-	if !isOfficialPostgresImage(image) || parsePostgresMajor(running) != postgresMajor(cluster) {
+	if cluster.Status.PgopImageSwappedFrom == "" || cluster.Status.PgopImageSwappedFrom != effectiveImage(cluster) ||
+		parsePostgresMajor(running) != postgresMajor(cluster) {
 		return ""
 	}
 	return running
+}
+
+// effectiveImage is the Cluster's spec.image, or the default.
+func effectiveImage(cluster *postgresv1alpha1.Cluster) string {
+	return cmp.Or(cluster.Spec.Image, DefaultPostgresImage)
 }
