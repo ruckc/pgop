@@ -1,0 +1,25 @@
+version = 1
+
+[workflows.review-pr]
+description = "Review newly opened pull requests"
+on = ["pull_request.opened"]
+start = "review"
+
+[workflows.review-pr.nodes.review]
+type = "agent"
+mode = "reviewer"
+instruction = "Review pull request #{{ event.pull_request.number }}: {{ event.pull_request.title }}. Write a short code review."
+next = "comment"
+
+[workflows.review-pr.nodes.review.result.summary]
+type = "string"
+
+[workflows.review-pr.nodes.comment]
+type = "action"
+action = "comment"
+body = "{{ nodes.review.result.summary }}"
+next = "done"
+
+[workflows.review-pr.nodes.done]
+type = "end"
+status = "done"
