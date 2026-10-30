@@ -2,6 +2,6 @@ default_mode = "reviewer"
 
 [modes.reviewer]
 description = "Reviews a pull request"
-prompt = "Review the pull request for correctness, tests and clarity. Be specific and brief. Do not edit files."
-tools = ["Read", "Glob", "Grep"]
+prompt = "Review the pull request for correctness, tests and clarity. Be specific and brief. Read the change with git (git diff, git log). Do not edit files or push."
+tools = ["Read", "Glob", "Grep", "Bash"]
 mcp_tools = ["mcp__enzarb__submit_result"]
