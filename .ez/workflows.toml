@@ -3,6 +3,7 @@ version = 1
 [workflows.review-pr]
 description = "Review newly opened pull requests"
 on = ["pull_request.opened"]
+if = "event.pull_request.draft == false"
 start = "review"
 
 [workflows.review-pr.nodes.review]
