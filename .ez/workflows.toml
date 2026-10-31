@@ -10,7 +10,13 @@ start = "review"
 type = "agent"
 mode = "reviewer"
 instruction = "Review pull request #{{ event.pull_request.number }}: {{ event.pull_request.title }}. Write a short code review."
-next = "comment"
+next = [{ if = "exit == 'success' and result", to = "comment" }, { to = "review_failed" }]
+
+
+[workflows.review-pr.nodes.review_failed]
+type = "end"
+status = "failed"
+reason = "the reviewer failed: {{ nodes.review.error if nodes.review.error else 'no result was submitted' }}"
 
 [workflows.review-pr.nodes.review.result.summary]
 type = "string"
