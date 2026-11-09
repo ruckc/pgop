@@ -137,7 +137,9 @@ does not restart them.
 
 When the Backup is deleted (or becomes `Invalid`), archiving and the sidecar
 are removed, but **pgop's image is kept**: switching back to the official
-image could change the C library (see [Images](#images)). The Cluster's
+image could change the C library (see [Images](#images)). pgop's image is
+kept only while `spec.image` still equals the value it replaced
+(`status.pgopImageSwappedFrom`); changing `spec.image` releases it. The Cluster's
 `PhysicalBackup` condition shows the state:
 
 | `PhysicalBackup` | Meaning |
