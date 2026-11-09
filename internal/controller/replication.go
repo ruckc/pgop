@@ -420,6 +420,7 @@ until pg_basebackup -D "$staging" -X stream -S "$slot" -c fast --no-password; do
 done
 touch "$staging/standby.signal"
 printf "primary_slot_name = '%s'\n" "$slot" >> "$staging/postgresql.auto.conf"
+rm -f "$staging/` + walDropMarkerFile + `"
 find "$staging" -mindepth 1 -maxdepth 1 -exec mv {} "$PGDATA"/ \;
 rmdir "$staging"
 echo "pgop: standby data directory ready"

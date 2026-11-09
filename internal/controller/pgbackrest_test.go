@@ -590,7 +590,13 @@ var _ = Describe("Physical backups (envtest)", func() {
 		Expect(meta.FindStatusCondition(cluster.Status.Conditions, ConditionTypeWALArchiving).Reason).To(Equal(reasonWALDropped))
 
 		By("a successful backup that started after the drop closes it")
-		newRun("after-"+suffix, dropAt.Add(time.Minute))
+		By("a run starting within the clock-skew tolerance of the drop does not close it")
+		newRun("skewed-"+suffix, dropAt.Add(30*time.Second))
+		r.reconcileArchiveHealth(ctx, cluster, backup, true)
+		Expect(meta.FindStatusCondition(cluster.Status.Conditions, ConditionTypeWALArchiving).Reason).To(Equal(reasonWALDropped))
+
+		By("a successful backup that started after the drop and the tolerance closes it")
+		newRun("after-"+suffix, dropAt.Add(3*time.Minute))
 		r.reconcileArchiveHealth(ctx, cluster, backup, true)
 		c = meta.FindStatusCondition(cluster.Status.Conditions, ConditionTypeWALArchiving)
 		Expect(c.Status).To(Equal(metav1.ConditionTrue))

@@ -216,7 +216,14 @@ pgBackRest checks is archived before the backup succeeds). Once a successful
 `BackupRun` started after the drop exists, `lastWALDrop.closedBy` names it
 and `WALArchiving` reflects archiving again. Take one right away
 (`kubectl create job ... --from=cronjob/<backup>-full`) once the cause of the
-outage is fixed.
+outage is fixed. To allow for clock skew between the pod (which stamps the
+drop) and the control plane (which stamps the run), the run must start more
+than 2 minutes after the drop; a run starting sooner closes the gap on the
+next backup.
+
+The marker records the drop history of one data directory, so it is not
+copied: a physical restore and a standby clone remove it. A Cluster restored
+from a backup, or a promoted standby, starts without `WALDropped`.
 
 The marker file is kept in the data directory (so it survives restarts and is
 part of backups); a restored data directory brings the drops from before its

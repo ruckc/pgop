@@ -710,14 +710,17 @@ func physicalRestoreArgs(restore *postgresv1alpha1.Restore, label string) []stri
 // buildPhysicalRestoreJob runs "pgbackrest restore" into the primary's data
 // volume. The data directory is created if needed, and a postmaster.pid left
 // behind by an unclean shutdown is removed (no PostgreSQL pod runs: the
-// Cluster is stopped).
+// Cluster is stopped). After the restore, the WAL-drop marker is removed: it
+// is the drop history of the Cluster the backup came from, not of the
+// restored one.
 func (r *RestoreReconciler) buildPhysicalRestoreJob(restore *postgresv1alpha1.Restore, t *physicalRestoreTarget) *batchv1.Job {
 	script := `set -eu
 mkdir -p "$PGBACKREST_PG1_PATH"
 chmod 0700 "$PGBACKREST_PG1_PATH"
 rm -f "$PGBACKREST_PG1_PATH/postmaster.pid"
 echo "pgop: restoring into $PGBACKREST_PG1_PATH from repository $PGBACKREST_REPO1_PATH: $*"
-exec ` + pgbackrestBin + ` restore "$@"
+` + pgbackrestBin + ` restore "$@"
+rm -f "$PGBACKREST_PG1_PATH/` + walDropMarkerFile + `"
 `
 
 	env := append(pgbackrestRepoEnv(t.backup), pgbackrestPGEnv(t.cluster, t.layout)...)

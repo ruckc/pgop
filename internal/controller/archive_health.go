@@ -167,8 +167,15 @@ func (r *ClusterReconciler) recordWALDrop(cluster *postgresv1alpha1.Cluster, mar
 	}
 }
 
+// walDropSkewTolerance is the clock skew tolerated between the pod and the
+// control plane when deciding whether a backup started after a WAL drop.
+const walDropSkewTolerance = 2 * time.Minute
+
 // backupStartedAfter returns the name of a successful BackupRun of the
-// Backup that started after t ("" if none).
+// Backup that started after t ("" if none). t comes from the pod's clock and
+// the start time from the control plane's, so a run must start more than
+// walDropSkewTolerance after t: a false "closed" would hide a PITR gap, a late
+// close only waits for the next backup.
 func (r *ClusterReconciler) backupStartedAfter(ctx context.Context, backup *postgresv1alpha1.Backup, t time.Time) (string, error) {
 	runs := &postgresv1alpha1.BackupRunList{}
 	if err := r.List(ctx, runs, client.InNamespace(backup.Namespace), client.MatchingLabels{
@@ -179,7 +186,7 @@ func (r *ClusterReconciler) backupStartedAfter(ctx context.Context, backup *post
 	}
 	for _, run := range runs.Items {
 		if run.Status.Phase == postgresv1alpha1.BackupRunPhaseSucceeded && run.Status.StartTime != nil &&
-			run.Status.StartTime.After(t) {
+			run.Status.StartTime.After(t.Add(walDropSkewTolerance)) {
 			return run.Name, nil
 		}
 	}

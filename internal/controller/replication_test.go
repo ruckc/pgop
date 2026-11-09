@@ -246,6 +246,10 @@ cat > "$FAKE_DIR/stdin"
 		Expect(bootstrapScript).To(ContainSubstring("primary_slot_name"))
 		Expect(bootstrapScript).To(ContainSubstring("refusing to initialize an empty primary"))
 		Expect(bootstrapScript).NotTo(ContainSubstring(" -R"))
+		rm := strings.Index(bootstrapScript, `rm -f "$staging/`+walDropMarkerFile+`"`)
+		mv := strings.Index(bootstrapScript, `-exec mv {} "$PGDATA"/`)
+		Expect(rm).To(BeNumerically(">", 0), "the primary's WAL-drop marker is not cloned")
+		Expect(rm).To(BeNumerically("<", mv))
 	})
 
 	It("keeps a single instance until the primary runs the replication template", func() {

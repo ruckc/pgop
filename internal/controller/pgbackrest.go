@@ -448,6 +448,9 @@ func archiveCommand() string {
 
 // walDropMarkerFile, in the data directory, records the WAL segments
 // pgBackRest dropped (see archiveCommand).
+//
+// It is the drop history of this data directory: the standby clone and the
+// physical restore scripts remove it from their copies.
 const walDropMarkerFile = "pgop-wal-dropped"
 
 // pgbackrestServerArgs are the server options for WAL archiving.
