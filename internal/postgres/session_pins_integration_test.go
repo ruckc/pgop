@@ -23,6 +23,7 @@ import (
 	"os"
 	"strconv"
 	"testing"
+	"time"
 )
 
 // TestOperatorSessionPinsIntegration checks against a real server that the
@@ -87,6 +88,25 @@ func TestOperatorSessionPinsIntegration(t *testing.T) {
 		_, _ = admin.db.ExecContext(ctx, `ALTER DATABASE `+db+` SET `+set)
 	}
 	exec(`ALTER ROLE ` + quoteIdent(cfg.User) + ` IN DATABASE ` + db + ` SET search_path = evil2`)
+	logging := map[string]string{
+		"log_statement":              "none",
+		"log_min_messages":           "panic",
+		"log_min_error_statement":    "panic",
+		"log_min_duration_statement": "-1",
+		"log_min_duration_sample":    "-1",
+		"log_statement_stats":        "on",
+	}
+	for k, v := range logging {
+		exec(`ALTER DATABASE ` + db + ` SET ` + k + ` = '` + v + `'`)
+	}
+	// A non-default cluster value: the pin follows it rather than a constant.
+	exec(`ALTER SYSTEM SET log_statement = 'ddl'`)
+	t.Cleanup(func() {
+		_, _ = admin.db.ExecContext(ctx, `ALTER SYSTEM RESET log_statement`)
+		_, _ = admin.db.ExecContext(ctx, `SELECT pg_reload_conf()`)
+	})
+	exec(`SELECT pg_reload_conf()`)
+	time.Sleep(time.Second)
 
 	cfg.Database = db
 	c, err := NewClient(cfg)
@@ -118,6 +138,32 @@ func TestOperatorSessionPinsIntegration(t *testing.T) {
 		if got.String != v {
 			t.Errorf("%s = %q, want %q", name, got.String, v)
 		}
+	}
+	for name := range logging {
+		var got, wantV string
+		if err := c.db.QueryRowContext(ctx, `SELECT pg_catalog.current_setting($1)`, name).Scan(&got); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		// The server-wide value, as seen by the admin connection in its own database.
+		if err := admin.db.QueryRowContext(ctx, `SELECT pg_catalog.current_setting($1)`, name).Scan(&wantV); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if got != wantV {
+			t.Errorf("%s = %q, want the server-wide %q", name, got, wantV)
+		}
+	}
+	var ls string
+	if err := c.db.QueryRowContext(ctx, `SHOW log_statement`).Scan(&ls); err != nil || ls != "ddl" {
+		t.Errorf("log_statement = %q %v, want the cluster value ddl", ls, err)
+	}
+	// The superuser can still lower logging for a transaction.
+	if tx, err := c.db.BeginTx(ctx, nil); err != nil {
+		t.Error(err)
+	} else {
+		if _, err := tx.ExecContext(ctx, `SET LOCAL log_statement = 'none'`); err != nil {
+			t.Errorf("SET LOCAL log_statement: %v", err)
+		}
+		_ = tx.Rollback()
 	}
 	var user string
 	if err := c.db.QueryRowContext(ctx, `SELECT current_user`).Scan(&user); err != nil {

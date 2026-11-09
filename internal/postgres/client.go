@@ -107,7 +107,30 @@ const versionedSessionPins = `SELECT pg_catalog.set_config(s.name, '0', false)
 FROM pg_catalog.pg_settings s
 WHERE s.name = 'transaction_timeout'`
 
-// pinningConnector runs versionedSessionPins on every new connection.
+// loggingSessionPins sets, on a new connection, each logging parameter whose
+// value comes from an ALTER DATABASE / ALTER ROLE ... SET override (source
+// 'database' or 'user') back to the server-wide value: the last applied entry
+// of the configuration files, else the built-in default. The value cannot be a
+// startup parameter because it is the cluster's own configuration, which the
+// client does not know. Other sources (the files, the command line) are left
+// alone, as the pg_settings reset_val already contains the override.
+const loggingSessionPins = `SELECT pg_catalog.set_config(s.name,
+	COALESCE((SELECT f.setting FROM pg_catalog.pg_file_settings f
+		WHERE f.name = s.name AND f.applied
+		ORDER BY f.seqno DESC LIMIT 1), s.boot_val), false)
+FROM pg_catalog.pg_settings s
+WHERE s.source IN ('database', 'user')
+AND s.name IN (` + loggingSessionParamList + `)`
+
+// loggingSessionParamList names the logging parameters (all superuser-settable
+// and present in every supported PostgreSQL version) that a database owner
+// holding a parameterGrants SET grant could lower with ALTER DATABASE ... SET.
+const loggingSessionParamList = `'log_statement', 'log_min_messages', 'log_min_error_statement',
+	'log_min_duration_statement', 'log_min_duration_sample',
+	'log_statement_sample_rate', 'log_transaction_sample_rate', 'log_statement_stats'`
+
+// pinningConnector runs versionedSessionPins and loggingSessionPins on every
+// new connection.
 type pinningConnector struct {
 	driver.Connector
 }
@@ -122,9 +145,11 @@ func (c pinningConnector) Connect(ctx context.Context) (driver.Conn, error) {
 		_ = conn.Close()
 		return nil, errors.New("the PostgreSQL driver does not support ExecContext")
 	}
-	if _, err := ex.ExecContext(ctx, versionedSessionPins, nil); err != nil {
-		_ = conn.Close()
-		return nil, fmt.Errorf("failed to pin session settings: %w", err)
+	for _, q := range []string{versionedSessionPins, loggingSessionPins} {
+		if _, err := ex.ExecContext(ctx, q, nil); err != nil {
+			_ = conn.Close()
+			return nil, fmt.Errorf("failed to pin session settings: %w", err)
+		}
 	}
 	return conn, nil
 }

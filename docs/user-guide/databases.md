@@ -874,8 +874,18 @@ new session in their database start as their own role), `statement_timeout`,
 `exit_on_error = off` (a superuser parameter an owner could only set with a
 `parameterGrants` grant). On connecting, `transaction_timeout`
 (PostgreSQL 17+, so it cannot be a startup parameter on older servers) is
-reset to `0` as well. Logging parameters are not pinned (see
-[Roles: parameter grants](roles.md#parameter-grants)).
+reset to `0` as well. The logging parameters (`log_statement`,
+`log_min_messages`, `log_min_error_statement`, `log_min_duration_statement`,
+`log_min_duration_sample`, `log_statement_sample_rate`,
+`log_transaction_sample_rate`, `log_statement_stats`) are also pinned on
+connecting, but to the cluster's own server-wide value rather than a constant:
+when a value comes from an `ALTER DATABASE/ROLE ... SET` override, the
+operator's session is set back to the last value in the server configuration
+files (`pg_file_settings`), or to the built-in default if none is set. Values
+set on the server command line are not overridden by a database default and
+are left alone; if a database override exists on top of a command-line value,
+the pin falls back to the built-in default. Other sessions in the database are
+not pinned (see [Roles: parameter grants](roles.md#parameter-grants)).
 
 ## Ordering & Dependencies
 
