@@ -112,7 +112,7 @@ At least one of `schema`, `tables`, `sequences` and `functions` is required.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `name` | string | **required** | Schema name (not `pg_*` or `information_schema`; unique, at most 64 schemas) |
-| `owner` | string | database owner | PostgreSQL role name that owns the schema (see [Which schemas a Database manages](#which-schemas-a-database-manages)) |
+| `owner` | string | database owner | PostgreSQL role name that owns the schema; follows the [grantee policy](#grantee-policy) (see [Which schemas a Database manages](#which-schemas-a-database-manages)) |
 | `grants` | []GrantSpec | - | Schema privileges to grant (at most 16; see [Schema Grants](#schema-grants)) |
 | `objectGrants` | []ObjectGrantSpec | - | Privileges on the schema's tables, sequences, functions, procedures and types (at most 32; see [Object Grants](#object-grants)) |
 | `defaultPrivileges` | []DefaultPrivilegeSpec | - | Privileges on objects a role creates in the schema later (at most 32; see [Default Privileges](#default-privileges)) |
@@ -686,6 +686,10 @@ the reserved names; the operator checks the rest on every reconcile. A grant
 to a grantee that is not allowed is not applied, is **revoked if pgop granted
 it earlier** (for example before the Cluster's policy changed), and is
 reported with reason `GranteeNotAllowed`; the other grants are still applied.
+The same policy applies to `schemas[].owner` (except that `PUBLIC` is not a
+role and so never an owner): a schema whose declared owner is refused is not
+created or re-owned and is reported with `GranteeNotAllowed`; an owner that does
+not exist yet is retried, and one whose Role is being deleted is paused.
 A Role that is created later is picked up as soon as it is recorded (the
 Database reconciles when the Role changes).
 

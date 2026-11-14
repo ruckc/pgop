@@ -191,6 +191,15 @@ func (c *granteeChecker) decideForRole(ctx context.Context, name string) (grante
 	return granteeResult{verdict: granteeAllowed}, nil
 }
 
+// checkOwner returns the decision for the declared owner of a schema: the
+// grantee policy, except that PUBLIC is not a role and so never an owner.
+func (c *granteeChecker) checkOwner(ctx context.Context, owner string) (granteeResult, error) {
+	if postgres.IsPublic(owner) {
+		return granteeResult{verdict: granteeRefused, problem: "is PUBLIC, not a role"}, nil
+	}
+	return c.check(ctx, owner)
+}
+
 // check returns the decision for grantee.
 func (c *granteeChecker) check(ctx context.Context, grantee string) (granteeResult, error) {
 	if res, ok := c.cache[grantee]; ok {

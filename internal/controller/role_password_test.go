@@ -46,7 +46,7 @@ var _ = Describe("Role password selection", func() {
 	now := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
 
 	newRole := func() *postgresv1alpha1.Role {
-		return &postgresv1alpha1.Role{ObjectMeta: metav1.ObjectMeta{Name: "app", UID: "uid-1"}}
+		return &postgresv1alpha1.Role{ObjectMeta: metav1.ObjectMeta{Name: ogSchema, UID: "uid-1"}}
 	}
 	withRotation := func(role *postgresv1alpha1.Role, every time.Duration, rotatedAt *time.Time) *postgresv1alpha1.Role {
 		role.Spec.PasswordRotation = &postgresv1alpha1.PasswordRotationSpec{Every: metav1.Duration{Duration: every}}

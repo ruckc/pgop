@@ -453,8 +453,14 @@ type SchemaSpec struct {
 	// +kubebuilder:validation:XValidation:rule="!self.startsWith('pg_') && self != 'information_schema'",message="schema name must not be a system schema (pg_* or information_schema)"
 	Name string `json:"name"`
 
-	// owner is the role that owns this schema.
+	// owner is the PostgreSQL role that owns this schema.
+	// It must be a role managed by a Role of the Cluster or one listed in the
+	// Cluster's spec.rolePolicy.allowedExistingRoles, and never a superuser,
+	// postgres, a pgop_* or pg_* role or PUBLIC: such a schema is not created
+	// or re-owned (reason GranteeNotAllowed).
 	// If not specified, the database owner will be the schema owner.
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:XValidation:rule="self != 'postgres' && !self.startsWith('pgop_') && !self.startsWith('pg_') && self.lowerAscii() != 'none' && self.lowerAscii() != 'public'",message="owner must not be postgres, a pgop_* or pg_* role, none or PUBLIC"
 	// +optional
 	Owner string `json:"owner,omitempty"`
 

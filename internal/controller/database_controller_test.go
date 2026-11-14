@@ -81,7 +81,7 @@ var _ = Describe("Database Controller", func() {
 					},
 					Schemas: []postgresv1alpha1.SchemaSpec{
 						{
-							Name:  "app",
+							Name:  ogSchema,
 							Owner: appUser,
 							Grants: []postgresv1alpha1.GrantSpec{
 								{
