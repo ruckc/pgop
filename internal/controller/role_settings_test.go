@@ -217,7 +217,7 @@ var _ = Describe("Role settings", func() {
 	})
 
 	It("never touches reserved roles", func() {
-		for _, name := range []string{bootstrapRoleName, DefaultOperatorUsername, "pg_monitor"} {
+		for _, name := range []string{bootstrapRoleName, DefaultOperatorUsername, polMonitor} {
 			f := &fakeRoleSettingsClient{}
 			_, err := reconcileRoleSettings(ctx, f, newRole(map[string]string{testWorkMem: grantTestValue}), name, testSettingPolicy)
 			ce, ok := errors.AsType[*conditionError](err)

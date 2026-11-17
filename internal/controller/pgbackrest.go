@@ -116,8 +116,8 @@ func isOfficialPostgresImage(image string) bool {
 		image = image[:colon]
 	}
 	switch image {
-	case "postgres", "library/postgres", "docker.io/postgres", "docker.io/library/postgres",
-		"index.docker.io/library/postgres", "registry-1.docker.io/library/postgres":
+	case defaultDatabaseName, "library/postgres", "docker.io/" + defaultDatabaseName, "docker.io/library/" + defaultDatabaseName,
+		"index.docker.io/library/" + defaultDatabaseName, "registry-1.docker.io/library/" + defaultDatabaseName:
 		return true
 	}
 	return false

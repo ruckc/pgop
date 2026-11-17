@@ -74,7 +74,7 @@ var _ = Describe("Schema owner policy", func() {
 	}
 
 	It("refuses unmanaged, superuser, reserved and PUBLIC owners without touching the schema", func() {
-		for _, owner := range []string{strayOwner, suOwner, "postgres", DefaultOperatorUsername, "pg_monitor", "PUBLIC", rsNone} {
+		for _, owner := range []string{strayOwner, suOwner, defaultDatabaseName, DefaultOperatorUsername, polMonitor, "PUBLIC", rsNone} {
 			s := &fakeSchemaClient{dbOwner: grantTestAdmin}
 			managed, refused, err := reconcileSchemas(ctx, s, dbWith(postgresv1alpha1.SchemaSpec{Name: ogSchema, Owner: owner}),
 				"", newChecker(nil))
@@ -87,8 +87,8 @@ var _ = Describe("Schema owner policy", func() {
 	})
 
 	It("does not re-own an existing managed schema to a refused owner, and keeps it recorded", func() {
-		s := &fakeSchemaClient{dbOwner: grantTestAdmin, owners: map[string]string{"app": grantTestRole}}
-		db := dbWith(postgresv1alpha1.SchemaSpec{Name: "app", Owner: strayOwner})
+		s := &fakeSchemaClient{dbOwner: grantTestAdmin, owners: map[string]string{ogSchema: grantTestRole}}
+		db := dbWith(postgresv1alpha1.SchemaSpec{Name: ogSchema, Owner: strayOwner})
 		db.Status.CreatedSchemas = []string{"app"}
 		managed, refused, err := reconcileSchemas(ctx, s, db, "", newChecker(nil))
 		Expect(err).NotTo(HaveOccurred())
@@ -102,8 +102,8 @@ var _ = Describe("Schema owner policy", func() {
 		db := dbWith(
 			postgresv1alpha1.SchemaSpec{Name: schemaFresh, Owner: managedOwner},
 			postgresv1alpha1.SchemaSpec{Name: "fresh2", Owner: allowedOwner},
-			postgresv1alpha1.SchemaSpec{Name: "old", Owner: managedOwner})
-		db.Status.CreatedSchemas = []string{"old"}
+			postgresv1alpha1.SchemaSpec{Name: memOld, Owner: managedOwner})
+		db.Status.CreatedSchemas = []string{memOld}
 		managed, refused, err := reconcileSchemas(ctx, s, db, "", newChecker(nil))
 		Expect(err).NotTo(HaveOccurred())
 		Expect(refused).NotTo(HaveOccurred())

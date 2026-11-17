@@ -496,7 +496,7 @@ var _ = Describe("Privilege grants", func() {
 
 		It("keeps a pending revoke tracked when it fails", func() {
 			f := &fakeGrantClient{failOn: "from old"}
-			db := newDB(nil, postgresv1alpha1.ManagedDatabaseGrant{Role: "old", Privileges: connect})
+			db := newDB(nil, postgresv1alpha1.ManagedDatabaseGrant{Role: memOld, Privileges: connect})
 			Expect(reconcileDatabaseGrants(ctx, f, db, "app_db", testChecker(f, nil), nil)).NotTo(Succeed())
 			Expect(db.Status.ManagedGrants).To(HaveLen(1))
 		})

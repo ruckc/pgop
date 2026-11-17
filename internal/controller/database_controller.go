@@ -297,6 +297,80 @@ func schemaOwnerProblem(ctx context.Context, owners *granteeChecker, schema post
 // (reason GranteeNotAllowed), and one whose owner is missing or being
 // deleted is retried. It returns the managed schemas, an error listing the refused ones (nil when
 // none) and the error that stopped it.
+type schemaState struct {
+	managed    bool
+	refused    string
+	pending    string
+	notManaged string
+}
+
+func reconcileSchema(ctx context.Context, pg schemaClient, ownerPGName, dbOwner string,
+	owners *granteeChecker, schema postgresv1alpha1.SchemaSpec, recorded map[string]bool) (schemaState, error) {
+	state := schemaState{}
+	refused, pending, err := schemaOwnerProblem(ctx, owners, schema)
+	if err != nil {
+		return state, err
+	}
+	if refused != "" || pending != "" {
+		if refused != "" {
+			state.refused = refused
+		} else {
+			state.pending = pending
+		}
+		if recorded[schema.Name] {
+			state.managed = true
+		}
+		return state, nil
+	}
+	info, exists, err := pg.SchemaOwner(ctx, schema.Name)
+	if err != nil {
+		return state, err
+	}
+	if !exists {
+		createAs := schema.Owner
+		if createAs == "" {
+			createAs = dbOwner
+		}
+		if err := pg.CreateSchema(ctx, schema.Name, createAs); err != nil {
+			if errors.Is(err, postgres.ErrObjectExists) {
+				state.notManaged = schema.Name + " (created by someone else meanwhile)"
+				return state, nil
+			}
+			return state, fmt.Errorf("schema %q: %w", schema.Name, err)
+		}
+		state.managed = true
+		return state, nil
+	}
+	if schema.Name == publicSchemaName && info.OwnerIsBootstrap {
+		// Before PostgreSQL 15 every database's schema public is owned by
+		// the bootstrap superuser (and PUBLIC may create in it). It is
+		// managed for grants only: pgop never changes its owner.
+		state.managed = true
+		return state, nil
+	}
+	owner := info.Owner
+	allowed := recorded[schema.Name]
+	ownedByDeclaredDBOwner := owner == dbOwner && ownerPGName != "" && dbOwner == ownerPGName
+	if !allowed && (owner == schema.Owner || ownedByDeclaredDBOwner || owner == pgDatabaseOwnerRole) {
+		r, err := pg.LookupRole(ctx, owner)
+		if err != nil {
+			return state, err
+		}
+		allowed = r != nil && !r.Superuser
+	}
+	if !allowed {
+		state.notManaged = fmt.Sprintf("%s (owned by %s)", schema.Name, owner)
+		return state, nil
+	}
+	if schema.Owner != "" && owner != schema.Owner {
+		if err := pg.AlterSchemaOwner(ctx, schema.Name, schema.Owner); err != nil {
+			return state, fmt.Errorf("schema %q: %w", schema.Name, err)
+		}
+	}
+	state.managed = true
+	return state, nil
+}
+
 func reconcileSchemas(ctx context.Context, pg schemaClient, database *postgresv1alpha1.Database, ownerPGName string,
 	owners *granteeChecker) (managed []string, refusedErr, err error) {
 	recorded := map[string]bool{}
@@ -323,68 +397,26 @@ func reconcileSchemas(ctx context.Context, pg schemaClient, database *postgresv1
 			system = append(system, schema.Name)
 			continue
 		}
-		refused, pending, err := schemaOwnerProblem(ctx, owners, schema)
+		state, err := reconcileSchema(ctx, pg, ownerPGName, dbOwner, owners, schema, recorded)
 		if err != nil {
 			return keepRecorded(i), nil, err
 		}
-		if refused != "" || pending != "" {
-			if refused != "" {
-				ownerRefused = append(ownerRefused, refused)
-			} else {
-				ownerPending = append(ownerPending, pending)
-			}
+		switch {
+		case state.refused != "":
+			ownerRefused = append(ownerRefused, state.refused)
 			if recorded[schema.Name] {
 				managed = append(managed, schema.Name)
 			}
-			continue
-		}
-		info, exists, err := pg.SchemaOwner(ctx, schema.Name)
-		owner := info.Owner
-		if err != nil {
-			return keepRecorded(i), nil, err
-		}
-		if !exists {
-			createAs := schema.Owner
-			if createAs == "" {
-				createAs = dbOwner
+		case state.pending != "":
+			ownerPending = append(ownerPending, state.pending)
+			if recorded[schema.Name] {
+				managed = append(managed, schema.Name)
 			}
-			err := pg.CreateSchema(ctx, schema.Name, createAs)
-			if errors.Is(err, postgres.ErrObjectExists) {
-				notManaged = append(notManaged, schema.Name+" (created by someone else meanwhile)")
-				continue
-			}
-			if err != nil {
-				return keepRecorded(i), nil, fmt.Errorf("schema %q: %w", schema.Name, err)
-			}
+		case state.notManaged != "":
+			notManaged = append(notManaged, state.notManaged)
+		case state.managed:
 			managed = append(managed, schema.Name)
-			continue
 		}
-		if schema.Name == publicSchemaName && info.OwnerIsBootstrap {
-			// Before PostgreSQL 15 every database's schema public is owned by
-			// the bootstrap superuser (and PUBLIC may create in it). It is
-			// managed for grants only: pgop never changes its owner.
-			managed = append(managed, schema.Name)
-			continue
-		}
-		allowed := recorded[schema.Name]
-		ownedByDeclaredDBOwner := owner == dbOwner && ownerPGName != "" && dbOwner == ownerPGName
-		if !allowed && (owner == schema.Owner || ownedByDeclaredDBOwner || owner == pgDatabaseOwnerRole) {
-			r, err := pg.LookupRole(ctx, owner)
-			if err != nil {
-				return keepRecorded(i), nil, err
-			}
-			allowed = r != nil && !r.Superuser
-		}
-		if !allowed {
-			notManaged = append(notManaged, fmt.Sprintf("%s (owned by %s)", schema.Name, owner))
-			continue
-		}
-		if schema.Owner != "" && owner != schema.Owner {
-			if err := pg.AlterSchemaOwner(ctx, schema.Name, schema.Owner); err != nil {
-				return keepRecorded(i), nil, fmt.Errorf("schema %q: %w", schema.Name, err)
-			}
-		}
-		managed = append(managed, schema.Name)
 	}
 	var errs []error
 	if len(system) > 0 {
