@@ -246,7 +246,7 @@ var _ = Describe("Role memberships", func() {
 			}
 			role := newRole(postgresv1alpha1.RoleSpec{
 				MemberOf:    []string{"a", polMonitor, polOps, grantTestAdmin}, //nolint:staticcheck // deprecated field under test
-				Memberships: []rm{{Role: polExecProgram}, {Role: "pgop_operator"}},
+				Memberships: []rm{{Role: polExecProgram}, {Role: DefaultOperatorUsername}},
 			}, polMonitor, polOps)
 			err := reconcileMemberships(ctx, f, role, "app", nil, testManaged)
 			ce, ok := errors.AsType[*conditionError](err)

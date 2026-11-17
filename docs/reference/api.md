@@ -417,7 +417,7 @@ spec:
   # Schemas to create (max 64, each name at most once)
   schemas:
     - name: string         # Schema name (not pg_* or information_schema)
-      owner: string        # Schema owner
+      owner: string        # Schema owner (PostgreSQL role; grantee policy applies, reason GranteeNotAllowed; max 63 chars)
       # Schema privileges (GRANT ... ON SCHEMA), max 16, each role at most
       # once. Tracked in status.managedSchemaGrants: pgop-granted privileges
       # removed from the spec (or whose schema entry is removed) are revoked,

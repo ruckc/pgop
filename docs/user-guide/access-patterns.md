@@ -642,7 +642,7 @@ be deleted in any order.
 | `DuplicateRoleName` / `DuplicateDatabaseName` | Role / Database | Another resource already manages that PostgreSQL name |
 | `PasswordSecretNotFound` / `PasswordSecretInvalid` | Role | The `passwordSecretRef` Secret or key is missing, or the value is not a plaintext password |
 | `SettingNotAllowed` | Role / Database | Not a `user`-context parameter, or a custom namespace the Cluster's `allowedSettingPrefixes` does not list |
-| `GranteeNotAllowed` | Database | A grantee that is not `PUBLIC`, a role of the Cluster's Roles, or in `allowedExistingRoles` |
+| `GranteeNotAllowed` | Database | A grantee (or a schema `owner`, never `PUBLIC`) that is not a role of the Cluster's Roles or in `allowedExistingRoles` |
 | `SchemaNotManaged` | Database | An existing schema the Database neither created nor owns; set the Database's (or the schema's) `owner` |
 | `ObjectGrantSkipped` / `ObjectNotFound` | Database | A named object is not granted on (owner outside the trust domain, extension member, ...) or does not exist yet |
 | `DefaultPrivilegeNotAllowed` | Database | `forRole` is not a non-superuser role of the Cluster's Roles |

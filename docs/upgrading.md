@@ -27,6 +27,19 @@ or together with the operator image, so the API server knows the new fields.
   (membership `inherit`/`set` options: 16+; `parameterGrants`: 15+;
   `MAINTAIN`: 17+), and they are not covered by the test suite.
 
+## Unreleased: schema owners follow the grantee policy
+
+- **`schemas[].owner` is checked like a grantee.** It must be a role managed
+  by a Role of the Cluster or listed in the Cluster's
+  `rolePolicy.allowedExistingRoles`, and never a superuser, `postgres`,
+  `none`, a `pgop_*` or `pg_*` role, or `PUBLIC`. A schema with a refused
+  owner is not created and not re-owned, and the Database reports
+  `GranteeNotAllowed` (other schemas still reconcile). The CRD also rejects
+  reserved names in new or updated objects and limits the name to 63
+  characters. Existing Databases whose schema owner is an unmanaged role
+  start reporting `GranteeNotAllowed`: add the role to `allowedExistingRoles`
+  or manage it with a Role.
+
 ## v0.19.2: recovery-aware password-sync hook
 
 (The version is the expected next patch release; see the GitHub release

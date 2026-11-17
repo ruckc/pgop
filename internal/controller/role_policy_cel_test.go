@@ -74,7 +74,7 @@ var _ = Describe("Role policy CRD validation", func() {
 	}
 
 	Context("Role", func() {
-		for _, target := range []string{bootstrapRoleName, "pgop_operator", "pgop_replicator", reservedPrefixName,
+		for _, target := range []string{bootstrapRoleName, DefaultOperatorUsername, "pgop_replicator", reservedPrefixName,
 			polExecProgram, "pg_read_server_files", "pg_write_server_files"} {
 			It(fmt.Sprintf("rejects membership in %q", target), func() {
 				expectInvalid(create(newRole("m-"+suffix, postgresv1alpha1.RoleSpec{
