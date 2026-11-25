@@ -32,10 +32,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v6.0.3
+        uses: actions/checkout@v4.2.0
 
       - name: Setup Go
-        uses: actions/setup-go@v6.4.0
+        uses: actions/setup-go@v5.7.0
         with:
           go-version-file: go.mod
           cache: true
@@ -48,10 +48,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v6.0.3
+        uses: actions/checkout@v4.2.0
 
       - name: Setup Go
-        uses: actions/setup-go@v6.4.0
+        uses: actions/setup-go@v5.7.0
         with:
           go-version-file: go.mod
           cache: true
@@ -94,10 +94,10 @@ jobs:
       PGOP_TEST_PGPASSWORD: pw
     steps:
       - name: Checkout
-        uses: actions/checkout@v6.0.3
+        uses: actions/checkout@v4.2.0
 
       - name: Setup Go
-        uses: actions/setup-go@v6.4.0
+        uses: actions/setup-go@v5.7.0
         with:
           go-version-file: go.mod
           cache: true
@@ -144,7 +144,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v6.0.3
+        uses: actions/checkout@v4.2.0
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4.1.0
@@ -161,10 +161,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v6.0.3
+        uses: actions/checkout@v4.2.0
 
       - name: Setup Go
-        uses: actions/setup-go@v6.4.0
+        uses: actions/setup-go@v5.7.0
         with:
           go-version-file: go.mod
           cache: true
@@ -194,7 +194,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v6.0.3
+        uses: actions/checkout@v4.2.0
 
       - name: Fail on merge-conflict markers
         run: |
@@ -208,7 +208,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v6.0.3
+        uses: actions/checkout@v4.2.0
 
       - name: Setup Helm
         uses: azure/setup-helm@v5.0.0
@@ -235,7 +235,7 @@ jobs:
       staging_tag: ${{ steps.commit.outputs.staging_tag }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v6.0.3
+        uses: actions/checkout@v4.2.0
         with:
           fetch-depth: 0
           token: ${{ secrets.RELEASE_TOKEN || github.token }}
@@ -319,7 +319,7 @@ jobs:
       packages: write
     steps:
       - name: Checkout release branch
-        uses: actions/checkout@v6.0.3
+        uses: actions/checkout@v4.2.0
         with:
           ref: ${{ needs.prepare-release.outputs.branch }}
 
@@ -376,7 +376,7 @@ jobs:
       url: ${{ steps.deploy-pages.outputs.page_url }}
     steps:
       - name: Checkout release branch
-        uses: actions/checkout@v6.0.3
+        uses: actions/checkout@v4.2.0
         with:
           ref: ${{ needs.prepare-release.outputs.branch }}
           fetch-depth: 0

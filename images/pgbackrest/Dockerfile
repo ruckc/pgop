@@ -20,11 +20,11 @@
 
 ARG PG_MAJOR=18
 
-FROM postgres:16-trixie@sha256:ca0bd484cb98bf4b24eb1010e73fb3fcbd6714d240fbc1a10eea5b7dbecb641d AS postgres-base-16
-FROM postgres:17-trixie@sha256:2d2b8998d31037bf721cfdf764d76ba74171b4fab3431b7f72c27c56ddbdf9e3 AS postgres-base-17
-FROM postgres:18-trixie@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336 AS postgres-base-18
+FROM postgres:16-trixie@sha256:07abc3f43c9395b0bdbbab36bc25ddb0e8d83cd4fcafb565b7d6abe14ff156dd8 AS postgres-base-16
+FROM postgres:17-trixie@sha256:87c8b42f423b45d5247e6aa8fdb2e7762fec164c68a50fe3eb07e7bfcaf4dbcf1b7f72c27c56ddbdf9e3 AS postgres-base-17
+FROM postgres:18-trixie@sha256:c699303802144847d238196173655dbbecf7a96aeca1565f2b02eb671a1f0b64 AS postgres-base-18
 
-FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2 AS builder
+FROM debian:trixie-slim@sha256:8aa5a7bf5a1955bddbe7d74fcdd0b91ab30e74362a8b73af672b0481b35b44a043b3375f070c51600d63b6b2 AS builder
 
 ARG PGBACKREST_VERSION=2.59.3
 ARG PGBACKREST_SHA256=b2a95535a68e326a0f316c2d8d3243bc30092cf1ce9de9be5d142e204d2d4263
@@ -48,7 +48,7 @@ RUN curl -fsSL -o pgbackrest.tar.gz \
 # The runtime stages install the libraries pgBackRest links against (Debian
 # trixie package names; the postgres image is trixie-based as well).
 
-FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2 AS pgbackrest
+FROM debian:trixie-slim@sha256:8aa5a7bf5a1955bddbe7d74fcdd0b91ab30e74362a8b73af672b0481b35b44a043b3375f070c51600d63b6b2 AS pgbackrest
 
 ARG PGBACKREST_VERSION=2.59.3
 LABEL org.opencontainers.image.title="pgop-pgbackrest" \
